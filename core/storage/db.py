@@ -3,6 +3,11 @@ SQLite storage layer for the Observability Core.
 
 Stores spans in a single table; traces are derived by aggregating spans
 with the same trace_id. Supports incremental assembly for late-arriving spans.
+
+P0-05: Metrics distinguish Trace / LLM Call / Span levels.
+P0-06: Trace filtering uses two-phase query (find matching trace_ids, then aggregate all spans).
+P0-07: Pagination returns correct total count.
+P0-04: TTFT/TTFC semantics separated.
 """
 import sqlite3
 import json
@@ -56,6 +61,7 @@ class Storage:
                     status TEXT NOT NULL,
                     http_status INTEGER,
                     ttft_ms REAL,
+                    ttfc_ms REAL,
                     session_id TEXT,
                     user_id TEXT,
                     app_name TEXT,
@@ -83,6 +89,7 @@ class Storage:
                 CREATE INDEX IF NOT EXISTS idx_spans_session ON spans(session_id);
                 CREATE INDEX IF NOT EXISTS idx_spans_user ON spans(user_id);
                 CREATE INDEX IF NOT EXISTS idx_spans_model ON spans(model);
+                CREATE INDEX IF NOT EXISTS idx_spans_kind ON spans(span_kind);
             """)
             conn.commit()
             self._initialized = True
@@ -104,11 +111,11 @@ class Storage:
             INSERT OR REPLACE INTO spans (
                 trace_id, span_id, parent_span_id, span_name, span_kind,
                 start_time, end_time, duration_ms, status, http_status,
-                ttft_ms, session_id, user_id, app_name, business_scene,
+                ttft_ms, ttfc_ms, session_id, user_id, app_name, business_scene,
                 attributes, events, error_type, error_message, payload,
                 request_metadata, payload_ref, trace_inherited,
                 model, input_tokens, output_tokens, total_tokens, is_stream
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             record["trace_id"],
             record["span_id"],
@@ -121,6 +128,7 @@ class Storage:
             record.get("status", "OK"),
             record.get("http_status"),
             record.get("ttft_ms"),
+            record.get("ttfc_ms"),
             record.get("session_id"),
             record.get("user_id"),
             record.get("app_name"),
@@ -180,53 +188,77 @@ class Storage:
         offset: int = 0,
         sort_by: str = "start_time",
         sort_order: str = "desc",
-    ) -> list[dict]:
-        """Get trace summaries with filtering."""
+    ) -> dict:
+        """Get trace summaries with filtering.
+
+        P0-06: Two-phase query — first find trace_ids that match filters,
+        then aggregate ALL spans for those trace_ids (no partial traces).
+
+        P0-07: Returns dict with 'traces' list and 'total' count for pagination.
+
+        Returns:
+            {"traces": [...], "total": int}
+        """
         conn = self._get_conn()
 
-        # Build query for trace-level aggregation
+        # ── Phase 1: Find matching trace_ids ──
+        # Build WHERE for span-level filters
         conditions = []
         params = []
 
         if time_start is not None:
-            conditions.append("s.start_time >= ?")
+            conditions.append("start_time >= ?")
             params.append(time_start)
         if time_end is not None:
-            conditions.append("s.start_time <= ?")
+            conditions.append("start_time <= ?")
             params.append(time_end)
         if status is not None:
-            conditions.append("s.status = ?")
+            conditions.append("status = ?")
             params.append(status)
         if model is not None:
-            conditions.append("s.model = ?")
+            conditions.append("model = ?")
             params.append(model)
         if session_id is not None:
-            conditions.append("s.session_id = ?")
+            conditions.append("session_id = ?")
             params.append(session_id)
         if user_id is not None:
-            conditions.append("s.user_id = ?")
+            conditions.append("user_id = ?")
             params.append(user_id)
         if trace_id is not None:
-            conditions.append("s.trace_id = ?")
+            conditions.append("trace_id = ?")
             params.append(trace_id)
-        if min_duration_ms is not None:
-            conditions.append("s.duration_ms >= ?")
-            params.append(min_duration_ms)
-        if max_duration_ms is not None:
-            conditions.append("s.duration_ms <= ?")
-            params.append(max_duration_ms)
         if app_name is not None:
-            conditions.append("s.app_name = ?")
+            conditions.append("app_name = ?")
             params.append(app_name)
         if business_scene is not None:
-            conditions.append("s.business_scene = ?")
+            conditions.append("business_scene = ?")
             params.append(business_scene)
 
         where_clause = " AND ".join(conditions) if conditions else "1=1"
 
-        # Valid sort columns
-        valid_sort = {"start_time", "duration_ms", "end_time"}
-        sort_col = sort_by if sort_by in valid_sort else "start_time"
+        # Get distinct trace_ids that have at least one matching span
+        matching_trace_ids_query = f"""
+            SELECT DISTINCT trace_id FROM spans WHERE {where_clause}
+        """
+        matching_rows = conn.execute(matching_trace_ids_query, params).fetchall()
+        matching_trace_ids = [r["trace_id"] for r in matching_rows]
+
+        if not matching_trace_ids:
+            return {"traces": [], "total": 0}
+
+        total = len(matching_trace_ids)
+
+        # ── Phase 2: Aggregate ALL spans for matching trace_ids ──
+        # Use a CTE for trace_id list, then aggregate without span-level WHERE
+        placeholders = ",".join("?" * len(matching_trace_ids))
+
+        # Valid sort columns (map to trace-level aggregate expressions)
+        trace_sort_map = {
+            "start_time": "MIN(s.start_time)",
+            "duration_ms": "(MAX(s.end_time) - MIN(s.start_time)) * 1000",
+            "end_time": "MAX(s.end_time)",
+        }
+        sort_expr = trace_sort_map.get(sort_by, "MIN(s.start_time)")
         sort_dir = "DESC" if sort_order.lower() == "desc" else "ASC"
 
         query = f"""
@@ -249,24 +281,24 @@ class Storage:
                 s.model,
                 s.error_type
             FROM spans s
-            WHERE {where_clause}
+            WHERE s.trace_id IN ({placeholders})
             GROUP BY s.trace_id
-            ORDER BY {sort_col} {sort_dir}
+            ORDER BY {sort_expr} {sort_dir}
             LIMIT ? OFFSET ?
         """
-        params.extend([limit, offset])
+        agg_params = list(matching_trace_ids) + [limit, offset]
 
-        rows = conn.execute(query, params).fetchall()
+        rows = conn.execute(query, agg_params).fetchall()
         results = []
         for row in rows:
             d = dict(row)
-            # Get input/output summary from first LLM span
-            trace_id = d["trace_id"]
+            tid = d["trace_id"]
+            # Get input/output summary from first LLM span for this trace
             summary_row = conn.execute(
                 """SELECT payload, request_metadata FROM spans
                    WHERE trace_id = ? AND span_kind = 'LLM'
                    ORDER BY start_time LIMIT 1""",
-                (trace_id,)
+                (tid,)
             ).fetchone()
             if summary_row:
                 req_meta = json.loads(summary_row["request_metadata"]) if summary_row["request_metadata"] else {}
@@ -274,7 +306,6 @@ class Storage:
                 req_payload = payload.get("request", {}) if isinstance(payload, dict) else {}
                 resp_payload = payload.get("response", {}) if isinstance(payload, dict) else {}
 
-                # Build summaries
                 messages = req_payload.get("messages", []) if isinstance(req_payload, dict) else []
                 if messages and isinstance(messages, list):
                     last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
@@ -295,7 +326,7 @@ class Storage:
 
             results.append(d)
 
-        return results
+        return {"traces": results, "total": total}
 
     def get_trace_detail(self, trace_id: str) -> Optional[dict]:
         """Get full trace detail with all spans."""
@@ -345,11 +376,21 @@ class Storage:
         time_end: Optional[float] = None,
         model: Optional[str] = None,
         session_id: Optional[str] = None,
-        user_id: Optional[str] = None,
+        user_id: Optional[float] = None,
     ) -> dict:
-        """Compute aggregated metrics for dashboard."""
+        """Compute aggregated metrics for dashboard.
+
+        P0-05: Separates metrics into three levels:
+        - Trace metrics: trace_count, error_count, error_rate
+        - LLM Call metrics: llm_call_count, latency percentiles, ttft/ttfc, tokens
+        - Span metrics: span_count (debugging only)
+
+        P0-04: TTFT = Time To First Token; TTFC = Time To Complete.
+        Latency percentiles computed from LLM spans only.
+        """
         conn = self._get_conn()
 
+        # Build WHERE clause
         conditions = []
         params: list = []
         if time_start is not None:
@@ -370,67 +411,123 @@ class Storage:
 
         where_clause = " AND ".join(conditions) if conditions else "1=1"
 
-        # Basic counts
-        row = conn.execute(
+        # ── Trace-level metrics ──
+        trace_row = conn.execute(
             f"""SELECT
-                COUNT(*) as total,
-                SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END) as errors,
+                COUNT(DISTINCT trace_id) as trace_count,
+                COUNT(DISTINCT CASE WHEN status = 'ERROR' THEN trace_id END) as error_trace_count
+            FROM spans WHERE {where_clause}""",
+            params
+        ).fetchone()
+
+        trace_count = trace_row["trace_count"] or 0
+        error_trace_count = trace_row["error_trace_count"] or 0
+        error_rate = (error_trace_count / trace_count * 100) if trace_count > 0 else 0.0
+
+        # ── LLM Call-level metrics ──
+        llm_where = f"{where_clause} AND span_kind = 'LLM'"
+        llm_row = conn.execute(
+            f"""SELECT
+                COUNT(*) as llm_call_count,
+                SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END) as llm_error_count,
                 SUM(COALESCE(input_tokens, 0)) as input_tokens,
                 SUM(COALESCE(output_tokens, 0)) as output_tokens,
                 SUM(COALESCE(total_tokens, 0)) as total_tokens,
                 COUNT(DISTINCT model) as unique_models,
                 COUNT(DISTINCT user_id) as unique_users,
                 COUNT(DISTINCT session_id) as unique_sessions
-            FROM spans WHERE {where_clause}""",
+            FROM spans WHERE {llm_where}""",
             params
         ).fetchone()
 
-        total = row["total"] or 0
-        errors = row["errors"] or 0
-        error_rate = (errors / total * 100) if total > 0 else 0.0
+        llm_call_count = llm_row["llm_call_count"] or 0
+        llm_error_count = llm_row["llm_error_count"] or 0
+        if trace_count > 0:
+            # Keep error_rate at trace level — it's more meaningful
+            pass
 
-        # Latency percentiles
-        latency_row = conn.execute(
+        # Latency percentiles (LLM spans only)
+        latency_rows = conn.execute(
             f"""SELECT duration_ms FROM spans
-                WHERE {where_clause} AND duration_ms IS NOT NULL
+                WHERE {llm_where} AND duration_ms IS NOT NULL
                 ORDER BY duration_ms""",
             params
         ).fetchall()
-        latencies = [r["duration_ms"] for r in latency_row]
+        latencies = [r["duration_ms"] for r in latency_rows]
 
         p50 = self._percentile(latencies, 50)
         p95 = self._percentile(latencies, 95)
         p99 = self._percentile(latencies, 99)
 
-        # TTFT percentiles
-        ttft_row = conn.execute(
+        # TTFT percentiles (LLM spans only)
+        ttft_rows = conn.execute(
             f"""SELECT ttft_ms FROM spans
-                WHERE {where_clause} AND ttft_ms IS NOT NULL
+                WHERE {llm_where} AND ttft_ms IS NOT NULL
                 ORDER BY ttft_ms""",
             params
         ).fetchall()
-        ttfts = [r["ttft_ms"] for r in ttft_row]
+        ttfts = [r["ttft_ms"] for r in ttft_rows]
 
         avg_ttft = sum(ttfts) / len(ttfts) if ttfts else None
         p50_ttft = self._percentile(ttfts, 50) if ttfts else None
         p95_ttft = self._percentile(ttfts, 95) if ttfts else None
 
+        # TTFC percentiles (LLM spans only) — P0-04
+        ttfc_rows = conn.execute(
+            f"""SELECT ttfc_ms FROM spans
+                WHERE {llm_where} AND ttfc_ms IS NOT NULL
+                ORDER BY ttfc_ms""",
+            params
+        ).fetchall()
+        ttfcs = [r["ttfc_ms"] for r in ttfc_rows]
+
+        avg_ttfc = sum(ttfcs) / len(ttfcs) if ttfcs else None
+        p50_ttfc = self._percentile(ttfcs, 50) if ttfcs else None
+        p95_ttfc = self._percentile(ttfcs, 95) if ttfcs else None
+
+        # Fallback: if ttfc_ms is not populated, use latency as TTFC
+        if not ttfcs and latencies:
+            avg_ttfc = sum(latencies) / len(latencies)
+            p50_ttfc = p50
+            p95_ttfc = p95
+
+        # ── Span-level metrics (debugging) ──
+        span_row = conn.execute(
+            f"""SELECT COUNT(*) as span_count FROM spans WHERE {where_clause}""",
+            params
+        ).fetchone()
+        span_count = span_row["span_count"] or 0
+
         return {
-            "total_requests": total,
-            "error_count": errors,
+            # Trace-level
+            "trace_count": trace_count,
+            "error_count": error_trace_count,
             "error_rate": round(error_rate, 2),
+
+            # LLM Call-level
+            "llm_call_count": llm_call_count,
             "p50_latency_ms": round(p50, 2) if p50 else 0.0,
             "p95_latency_ms": round(p95, 2) if p95 else 0.0,
             "p99_latency_ms": round(p99, 2) if p99 else 0.0,
             "avg_ttft_ms": round(avg_ttft, 2) if avg_ttft else None,
             "p50_ttft_ms": round(p50_ttft, 2) if p50_ttft else None,
             "p95_ttft_ms": round(p95_ttft, 2) if p95_ttft else None,
-            "total_input_tokens": row["input_tokens"] or 0,
-            "total_output_tokens": row["output_tokens"] or 0,
-            "total_tokens": row["total_tokens"] or 0,
-            "unique_models": row["unique_models"] or 0,
-            "unique_users": row["unique_users"] or 0,
-            "unique_sessions": row["unique_sessions"] or 0,
+            "avg_ttfc_ms": round(avg_ttfc, 2) if avg_ttfc else None,
+            "p50_ttfc_ms": round(p50_ttfc, 2) if p50_ttfc else None,
+            "p95_ttfc_ms": round(p95_ttfc, 2) if p95_ttfc else None,
+
+            # Tokens (LLM spans only)
+            "total_input_tokens": llm_row["input_tokens"] or 0,
+            "total_output_tokens": llm_row["output_tokens"] or 0,
+            "total_tokens": llm_row["total_tokens"] or 0,
+
+            # Span-level (debugging)
+            "span_count": span_count,
+
+            # Dimensional
+            "unique_models": llm_row["unique_models"] or 0,
+            "unique_users": llm_row["unique_users"] or 0,
+            "unique_sessions": llm_row["unique_sessions"] or 0,
         }
 
     def get_time_series(
@@ -454,7 +551,9 @@ class Storage:
         rows = conn.execute(
             f"""SELECT
                 CAST(start_time / {interval_seconds} AS INTEGER) * {interval_seconds} as bucket,
-                COUNT(*) as count,
+                COUNT(DISTINCT trace_id) as trace_count,
+                COUNT(CASE WHEN span_kind = 'LLM' THEN 1 END) as llm_call_count,
+                COUNT(*) as span_count,
                 SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END) as errors,
                 AVG(duration_ms) as avg_latency,
                 SUM(COALESCE(total_tokens, 0)) as tokens,
@@ -472,10 +571,13 @@ class Storage:
         """Get list of models with counts."""
         conn = self._get_conn()
         rows = conn.execute(
-            """SELECT model, COUNT(*) as count,
+            """SELECT model,
+                      COUNT(*) as span_count,
+                      SUM(CASE WHEN span_kind = 'LLM' THEN 1 ELSE 0 END) as llm_call_count,
+                      COUNT(DISTINCT trace_id) as trace_count,
                       SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END) as errors
                FROM spans WHERE model IS NOT NULL
-               GROUP BY model ORDER BY count DESC"""
+               GROUP BY model ORDER BY llm_call_count DESC"""
         ).fetchall()
         return [dict(r) for r in rows]
 

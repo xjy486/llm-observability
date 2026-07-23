@@ -83,7 +83,8 @@ async def list_traces(
         time_end = time.time()
         time_start = time_end - (durationMinutes * 60)
 
-    results = storage.get_trace_summaries(
+    # P0-06/P0-07: db.get_trace_summaries returns {"traces": [...], "total": int}
+    result = storage.get_trace_summaries(
         time_start=time_start,
         time_end=time_end,
         status=status,
@@ -102,8 +103,8 @@ async def list_traces(
     )
 
     return {
-        "traces": results,
-        "total": len(results),
+        "traces": result["traces"],
+        "total": result["total"],
         "limit": limit,
         "offset": offset,
     }
@@ -178,10 +179,10 @@ async def health():
 @app.get("/api/v1/sessions/{session_id}/traces")
 async def get_session_traces(session_id: str):
     """Get all traces for a session (for session view)."""
-    results = storage.get_trace_summaries(
+    result = storage.get_trace_summaries(
         session_id=session_id,
         limit=200,
         sort_by="start_time",
         sort_order="asc",
     )
-    return {"session_id": session_id, "traces": results, "total": len(results)}
+    return {"session_id": session_id, "traces": result["traces"], "total": result["total"]}

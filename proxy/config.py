@@ -10,7 +10,7 @@ from typing import Optional
 class ProxyConfig:
     # Network
     listen_host: str = "0.0.0.0"
-    listen_port: int = 8080
+    listen_port: int = 8082
 
     # Upstream LLM Gateway (One-API, LiteLLM, etc.)
     upstream_url: str = os.getenv("UPSTREAM_URL", "http://localhost:3000")
@@ -23,6 +23,9 @@ class ProxyConfig:
     # Payload capture strategy: off / metadata_only / masked / full
     payload_strategy: str = os.getenv("PAYLOAD_STRATEGY", "masked")
 
+    # Gateway name for span identification (configurable, not hardcoded)
+    gateway_name: str = os.getenv("GATEWAY_NAME", "llm-proxy")
+
     # Sampling rate (0.0 - 1.0); errors always captured
     sample_rate: float = float(os.getenv("SAMPLE_RATE", "1.0"))
     error_always_capture: bool = True
@@ -33,13 +36,31 @@ class ProxyConfig:
         "x-auth-token", "proxy-authorization",
     ])
 
-    # Fields to mask in payload
+    # Fields to mask in payload (regex-based content masking)
     mask_patterns: list = field(default_factory=lambda: [
         r"sk-[a-zA-Z0-9]+",  # OpenAI keys
         r"Bearer\s+[a-zA-Z0-9\-._]+",
         r"password['\"]?\s*[:=]\s*['\"]?[^\s'\"]+",
         r"token['\"]?\s*[:=]\s*['\"]?[^\s'\"]+",
         r"secret['\"]?\s*[:=]\s*['\"]?[^\s'\"]+",
+    ])
+
+    # Keys whose VALUES should be entirely redacted (key-based masking)
+    mask_keys: list = field(default_factory=lambda: [
+        "authorization",
+        "api_key",
+        "apikey",
+        "api-key",
+        "x-api-key",
+        "x-auth-token",
+        "access_token",
+        "refresh_token",
+        "private_key",
+        "secret_key",
+        "password",
+        "passwd",
+        "credential",
+        "cookie",
     ])
 
     # Paths to intercept
@@ -52,10 +73,11 @@ class ProxyConfig:
     def from_env(cls) -> "ProxyConfig":
         return cls(
             listen_host=os.getenv("PROXY_HOST", "0.0.0.0"),
-            listen_port=int(os.getenv("PROXY_PORT", "8080")),
+            listen_port=int(os.getenv("PROXY_PORT", "8082")),
             upstream_url=os.getenv("UPSTREAM_URL", "http://localhost:3000"),
             upstream_timeout=float(os.getenv("UPSTREAM_TIMEOUT", "300")),
             observability_endpoint=os.getenv("OBSERVABILITY_ENDPOINT", "http://localhost:8001"),
             payload_strategy=os.getenv("PAYLOAD_STRATEGY", "masked"),
+            gateway_name=os.getenv("GATEWAY_NAME", "llm-proxy"),
             sample_rate=float(os.getenv("SAMPLE_RATE", "1.0")),
         )

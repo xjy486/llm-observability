@@ -8,12 +8,11 @@ An independent LLM/Agent observability platform that provides Trace/Span-level v
 Client / Agent
      │  OpenAI-compatible API
      ▼
-Telemetry Proxy ──────► Observability Core (Ingestion + Storage + Query API)
-     │  transparent forward         │
-     ▼                              ▼
-One-API / LiteLLM              Web UI (Dashboard + Trace Explorer)
-     ▼
-LLM Provider
+Telemetry Proxy (:8082) ──────► Observability Core (:8001)
+     │  transparent forward           │
+     ▼                                ▼
+LLM Provider (OpenAI,     Web UI (:3000)
+  Agnes, Azure, etc.)     Dashboard + Trace Explorer
 ```
 
 ## Components

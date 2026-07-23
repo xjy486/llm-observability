@@ -20,14 +20,28 @@ def mask_value(val: str, patterns: list) -> str:
     return val
 
 
-def mask_object(obj: Any, patterns: list) -> Any:
-    """Recursively mask sensitive values in a nested object."""
+def mask_object(obj: Any, patterns: list, mask_keys: list = None) -> Any:
+    """Recursively mask sensitive values in a nested object.
+
+    Two strategies:
+    1. Key-based: if a key matches mask_keys, redact its entire value
+    2. Regex-based: apply regex patterns to string values
+    """
+    if mask_keys is None:
+        mask_keys = []
+
     if isinstance(obj, str):
         return mask_value(obj, patterns)
     elif isinstance(obj, dict):
-        return {k: mask_object(v, patterns) for k, v in obj.items()}
+        result = {}
+        for k, v in obj.items():
+            if k.lower() in [mk.lower() for mk in mask_keys]:
+                result[k] = "[REDACTED]"
+            else:
+                result[k] = mask_object(v, patterns, mask_keys)
+        return result
     elif isinstance(obj, list):
-        return [mask_object(item, patterns) for item in obj]
+        return [mask_object(item, patterns, mask_keys) for item in obj]
     return obj
 
 
@@ -70,7 +84,7 @@ def process_payload(
         return meta
 
     if strategy == "masked":
-        return mask_object(data, config.mask_patterns)
+        return mask_object(data, config.mask_patterns, config.mask_keys)
 
     # full
     return data

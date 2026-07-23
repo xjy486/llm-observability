@@ -27,7 +27,8 @@ class SpanRecord(BaseModel):
     duration_ms: float
     status: str  # OK / ERROR / UNSET
     http_status: Optional[int] = None
-    ttft_ms: Optional[float] = None
+    ttft_ms: Optional[float] = None  # Time To First Token (ms): request start → first response byte
+    ttfc_ms: Optional[float] = None  # Time To Complete (ms): request start → last response byte (= duration_ms for non-streaming)
     session_id: Optional[str] = None
     user_id: Optional[str] = None
     app_name: Optional[str] = None
@@ -62,7 +63,8 @@ class IngestRecord(BaseModel):
     duration_ms: float
     status: str = "OK"
     http_status: Optional[int] = None
-    ttft_ms: Optional[float] = None
+    ttft_ms: Optional[float] = None  # Time To First Token (ms)
+    ttfc_ms: Optional[float] = None  # Time To Complete (ms)
     session_id: Optional[str] = None
     user_id: Optional[str] = None
     app_name: Optional[str] = None
@@ -124,19 +126,39 @@ class TraceDetail(BaseModel):
 
 
 class MetricsSummary(BaseModel):
-    """Dashboard metrics summary."""
-    total_requests: int = 0
+    """Dashboard metrics summary.
+
+    Metrics are separated into three levels:
+    - Trace metrics: trace_count, error_rate (at trace level)
+    - LLM Call metrics: llm_call_count, latency percentiles, ttft, tokens (LLM spans only)
+    - Span metrics: span_count (debugging only)
+    """
+    # Trace-level metrics
+    trace_count: int = 0
     error_count: int = 0
     error_rate: float = 0.0
+
+    # LLM Call-level metrics (only span_kind='LLM')
+    llm_call_count: int = 0
     p50_latency_ms: float = 0.0
     p95_latency_ms: float = 0.0
     p99_latency_ms: float = 0.0
     avg_ttft_ms: Optional[float] = None
     p50_ttft_ms: Optional[float] = None
     p95_ttft_ms: Optional[float] = None
+    avg_ttfc_ms: Optional[float] = None
+    p50_ttfc_ms: Optional[float] = None
+    p95_ttfc_ms: Optional[float] = None
+
+    # Token metrics (LLM spans only)
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     total_tokens: int = 0
+
+    # Span-level metrics (debugging)
+    span_count: int = 0
+
+    # Dimensional metrics
     unique_models: int = 0
     unique_users: int = 0
     unique_sessions: int = 0

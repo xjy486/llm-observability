@@ -4,11 +4,14 @@ Main proxy handler — transparent LLM API proxy with telemetry capture.
 Handles:
 - Non-streaming /v1/chat/completions
 - Streaming SSE /v1/chat/completions
-- W3C Trace Context propagation
-- TTFT measurement for streaming
+- W3C Trace Context propagation (P0-02: inject traceparent for downstream)
+- TTFT/TTFC measurement (P0-04: TTFT = first token, TTFC = complete)
+- Streaming response aggregation (P0-03: aggregate into standardized response)
+- Streaming memory optimization (P1-05: incremental accumulator, no raw chunk storage)
 - Token / usage extraction
 - Error capture
 - Payload capture with masking strategies
+- Configurable gateway name (P1-04: not hardcoded)
 """
 import asyncio
 import json
@@ -26,6 +29,95 @@ from payload import process_payload, extract_request_metadata, extract_response_
 from reporter import TelemetryReporter
 
 logger = logging.getLogger("proxy.handler")
+
+
+class StreamingAccumulator:
+    """Incremental accumulator for SSE streaming responses.
+
+    P0-03: Aggregates streaming chunks into a standardized non-streaming response.
+    P1-05: Does NOT store raw chunks — extracts only necessary fields incrementally.
+    """
+
+    def __init__(self):
+        self.model: Optional[str] = None
+        self.id: Optional[str] = None
+        self.content_parts: list[str] = []  # concatenated content deltas
+        self.reasoning_parts: list[str] = []  # reasoning/thinking content
+        self.tool_calls: list[dict] = []
+        self.finish_reason: Optional[str] = None
+        self.usage: dict = {}
+        self.chunk_count: int = 0
+        self.first_chunk_received: bool = False
+
+    def feed(self, chunk: dict) -> None:
+        """Process a single SSE chunk incrementally."""
+        self.chunk_count += 1
+
+        if not self.model:
+            self.model = chunk.get("model")
+        if not self.id:
+            self.id = chunk.get("id")
+
+        choices = chunk.get("choices", [])
+        for choice in choices:
+            delta = choice.get("delta", {})
+            if isinstance(delta, dict):
+                # Content delta
+                content = delta.get("content")
+                if content:
+                    self.content_parts.append(content)
+
+                # Reasoning content (some models)
+                reasoning = delta.get("reasoning_content")
+                if reasoning:
+                    self.reasoning_parts.append(reasoning)
+
+                # Tool calls
+                tc = delta.get("tool_calls")
+                if tc:
+                    for t in tc:
+                        idx = t.get("index", len(self.tool_calls))
+                        while len(self.tool_calls) <= idx:
+                            self.tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                        if t.get("id"):
+                            self.tool_calls[idx]["id"] = t["id"]
+                        func = t.get("function", {})
+                        if func.get("name"):
+                            self.tool_calls[idx]["function"]["name"] += func["name"]
+                        if func.get("arguments"):
+                            self.tool_calls[idx]["function"]["arguments"] += func["arguments"]
+
+            # Finish reason (usually on last chunk)
+            fr = choice.get("finish_reason")
+            if fr:
+                self.finish_reason = fr
+
+        # Usage (usually on last chunk)
+        u = chunk.get("usage")
+        if u and isinstance(u, dict):
+            self.usage = u
+
+    def build_response(self) -> dict:
+        """Build a standardized non-streaming response object."""
+        full_content = "".join(self.content_parts)
+        message = {"role": "assistant", "content": full_content if full_content else None}
+        if self.reasoning_parts:
+            message["reasoning_content"] = "".join(self.reasoning_parts)
+        if self.tool_calls:
+            message["tool_calls"] = self.tool_calls
+
+        return {
+            "id": self.id or "",
+            "object": "chat.completion",
+            "model": self.model or "unknown",
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": self.finish_reason or "stop",
+            }],
+            "usage": self.usage,
+            "stream_chunk_count": self.chunk_count,
+        }
 
 
 class ProxyHandler:
@@ -73,7 +165,7 @@ class ProxyHandler:
             url += "?" + request.query_string
 
         # Forward request
-        headers = self._forward_headers(request)
+        headers = self._build_forward_headers(request)
         body = await request.read()
 
         async with self._upstream_session.request(
@@ -121,7 +213,9 @@ class ProxyHandler:
         if request.query_string:
             upstream_url += "?" + request.query_string
 
-        forward_headers = self._forward_headers(request, preserve_traceparent=False)
+        # P0-02: Build forward headers and INJECT traceparent for downstream
+        forward_headers = self._build_forward_headers(request)
+        forward_headers["traceparent"] = trace_ctx.to_traceparent()
 
         # Send to upstream
         try:
@@ -148,7 +242,7 @@ class ProxyHandler:
                 processed_payload=processed_payload if should_sample else None,
                 response_payload=None,
                 ttft_ms=None,
-                stream_chunks=None,
+                ttfc_ms=None,
             )
             return web.Response(
                 status=502,
@@ -180,7 +274,12 @@ class ProxyHandler:
         processed_payload,
         should_sample: bool,
     ) -> web.StreamResponse:
-        """Handle SSE streaming response with TTFT measurement."""
+        """Handle SSE streaming response with TTFT/TTFC measurement.
+
+        P0-03: Uses StreamingAccumulator to build standardized response.
+        P1-05: Does NOT store raw SSE chunks — only incremental accumulation.
+        P0-04: Measures both TTFT (first token) and TTFC (complete).
+        """
         # Create streaming response
         response = web.StreamResponse(
             status=upstream_resp.status,
@@ -189,15 +288,13 @@ class ProxyHandler:
         await response.prepare(request)
 
         ttft_ms = None
-        stream_chunks = []
+        accumulator = StreamingAccumulator()
         first_chunk_time = None
-        total_output = b""
 
         try:
             async for line in upstream_resp.content:
                 # Forward to client immediately
                 await response.write(line)
-                total_output += line
 
                 # Parse SSE data for telemetry
                 line_str = line.decode("utf-8", errors="replace").strip()
@@ -207,7 +304,7 @@ class ProxyHandler:
                         continue
                     try:
                         chunk = json.loads(data_str)
-                        stream_chunks.append(chunk)
+                        accumulator.feed(chunk)
                         if first_chunk_time is None:
                             first_chunk_time = time.perf_counter()
                             ttft_ms = (first_chunk_time - start_time) * 1000
@@ -225,7 +322,8 @@ class ProxyHandler:
                 status="ERROR", http_status=upstream_resp.status,
                 error_type="stream_interrupted", error_message=str(e),
                 is_stream=True, processed_payload=processed_payload if should_sample else None,
-                response_payload=None, ttft_ms=ttft_ms, stream_chunks=stream_chunks,
+                response_payload=accumulator.build_response() if should_sample else None,
+                ttft_ms=ttft_ms, ttfc_ms=elapsed_ms,
             )
             if not response.prepared:
                 return web.Response(status=502, text="Streaming error")
@@ -234,8 +332,16 @@ class ProxyHandler:
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         is_error = upstream_resp.status >= 400
 
-        # Extract response metadata from streaming chunks
-        response_meta = extract_response_metadata(upstream_resp.status, None, stream_chunks)
+        # P0-03: Build standardized response from accumulator
+        aggregated_response = accumulator.build_response()
+
+        # P0-04: TTFC = total time from request to last byte
+        ttfc_ms = elapsed_ms
+
+        # Extract response metadata from aggregated response
+        response_meta = extract_response_metadata(
+            upstream_resp.status, aggregated_response, []
+        )
 
         # Process response payload
         response_payload = None
@@ -243,13 +349,7 @@ class ProxyHandler:
             if self.config.payload_strategy == "metadata_only":
                 response_payload = response_meta
             else:
-                response_payload = {
-                    "stream_chunks_summary": {
-                        "chunk_count": len(stream_chunks),
-                    },
-                    "usage": stream_chunks[-1].get("usage") if stream_chunks else None,
-                    "model": stream_chunks[0].get("model") if stream_chunks else None,
-                }
+                response_payload = aggregated_response
                 if self.config.payload_strategy == "masked":
                     response_payload = process_payload(response_payload, "masked", self.config)
 
@@ -262,8 +362,8 @@ class ProxyHandler:
             error_type=None if not is_error else "http_error",
             error_message=None if not is_error else f"HTTP {upstream_resp.status}",
             is_stream=True, processed_payload=processed_payload if should_sample else None,
-            response_payload=response_payload, ttft_ms=ttft_ms,
-            stream_chunks=stream_chunks if should_sample else None,
+            response_payload=response_payload,
+            ttft_ms=ttft_ms, ttfc_ms=ttfc_ms,
         )
 
         return response
@@ -280,7 +380,10 @@ class ProxyHandler:
         should_sample: bool,
         is_stream: bool,
     ) -> web.Response:
-        """Handle non-streaming response."""
+        """Handle non-streaming response.
+
+        P0-04: For non-streaming, TTFT = TTFC = total response time.
+        """
         resp_body_raw = await upstream_resp.read()
 
         try:
@@ -291,8 +394,9 @@ class ProxyHandler:
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         is_error = upstream_resp.status >= 400
 
-        # For non-streaming, TTFT is effectively the total response time
-        ttft_ms = elapsed_ms if not is_stream and not is_error else None
+        # P0-04: For non-streaming, TTFT = TTFC = total time
+        ttft_ms = elapsed_ms if not is_error else None
+        ttfc_ms = elapsed_ms
 
         # Extract response metadata
         response_meta = extract_response_metadata(upstream_resp.status, resp_body, [])
@@ -318,8 +422,8 @@ class ProxyHandler:
             status=status, http_status=upstream_resp.status,
             error_type=error_type, error_message=error_message,
             is_stream=is_stream, processed_payload=processed_payload if should_sample else None,
-            response_payload=response_payload, ttft_ms=ttft_ms,
-            stream_chunks=None,
+            response_payload=response_payload,
+            ttft_ms=ttft_ms, ttfc_ms=ttfc_ms,
         )
 
         return web.Response(
@@ -350,42 +454,47 @@ class ProxyHandler:
         processed_payload: Optional[dict],
         response_payload: Optional[dict],
         ttft_ms: Optional[float],
-        stream_chunks: Optional[list],
+        ttfc_ms: Optional[float],
     ):
-        """Build and queue telemetry record."""
+        """Build and queue telemetry record.
+
+        P1-04: Uses self.config.gateway_name instead of hardcoded 'one-api-proxy'.
+        P0-04: Reports both ttft_ms and ttfc_ms.
+        """
         # Build attributes (OpenTelemetry GenAI semantic conventions)
         attributes = {
             "gen_ai.request.model": request_meta.get("model", "unknown"),
             "gen_ai.operation.name": "chat",
             "llm.stream": is_stream,
-            "llm.gateway.name": "one-api-proxy",
+            "llm.gateway.name": self.config.gateway_name,
             "http.status_code": http_status,
         }
 
         # Add response model
-        if "response_model" in (response_payload or {}):
-            attributes["gen_ai.response.model"] = response_payload["response_model"]
-        elif "response_model" in request_meta:
-            pass
+        if isinstance(response_payload, dict):
+            resp_model = response_payload.get("model")
+            if resp_model:
+                attributes["gen_ai.response.model"] = resp_model
 
         # Tokens
         resp_meta = response_payload if isinstance(response_payload, dict) else {}
-        input_tokens = resp_meta.get("input_tokens") if resp_meta else None
-        output_tokens = resp_meta.get("output_tokens") if resp_meta else None
-        total_tokens = resp_meta.get("total_tokens") if resp_meta else None
+        input_tokens = None
+        output_tokens = None
+        total_tokens = None
 
-        if not input_tokens and isinstance(resp_meta, dict):
+        if resp_meta:
             usage = resp_meta.get("usage", {})
-            if isinstance(usage, dict):
+            if isinstance(usage, dict) and usage:
                 input_tokens = usage.get("prompt_tokens")
-        if not output_tokens and isinstance(resp_meta, dict):
-            usage = resp_meta.get("usage", {})
-            if isinstance(usage, dict):
                 output_tokens = usage.get("completion_tokens")
-        if not total_tokens and isinstance(resp_meta, dict):
-            usage = resp_meta.get("usage", {})
-            if isinstance(usage, dict):
                 total_tokens = usage.get("total_tokens")
+            # Also check top-level fields
+            if input_tokens is None:
+                input_tokens = resp_meta.get("input_tokens")
+            if output_tokens is None:
+                output_tokens = resp_meta.get("output_tokens")
+            if total_tokens is None:
+                total_tokens = resp_meta.get("total_tokens")
 
         if input_tokens is not None:
             attributes["gen_ai.usage.input_tokens"] = input_tokens
@@ -394,13 +503,21 @@ class ProxyHandler:
         if total_tokens is not None:
             attributes["gen_ai.usage.total_tokens"] = total_tokens
 
-        # TTFT
+        # TTFT event
         events = []
         if ttft_ms is not None:
             events.append({
                 "name": "first_token",
                 "timestamp": start_wall + (ttft_ms / 1000),
                 "attributes": {"time_to_first_token_ms": round(ttft_ms, 2)},
+            })
+
+        # TTFC event
+        if ttfc_ms is not None:
+            events.append({
+                "name": "response_complete",
+                "timestamp": start_wall + (ttfc_ms / 1000),
+                "attributes": {"time_to_complete_ms": round(ttfc_ms, 2)},
             })
 
         # Error event
@@ -428,6 +545,7 @@ class ProxyHandler:
             "status": status,
             "http_status": http_status,
             "ttft_ms": round(ttft_ms, 2) if ttft_ms is not None else None,
+            "ttfc_ms": round(ttfc_ms, 2) if ttfc_ms is not None else None,
             "session_id": metadata.get("session_id"),
             "user_id": metadata.get("user_id"),
             "app_name": metadata.get("app_name", "unknown"),
@@ -445,8 +563,12 @@ class ProxyHandler:
 
         self.reporter.report(record)
 
-    def _forward_headers(self, request: web.Request, preserve_traceparent: bool = True) -> dict:
-        """Build headers to forward to upstream, stripping sensitive ones."""
+    def _build_forward_headers(self, request: web.Request) -> dict:
+        """Build headers to forward to upstream.
+
+        P0-02: Strips incoming traceparent; caller must inject new one.
+        Sensitive headers (except Authorization) are stripped.
+        """
         headers = {}
         for k, v in request.headers.items():
             kl = k.lower()
@@ -457,8 +579,8 @@ class ProxyHandler:
                 continue
             if kl == "host":
                 continue  # Let aiohttp set the correct host
-            if kl == "traceparent" and not preserve_traceparent:
-                continue
+            if kl == "traceparent":
+                continue  # P0-02: stripped here, injected by caller with new span context
             headers[k] = v
         return headers
 
@@ -479,4 +601,5 @@ class ProxyHandler:
             "status": "healthy",
             "reporter_stats": stats,
             "upstream": self.config.upstream_url,
+            "gateway_name": self.config.gateway_name,
         })

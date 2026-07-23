@@ -9,12 +9,12 @@ services:
     ports:
       - "8082:8082"
     environment:
-      - LISTEN_HOST=0.0.0.0
-      - LISTEN_PORT=8082
-      # ↑ Point to your real LLM gateway (e.g. One-API)
+      - PROXY_HOST=0.0.0.0
+      - PROXY_PORT=8082
       - UPSTREAM_URL=http://host.docker.internal:3000
-      - OBSERVABILITY_URL=http://core:8001
+      - OBSERVABILITY_ENDPOINT=http://core:8001
       - PAYLOAD_STRATEGY=masked
+      - GATEWAY_NAME=one-api-proxy
     depends_on:
       - core
     restart: unless-stopped
