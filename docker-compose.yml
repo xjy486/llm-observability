@@ -1,0 +1,47 @@
+version: "3.8"
+
+services:
+  # ─── Telemetry Proxy ───
+  proxy:
+    build:
+      context: ./proxy
+      dockerfile: Dockerfile
+    ports:
+      - "8082:8082"
+    environment:
+      - LISTEN_HOST=0.0.0.0
+      - LISTEN_PORT=8082
+      # ↑ Point to your real LLM gateway (e.g. One-API)
+      - UPSTREAM_URL=http://host.docker.internal:3000
+      - OBSERVABILITY_URL=http://core:8001
+      - PAYLOAD_STRATEGY=masked
+    depends_on:
+      - core
+    restart: unless-stopped
+
+  # ─── Observability Core (FastAPI + SQLite) ───
+  core:
+    build:
+      context: ./core
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      - DB_PATH=/data/observability.db
+    volumes:
+      - obs-data:/data
+    restart: unless-stopped
+
+  # ─── Web UI (React → nginx) ───
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    depends_on:
+      - core
+    restart: unless-stopped
+
+volumes:
+  obs-data:
