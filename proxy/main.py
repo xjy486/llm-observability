@@ -4,6 +4,7 @@ Telemetry Proxy — main entry point.
 import asyncio
 import logging
 import sys
+from typing import Optional
 
 from aiohttp import web
 
@@ -19,8 +20,10 @@ logging.basicConfig(
 logger = logging.getLogger("proxy.main")
 
 
-async def create_app(config: ProxyConfig) -> web.Application:
+async def create_app(config: Optional[ProxyConfig] = None) -> web.Application:
     """Create the aiohttp application."""
+    if config is None:
+        config = ProxyConfig.from_env()
     reporter = TelemetryReporter(
         endpoint=config.observability_endpoint,
         timeout=config.observability_timeout,
@@ -62,8 +65,19 @@ def main():
         config.upstream_url, config.observability_endpoint,
         config.payload_strategy,
     )
-    app = asyncio.run(create_app(config))
+    app = create_app_sync(config)
     web.run_app(app, host=config.listen_host, port=config.listen_port)
+
+
+def create_app_sync(config: ProxyConfig) -> web.Application:
+    """Create app synchronously (delegates to async create_app)."""
+    loop = asyncio.new_event_loop()
+    try:
+        app = loop.run_until_complete(create_app(config))
+        return app
+    finally:
+        if not loop.is_closed():
+            loop.stop()
 
 
 if __name__ == "__main__":
