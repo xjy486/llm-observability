@@ -431,12 +431,14 @@ class TestTimingMigrationNoCopy:
             os.unlink(db_path)
 
     def test_migration_preserves_old_ttft_ms_column(self):
-        """Old DB already had ttft_ms column — migration should keep existing values as NULL."""
-        # The old schema had ttft_ms, but the semantics changed (old ttft was different).
-        # Safest: set to NULL. But since ALTER TABLE adds new column as NULL,
-        # and old column already existed, the old values technically remain.
-        # However, our migration only adds MISSING columns. The old ttft_ms stays.
-        # This test verifies that the old ttft_ms value is accessible but flagged as legacy.
+        """Legacy records: ttft_ms is NULLed by v1→v2 migration (one-time).
+
+        The old schema had ttft_ms but semantics changed between v1 and v2.
+        The migration NULLs old ttft_ms values. This test verifies:
+          - ttft_ms is None (was 50.0 in v1, NULLed by migration)
+          - first_chunk_ms is None (not copied from ttfc_ms=80.0)
+          - duration_ms is preserved
+        """
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             db_path = f.name
         try:
@@ -461,9 +463,87 @@ class TestTimingMigrationNoCopy:
             storage = Storage(db_path=db_path)
             spans = storage.get_trace_spans("t-old")
             assert len(spans) == 1
-            # Old ttft_ms=50.0 remains in the DB (we don't NULL existing columns).
-            # But first_chunk_ms should be NULL (not copied from ttfc_ms=80.0).
-            assert spans[0]["first_chunk_ms"] is None
+            s = spans[0]
+            # Migration NULLed old ttft_ms (incompatible v1→v2 semantics)
+            assert s["ttft_ms"] is None, \
+                f"ttft_ms must be NULL after migration (was {s['ttft_ms']})"
+            # first_chunk_ms not copied from ttfc_ms
+            assert s["first_chunk_ms"] is None
+            # duration_ms preserved
+            assert s["duration_ms"] == 1500.0
+
+        finally:
+            os.unlink(db_path)
+
+    def test_migration_does_not_null_new_ttft_on_restart(self):
+        """Regression: After migration + restart, new ttft_ms values must survive.
+
+        The bug: the old code checked `if "ttfc_ms" in existing_cols` which stays
+        True forever (column is never DROPped). On restart, it would
+        re-run `UPDATE spans SET ttft_ms = NULL`, destroying valid new data.
+
+        The fix gates the destructive UPDATE behind a schema_version check —
+        it only runs when upgrading from a prior version, not on every restart.
+
+        Test steps:
+          1. Create v1 DB (with ttfc_ms)
+          2. Start Storage → migration v1→v2
+          3. Insert new Span: ttft=45, first_chunk=25
+          4. Recreate Storage(db_path) — simulates restart
+          5. Query new Span → ttft_ms == 45, first_chunk_ms == 25
+        """
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+        try:
+            # Step 1: Create v1 schema with ttfc_ms
+            old_conn = sqlite3.connect(db_path)
+            old_conn.execute("""CREATE TABLE spans (
+                trace_id TEXT, span_id TEXT, span_kind TEXT,
+                start_time REAL, end_time REAL, duration_ms REAL,
+                status TEXT, ttft_ms REAL, ttfc_ms REAL,
+                attributes TEXT, events TEXT, payload TEXT,
+                request_metadata TEXT, session_id TEXT, user_id TEXT,
+                error_type TEXT, error_message TEXT
+            )""")
+            old_conn.execute("""INSERT INTO spans VALUES (
+                'legacy', 'legacy-span', 'LLM',
+                1000.0, 1001.5, 1500.0,
+                'OK', 50.0, 80.0,
+                '{}', '[]', NULL, NULL, 's1', 'u1', NULL, NULL
+            )""")
+            old_conn.commit()
+            old_conn.close()
+
+            # Step 2: First Storage startup → triggers v1→v2 migration
+            storage1 = Storage(db_path=db_path)
+
+            # Verify legacy record was migrated
+            legacy_spans = storage1.get_trace_spans("legacy")
+            assert legacy_spans[0]["ttft_ms"] is None  # NULLed by migration
+
+            # Step 3: Insert new record with valid timing
+            new_span = _make_span(
+                trace_id="t-restart", span_id="s-restart",
+                duration_ms=300,
+            )
+            new_span["ttft_ms"] = 45.0
+            new_span["first_chunk_ms"] = 25.0
+            storage1.insert_span(new_span)
+
+            # Step 4: Restart — recreate Storage with the SAME db file
+            del storage1
+
+            storage2 = Storage(db_path=db_path)
+
+            # Step 5: The new span's timing MUST survive the restart
+            spans = storage2.get_trace_spans("t-restart")
+            assert len(spans) == 1
+            s = spans[0]
+            assert s["ttft_ms"] == 45.0, \
+                f"BUG: new ttft_ms was destroyed on restart! (got {s['ttft_ms']})"
+            assert s["first_chunk_ms"] == 25.0, \
+                f"BUG: new first_chunk_ms destroyed on restart! (got {s['first_chunk_ms']})"
+            assert s["duration_ms"] == 300.0
 
         finally:
             os.unlink(db_path)

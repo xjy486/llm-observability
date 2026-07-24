@@ -157,12 +157,26 @@ class Storage:
                             "first_chunk_ms NULL (incompatible timing semantics)"
                         )
 
-            # P0-NEW-02-fix: If migrating from v1 (ttfc_ms existed), NULL out
-            # old ttft_ms values too — the semantics changed between v1 and v2.
-            # ttft_ms existed in v1 but meant something subtly different; NULL is safer.
-            if "ttfc_ms" in existing_cols:
-                conn.execute("UPDATE spans SET ttft_ms = NULL WHERE ttft_ms IS NOT NULL")
-                logger.info("Migration: NULLed old ttft_ms values (incompatible semantics)")
+            # ── Destructive migration: v1 → v2 timing semantics ──
+            # CRITICAL: This must only run ONCE. The old ttfc_ms column is never
+            # DROPped (SQLite ALTER TABLE DROP COLUMN requires v3.35+), so
+            # "ttfc_ms" in existing_cols stays True forever. If we NULL ttft_ms
+            # on every restart, we destroy new valid timing data produced by
+            # the v2 system. Gate on schema_version instead: run only when
+            # upgrading from a prior version (< SCHEMA_VERSION).
+            version_row = conn.execute(
+                "SELECT value FROM metadata WHERE key = 'schema_version'"
+            ).fetchone()
+            current_version = version_row[0] if version_row else None
+
+            if current_version != SCHEMA_VERSION and "ttfc_ms" in existing_cols:
+                conn.execute(
+                    "UPDATE spans SET ttft_ms = NULL WHERE ttft_ms IS NOT NULL"
+                )
+                logger.info(
+                    "Migration v1→v2: NULLed legacy ttft_ms values "
+                    "(incompatible timing semantics, one-time only)"
+                )
 
             # Create indexes AFTER migration so all columns exist
             conn.executescript("""
