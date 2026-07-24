@@ -254,12 +254,8 @@ class TestP03StreamingLifecycle:
             reporter = MockReporter()
 
         tracer = MockTracer()
-        token = set_context(SpanContext(
-            trace_id="t1", span_id="s1", parent_span_id=None,
-            span_kind=SpanKind.LLM, sampled=True,
-        ))
 
-        observed = ObservedStream(mock_stream, span, tracer, token)
+        observed = ObservedStream(mock_stream, span, tracer, sampled=True)
 
         # Consume the stream
         collected = []
@@ -299,12 +295,8 @@ class TestP03StreamingLifecycle:
             reporter = MockReporter()
 
         tracer = MockTracer()
-        token = set_context(SpanContext(
-            trace_id="t1", span_id="s1", parent_span_id=None,
-            span_kind=SpanKind.LLM, sampled=True,
-        ))
 
-        observed = ObservedStream(ErrorStream(), span, tracer, token)
+        observed = ObservedStream(ErrorStream(), span, tracer, sampled=True)
 
         with pytest.raises(ConnectionError):
             for _ in observed:
@@ -348,12 +340,8 @@ class TestP03StreamingLifecycle:
             reporter = MockReporter()
 
         tracer = MockTracer()
-        token = set_context(SpanContext(
-            trace_id="t1", span_id="s1", parent_span_id=None,
-            span_kind=SpanKind.LLM, sampled=True,
-        ))
 
-        observed = ObservedStream(mock_stream, span, tracer, token)
+        observed = ObservedStream(mock_stream, span, tracer, sampled=True)
         observed.close()
 
         assert observed._finalized is True

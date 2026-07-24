@@ -32,6 +32,14 @@ class TraceContext:
         """Serialize back to traceparent header format."""
         return f"00-{self.trace_id}-{self.span_id}-{self.trace_flags}"
 
+    @property
+    def sampled(self) -> bool:
+        """P0-2: Whether this trace is sampled, derived from trace_flags.
+
+        flags=01 means sampled, flags=00 means not sampled.
+        """
+        return self.trace_flags == "01"
+
 
 def parse_traceparent(header_value: str) -> Optional[TraceContext]:
     """Parse a W3C traceparent header value.

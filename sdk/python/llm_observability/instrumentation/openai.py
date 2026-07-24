@@ -6,8 +6,11 @@ Patches openai.resources.chat.completions.Completions.create to:
 3. Record response metadata (model, tokens)
 4. Handle dedup via logical_llm_span_active flag (spec §19)
 
-P0-2: All state (_tracer, _original_create, _patched) is instance-level,
-      not module-level, to ensure correct lifecycle across init/shutdown/re-init.
+P0-1 (final): ContextVar lifetime is decoupled from Span lifetime.
+              Context is restored immediately after original_create() returns.
+              ObservedStream only manages Span lifecycle, not context.
+P0-2 (final): Sampling decision inherited from parent context; LLM span
+              finalize gates reporter.report on sampled flag.
 P0-3: Streaming responses are wrapped in ObservedStream to defer span
       finalization until the stream is fully consumed.
 P1-4: Dedup still injects traceparent + ownership marker headers.
@@ -89,8 +92,8 @@ class OpenAIInstrumentor(BaseInstrumentor):
         Creates an LLM span, injects headers, calls original, records result.
         P1-4: Dedup — if logical_llm_span_active is True, skips span creation
               but STILL injects traceparent + ownership marker.
-        P0-3: For streaming, wraps the Stream in ObservedStream to defer
-              span finalization until stream consumption completes.
+        P0-1: Context is restored immediately after create() returns.
+        P0-2: Sampling inherited from parent; report gated on sampled.
         """
         if self._tracer is None or self._original_create is None:
             return self._original_create(self_inner, *args, **kwargs)
@@ -110,7 +113,6 @@ class OpenAIInstrumentor(BaseInstrumentor):
             inject = inject_headers(
                 current_ctx,
                 is_logical_llm=True,
-                session_id=self._tracer.config and None,  # metadata from context
             )
             headers.update(inject)
             kwargs["extra_headers"] = headers
@@ -165,40 +167,45 @@ class OpenAIInstrumentor(BaseInstrumentor):
 
         try:
             response = self._original_create(self_inner, *args, **kwargs)
-
-            # P0-3: For streaming, wrap in ObservedStream
-            if stream:
-                return ObservedStream(
-                    response,
-                    span,
-                    self._tracer,
-                    token,
-                )
-
-            # Non-streaming: process and finalize immediately
-            span.set_status("OK")
-            self._extract_response_metadata(span, response)
-
-            # Store response payload (masked)
-            if self._tracer.config.payload_strategy != "off" and response:
-                from ..utils.masking import mask_payload
-                try:
-                    resp_dict = response.model_dump() if hasattr(response, "model_dump") else None
-                    if resp_dict:
-                        span.set_attribute(
-                            "llm.output",
-                            mask_payload(resp_dict, self._tracer.config.payload_strategy),
-                        )
-                except Exception:
-                    pass
-
-            self._finalize_span(span, token)
-            return response
-
         except Exception as e:
+            # Error path: finalize span and reset context (context not yet restored)
             span.set_error(error_type=type(e).__name__, error_message=str(e))
-            self._finalize_span(span, token)
+            self._finalize_span(span, token, sampled=llm_ctx.sampled)
             raise
+
+        # P0-1: Restore parent context IMMEDIATELY after create() returns.
+        # The ContextVar activation was only needed for header injection.
+        # Span lifetime continues independently (streaming) or ends now (non-streaming).
+        reset_context(token)
+
+        # P0-3: For streaming, wrap in ObservedStream (no token needed)
+        if stream:
+            return ObservedStream(
+                response,
+                span,
+                self._tracer,
+                sampled=llm_ctx.sampled,
+            )
+
+        # Non-streaming: process and finalize immediately
+        span.set_status("OK")
+        self._extract_response_metadata(span, response)
+
+        # Store response payload (masked)
+        if self._tracer.config.payload_strategy != "off" and response:
+            from ..utils.masking import mask_payload
+            try:
+                resp_dict = response.model_dump() if hasattr(response, "model_dump") else None
+                if resp_dict:
+                    span.set_attribute(
+                        "llm.output",
+                        mask_payload(resp_dict, self._tracer.config.payload_strategy),
+                    )
+            except Exception:
+                pass
+
+        self._finalize_span_no_reset(span, sampled=llm_ctx.sampled)
+        return response
 
     def _extract_response_metadata(self, span: Span, response):
         """Extract model and usage from response."""
@@ -213,39 +220,62 @@ class OpenAIInstrumentor(BaseInstrumentor):
             if hasattr(usage, "total_tokens") and usage.total_tokens is not None:
                 span.set_attribute("gen_ai.usage.total_tokens", usage.total_tokens)
 
-    def _finalize_span(self, span: Span, token):
-        """End and report a span, then reset context."""
+    def _finalize_span(self, span: Span, token, sampled: bool = True):
+        """End and report a span, then reset context. Used for error path only.
+
+        P0-2: Gates reporter.report on sampled flag.
+        """
         span.end()
-        try:
-            self._tracer.reporter.report(span.to_record())
-        except Exception as e:
-            logger.error("Failed to report LLM span: %s", e)
+        if sampled:
+            try:
+                self._tracer.reporter.report(span.to_record())
+            except Exception as e:
+                logger.error("Failed to report LLM span: %s", e)
         reset_context(token)
+
+    def _finalize_span_no_reset(self, span: Span, sampled: bool = True):
+        """End and report a span WITHOUT resetting context (P0-1: context already restored).
+
+        P0-2: Gates reporter.report on sampled flag.
+        """
+        span.end()
+        if sampled:
+            try:
+                self._tracer.reporter.report(span.to_record())
+            except Exception as e:
+                logger.error("Failed to report LLM span: %s", e)
 
 
 class ObservedStream:
     """Wrapper for OpenAI streaming responses.
 
-    P0-3: Defers LLM span finalization until the stream is fully consumed.
+    P0-1 (final): ContextVar lifetime is decoupled from Span lifetime.
+    The ContextVar is restored by the caller (_do_patch) immediately after
+    original_create() returns. ObservedStream only manages the Span lifecycle
+    (start/end/report), NOT the context.
+
+    P0-2: Reporting is gated on the sampled flag.
+
     The span is finalized when:
     - The iterator is exhausted (normal completion)
     - close() is called
     - An exception occurs during iteration
+    - __del__ best-effort (for early break without close)
 
     Maintains original OpenAI Stream behavior — all attributes and methods
     are delegated to the wrapped stream.
     """
 
-    def __init__(self, stream, span: Span, tracer, token):
+    def __init__(self, stream, span: Span, tracer, sampled: bool = True):
         self._stream = stream
         self._span = span
         self._tracer = tracer
-        self._token = token
+        self._sampled = sampled
         self._finalized = False
         self._collected_content = []
 
     def _finalize(self, error: Optional[Exception] = None):
-        """Finalize the span — end, report, reset context."""
+        """Finalize the span — end, report. Does NOT reset context (P0-1)."""
         if self._finalized:
             return
         self._finalized = True
@@ -259,8 +289,6 @@ class ObservedStream:
             self._span.set_status("OK")
 
         # Try to extract usage from the stream's last chunk
-        # OpenAI streams may have usage in the last chunk when stream_options.include_usage=True
-        # We also try to get it from any accumulated data
         self._try_extract_stream_usage()
 
         # Store aggregated content if available
@@ -276,20 +304,17 @@ class ObservedStream:
                 pass
 
         self._span.end()
-        try:
-            self._tracer.reporter.report(self._span.to_record())
-        except Exception as e:
-            logger.error("Failed to report LLM span: %s", e)
-        reset_context(self._token)
+
+        # P0-2: Only report if sampled
+        if self._sampled:
+            try:
+                self._tracer.reporter.report(self._span.to_record())
+            except Exception as e:
+                logger.error("Failed to report LLM span: %s", e)
 
     def _try_extract_stream_usage(self):
         """Try to extract usage info from stream attributes."""
-        # Some OpenAI stream objects may have usage stored
-        # when stream_options={"include_usage": True} is set
-        # The last chunk typically contains usage data
-        # We check if the stream has any accessible usage
         try:
-            # Check if we captured usage from the last chunk
             if hasattr(self, "_last_usage") and self._last_usage:
                 usage = self._last_usage
                 if hasattr(usage, "prompt_tokens") and usage.prompt_tokens is not None:
@@ -348,3 +373,11 @@ class ObservedStream:
         else:
             self._finalize()
         return False
+
+    def __del__(self):
+        """Best-effort finalize for early-break scenarios. Do NOT rely on this."""
+        if not self._finalized:
+            try:
+                self._finalize()
+            except Exception:
+                pass

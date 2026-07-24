@@ -232,7 +232,7 @@ class ProxyHandler:
         processed_payload = process_payload(request_body, self.config.payload_strategy, self.config)
 
         # Sampling check
-        should_sample = self._should_sample(is_error=False)
+        should_sample = self._should_sample_for_ctx(trace_ctx, is_error=False)
 
         # Forward to upstream
         upstream_url = self.config.upstream_url + request.path
@@ -487,6 +487,20 @@ class ProxyHandler:
         """Determine if this request should be sampled."""
         if is_error and self.config.error_always_capture:
             return True
+        import random
+        return random.random() < self.config.sample_rate
+
+    def _should_sample_for_ctx(self, trace_ctx, is_error: bool) -> bool:
+        """Determine sampling, inheriting from traceparent flags when present.
+
+        P0-2: When traceparent is inherited, sampling decision comes from flags.
+        When root trace (no inherited traceparent), apply config.sample_rate.
+        Errors are always captured (if error_always_capture).
+        """
+        if is_error and self.config.error_always_capture:
+            return True
+        if trace_ctx.inherited:
+            return trace_ctx.sampled
         import random
         return random.random() < self.config.sample_rate
 
