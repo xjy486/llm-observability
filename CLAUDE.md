@@ -51,3 +51,12 @@
 - StreamingAccumulator supports `capture_payload=False` for memory-efficient mode
 - Tests: contract tests + filter semantics tests pass
 - Pushed to https://github.com/xjy486/llm-observability
+
+## Current Status — Phase 2.1 (Application SDK & Agent Trace) complete
+- SDK Core: Config, ContextVar, Span, SpanContext — complete
+- Manual Trace API: Observability.init() + Observability.trace() — complete
+- OpenAI Instrumentation: chat.completions patch with LLM span + dedup — complete
+- Trace Context Propagation: W3C traceparent + ownership marker — complete
+- Proxy Span Ownership: GATEWAY detection from X-LLM-OBS-Span-Role header — complete
+- UI GATEWAY support: teal tag, waterfall color, detail fields — complete
+- E2E Tests: context propagation, dedup, fail-open, multi-LLM — complete (31 SDK tests + 65 proxy/core tests all pass)
