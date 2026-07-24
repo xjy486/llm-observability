@@ -205,6 +205,24 @@ function SpanDetailPanel({ span }: { span: SpanRecord }) {
             </div>
           )}
         </div>
+
+        {/* GATEWAY-specific fields */}
+        {span.span_kind === 'GATEWAY' && (
+          <div className="grid grid-cols-2 gap-2 pt-2 border-t border-gray-100">
+            <div>
+              <span className="text-gray-500">Gateway:</span>
+              <span className="ml-1 font-mono">
+                {span.attributes?.['llm.gateway.name'] || '—'}
+              </span>
+            </div>
+            {span.first_chunk_ms !== null && (
+              <div>
+                <span className="text-gray-500">First Chunk:</span>
+                <span className="ml-1 font-mono">{Math.round(span.first_chunk_ms)}ms</span>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Payload viewer */}

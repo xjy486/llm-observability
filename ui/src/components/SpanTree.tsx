@@ -55,6 +55,8 @@ function kindColor(kind: string): string {
       return 'tag-agent'
     case 'TOOL':
       return 'tag-tool'
+    case 'GATEWAY':
+      return 'tag-gateway'
     default:
       return 'bg-gray-100 text-gray-800'
   }
@@ -83,7 +85,9 @@ function WaterfallBar({
           ? 'bg-purple-400'
           : span.span_kind === 'TOOL'
             ? 'bg-orange-400'
-            : 'bg-gray-400'
+            : span.span_kind === 'GATEWAY'
+              ? 'bg-teal-400'
+              : 'bg-gray-400'
 
   return (
     <div className="relative h-5 bg-gray-100 rounded">
