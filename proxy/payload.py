@@ -6,6 +6,10 @@ Strategies:
 - metadata_only: Only structural metadata (model, token counts, status), no content
 - masked: Content captured but sensitive fields masked
 - full: Full content captured as-is
+
+BLOCKER-2: Uses unified SENSITIVE_REGEX_PATTERNS from common/privacy module
+for both key-based and regex-based masking, ensuring SDK and Proxy behavior
+is identical.
 """
 import re
 import json
@@ -14,10 +18,21 @@ from config import ProxyConfig
 
 
 def mask_value(val: str, patterns: list) -> str:
-    """Apply regex masking patterns to a string value."""
-    for pattern in patterns:
-        val = re.sub(pattern, "***MASKED***", val, flags=re.IGNORECASE)
-    return val
+    """Apply regex masking patterns to a string value.
+
+    BLOCKER-2: patterns is now a list of (compiled_regex, replacement_string) tuples
+    from the unified SENSITIVE_REGEX_PATTERNS, matching the SDK's masking behavior.
+    """
+    if not isinstance(val, str):
+        return val
+    masked = val
+    for pattern, replacement in patterns:
+        # Handle backreference replacements (e.g. r"\1=***REDACTED***")
+        if replacement.startswith(r"\1"):
+            masked = pattern.sub(replacement, masked)
+        else:
+            masked = pattern.sub(replacement, masked)
+    return masked
 
 
 def mask_object(obj: Any, patterns: list, mask_keys: list = None) -> Any:
@@ -26,6 +41,8 @@ def mask_object(obj: Any, patterns: list, mask_keys: list = None) -> Any:
     Two strategies:
     1. Key-based: if a key matches mask_keys, redact its entire value
     2. Regex-based: apply regex patterns to string values
+
+    BLOCKER-2: patterns is now a list of (compiled_regex, replacement_string) tuples.
     """
     if mask_keys is None:
         mask_keys = []

@@ -4,8 +4,8 @@ services:
   # ─── Telemetry Proxy ───
   proxy:
     build:
-      context: ./proxy
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: proxy/Dockerfile
     ports:
       - "8082:8082"
     environment:

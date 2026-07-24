@@ -365,13 +365,27 @@ class ObservedStream:
         return getattr(self._stream, name)
 
     def __enter__(self):
+        """P1-2: Enter context manager — delegate to underlying stream if supported."""
+        if hasattr(self._stream, "__enter__"):
+            self._stream.__enter__()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is not None:
-            self._finalize(error=exc_val)
-        else:
-            self._finalize()
+        """P1-2: Exit context manager — close underlying stream FIRST, then finalize span.
+
+        Ensures the underlying HTTP stream/connection is properly released
+        before the observability span is finalized. The span finalize (report)
+        only happens once due to the _finalized guard.
+        """
+        try:
+            if hasattr(self._stream, "__exit__"):
+                self._stream.__exit__(exc_type, exc_val, exc_tb)
+            elif hasattr(self._stream, "close"):
+                self._stream.close()
+        except Exception:
+            pass
+        finally:
+            self._finalize(error=exc_val if exc_type else None)
         return False
 
     def __del__(self):

@@ -516,7 +516,7 @@ class TestP14UnifiedMaskingKeys:
 
     def test_sdk_proxy_key_sets_match(self):
         """SDK and Proxy must have the same canonical key set."""
-        from llm_observability.utils.privacy_constants import SENSITIVE_KEYS
+        from common.privacy.constants import SENSITIVE_KEYS
         from config import ProxyConfig
         config = ProxyConfig()
         proxy_keys = set(k.lower() for k in config.mask_keys)

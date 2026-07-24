@@ -540,10 +540,18 @@ async def run_e2e_tests(svc: ServiceManager):
     # ═════════════════════════════════════════════════════════
     # Scenario 6: Sampling=0 — no telemetry stored, business OK
     # P0-2 Case A: sample_rate=0 → 0 AGENT, 0 LLM, 0 GATEWAY
+    # BLOCKER-1: Strict before/after count comparison
     # ═════════════════════════════════════════════════════════
     print("\n" + "=" * 70)
     print("Scenario 6: Sampling=0 (no telemetry, business OK)")
     print("=" * 70)
+
+    # BLOCKER-1: Capture before counts for strict comparison
+    before_metrics = http_get_json(f"{svc.core_url}/api/v1/metrics?durationMinutes=5")
+    before_trace_count = before_metrics.get("trace_count", 0)
+    before_span_count = before_metrics.get("span_count", 0)
+    before_llm_call_count = before_metrics.get("llm_call_count", 0)
+    print(f"  📊 Before: traces={before_trace_count}, spans={before_span_count}, llm_calls={before_llm_call_count}")
 
     # Shutdown the current SDK (which uses sample_rate=1.0 by default)
     Observability.shutdown()
@@ -580,21 +588,34 @@ async def run_e2e_tests(svc: ServiceManager):
     print("  ⏳ Waiting for async flush (5s)...")
     await asyncio.sleep(5)
 
-    # Query Core: should have NO traces from session-6
+    # BLOCKER-1: Strict before/after comparison — nothing should be added
+    after_metrics = http_get_json(f"{svc.core_url}/api/v1/metrics?durationMinutes=5")
+    after_trace_count = after_metrics.get("trace_count", 0)
+    after_span_count = after_metrics.get("span_count", 0)
+    after_llm_call_count = after_metrics.get("llm_call_count", 0)
+    print(f"  📊 After:  traces={after_trace_count}, spans={after_span_count}, llm_calls={after_llm_call_count}")
+
+    check(
+        "Trace count unchanged (sample_rate=0 adds nothing)",
+        after_trace_count == before_trace_count,
+        f"before={before_trace_count}, after={after_trace_count}",
+    )
+    check(
+        "Span count unchanged (sample_rate=0 adds nothing)",
+        after_span_count == before_span_count,
+        f"before={before_span_count}, after={after_span_count}",
+    )
+    check(
+        "LLM call count unchanged (sample_rate=0 adds nothing)",
+        after_llm_call_count == before_llm_call_count,
+        f"before={before_llm_call_count}, after={after_llm_call_count}",
+    )
+
+    # Also verify no traces from session-6
     traces_resp6 = http_get_json(f"{svc.core_url}/api/v1/traces?durationMinutes=5&limit=50")
     traces6 = traces_resp6.get("traces", [])
     session6_traces = [t for t in traces6 if t.get("session_id") == "e2e-session-6"]
-    check("No traces stored for sample_rate=0", len(session6_traces) == 0, f"found={len(session6_traces)}")
-
-    # Also check metrics: no AGENT/LLM from session-6
-    metrics6 = http_get_json(f"{svc.core_url}/api/v1/metrics?durationMinutes=5")
-    # The trace_count should NOT have increased from the sampling=0 call
-    # (it should still be the same as after scenario 5)
-    check(
-        "Metrics trace_count unchanged (sampling=0 adds nothing)",
-        metrics6.get("trace_count", 0) >= 3,  # still >=3 from scenarios 1-4
-        f"trace_count={metrics6.get('trace_count')}",
-    )
+    check("No traces stored for sample_rate=0 session", len(session6_traces) == 0, f"found={len(session6_traces)}")
 
     Observability.shutdown()
     print("  ✅ Sampling=0 SDK shut down")

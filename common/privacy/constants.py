@@ -1,12 +1,18 @@
 """Unified privacy constants shared between SDK and Proxy.
 
-P1-4: Both SDK and Proxy must use the same canonical set of sensitive keys
-and regex patterns for masking. This module is the single source of truth.
+This module is the single source of truth for:
+  - SENSITIVE_KEYS: keys whose values are entirely redacted in dicts
+  - SENSITIVE_REGEX_PATTERNS: compiled regex patterns for text content masking
 
-Import this from:
-  - sdk/python/llm_observability/utils/masking.py
-  - proxy/config.py
+Both SDK (sdk/python/llm_observability/utils/masking.py) and
+Proxy (proxy/config.py, proxy/payload.py) import from here.
+
+BLOCKER-2: Previously, proxy/config.py used sys.path.insert to import
+from the SDK source tree, which broke Docker builds (build context
+only included ./proxy). This common module resolves that by providing
+a proper shared package at the repo root.
 """
+import re
 
 # ── Canonical sensitive key set ──
 # Keys whose VALUES are entirely redacted when found in dicts (case-insensitive).
@@ -35,8 +41,7 @@ SENSITIVE_KEYS = [
 # ── Canonical regex patterns for text content masking ──
 # Each entry is (compiled_regex, replacement_string).
 # Used for masking sensitive values embedded in text content.
-import re
-
+# Both SDK and Proxy must use exactly this set.
 SENSITIVE_REGEX_PATTERNS = [
     # OpenAI-style API keys: sk-...
     (re.compile(r"sk-[a-zA-Z0-9]{20,}", re.IGNORECASE), "sk-***REDACTED***"),

@@ -2,19 +2,52 @@
 
 Strategies: off / metadata_only / masked / full
 
-P1-4: Unified masking rules with Proxy — imports canonical SENSITIVE_KEYS
-and SENSITIVE_REGEX_PATTERNS from privacy_constants to ensure both SDK and
-Proxy share the exact same sensitive key set and regex patterns.
+P1-4 / BLOCKER-2: Unified masking rules with Proxy — imports canonical
+SENSITIVE_KEYS and SENSITIVE_REGEX_PATTERNS from common.privacy.constants
+to ensure both SDK and Proxy share the exact same sensitive key set and
+regex patterns.
 """
 import copy
 import re
+import sys
+import os
 from typing import Any
 
-# P1-4: Import unified constants from privacy_constants (single source of truth)
-from llm_observability.utils.privacy_constants import (
-    SENSITIVE_KEYS as _CANONICAL_SENSITIVE_KEYS,
-    SENSITIVE_REGEX_PATTERNS as _CANONICAL_REGEX_PATTERNS,
-)
+# BLOCKER-2: Import from common/privacy module (repo-root shared package)
+# Path: masking.py → utils/ → llm_observability/ → python/ → sdk/ → repo_root
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+# Fallback: also try adding the llm-observability root
+_LLM_OBS_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+if _LLM_OBS_ROOT not in sys.path:
+    sys.path.insert(0, _LLM_OBS_ROOT)
+
+try:
+    from common.privacy.constants import (
+        SENSITIVE_KEYS as _CANONICAL_SENSITIVE_KEYS,
+        SENSITIVE_REGEX_PATTERNS as _CANONICAL_REGEX_PATTERNS,
+    )
+except ImportError:
+    # Fallback for SDK installed as package (without repo root available)
+    # In this case, use inline constants to ensure masking still works
+    import re as _re
+    _CANONICAL_SENSITIVE_KEYS = [
+        "authorization", "api_key", "apikey", "api-key", "x-api-key",
+        "x-auth-token", "token", "access_token", "refresh_token",
+        "secret", "secret_key", "private_key", "password", "passwd",
+        "credential", "cookie", "set-cookie", "proxy-authorization",
+    ]
+    _CANONICAL_REGEX_PATTERNS = [
+        (_re.compile(r"sk-[a-zA-Z0-9]{20,}", _re.IGNORECASE), "sk-***REDACTED***"),
+        (_re.compile(r"(?i)bearer\s+[a-zA-Z0-9\-._~+/]+=*", _re.IGNORECASE), "Bearer ***REDACTED***"),
+        (_re.compile(r"(?i)(password|passwd)\s*[=:]\s*\S+", _re.IGNORECASE), r"\1=***REDACTED***"),
+        (_re.compile(r"(?i)(token)\s*[=:]\s*\S+", _re.IGNORECASE), r"\1=***REDACTED***"),
+        (_re.compile(r"(?i)(secret)\s*[=:]\s*\S+", _re.IGNORECASE), r"\1=***REDACTED***"),
+        (_re.compile(r"(?i)api[_-]?key\s*[=:]\s*\S+", _re.IGNORECASE), "api_key=***REDACTED***"),
+        (_re.compile(r"(?i)authorization\s*[=:]\s*\S+", _re.IGNORECASE), "authorization=***REDACTED***"),
+    ]
 
 # Keys that are always masked regardless of strategy (from unified constants)
 SENSITIVE_KEYS = set(_CANONICAL_SENSITIVE_KEYS)

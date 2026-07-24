@@ -660,14 +660,42 @@ class Storage:
                 SUM(COALESCE(input_tokens, 0)) as input_tokens,
                 SUM(COALESCE(output_tokens, 0)) as output_tokens,
                 SUM(COALESCE(total_tokens, 0)) as total_tokens,
-                COUNT(DISTINCT model) as unique_models,
-                COUNT(DISTINCT user_id) as unique_users,
-                COUNT(DISTINCT session_id) as unique_sessions
+                COUNT(DISTINCT model) as unique_models
             FROM spans s WHERE {llm_where}""",
             params
         ).fetchone()
 
         llm_call_count = llm_row["llm_call_count"] or 0
+
+        # P1-1: unique_users / unique_sessions must be counted at Trace-level.
+        # SDK pattern: AGENT span has user_id/session_id, LLM spans have NULL.
+        # Counting DISTINCT on LLM spans gives 0. Instead, compute trace-level
+        # user_id/session_id (preferring AGENT span, fallback to any non-NULL),
+        # then count DISTINCT on those trace-level values.
+        unique_dims_row = conn.execute(
+            f"""SELECT
+                COUNT(DISTINCT trace_user_id) as unique_users,
+                COUNT(DISTINCT trace_session_id) as unique_sessions
+            FROM (
+                SELECT
+                    trace_id,
+                    COALESCE(
+                        MAX(CASE WHEN span_kind = 'AGENT' THEN user_id END),
+                        MAX(user_id)
+                    ) AS trace_user_id,
+                    COALESCE(
+                        MAX(CASE WHEN span_kind = 'AGENT' THEN session_id END),
+                        MAX(session_id)
+                    ) AS trace_session_id
+                FROM spans s
+                WHERE {where_clause}
+                GROUP BY trace_id
+            )""",
+            params
+        ).fetchone()
+
+        unique_users = unique_dims_row["unique_users"] if unique_dims_row else 0
+        unique_sessions = unique_dims_row["unique_sessions"] if unique_dims_row else 0
 
         # Latency percentiles (LLM spans only)
         latency_rows = conn.execute(
@@ -745,8 +773,8 @@ class Storage:
 
             # Dimensional
             "unique_models": llm_row["unique_models"] or 0,
-            "unique_users": llm_row["unique_users"] or 0,
-            "unique_sessions": llm_row["unique_sessions"] or 0,
+            "unique_users": unique_users,
+            "unique_sessions": unique_sessions,
         }
 
     def get_time_series(

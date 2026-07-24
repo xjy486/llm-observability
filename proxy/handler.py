@@ -254,6 +254,8 @@ class ProxyHandler:
         except aiohttp.ClientError as e:
             # Upstream error — capture and return error
             elapsed_ms = (time.perf_counter() - start_time) * 1000
+            # BLOCKER-1: Re-evaluate sampling for error report
+            should_report = self._should_sample_for_ctx(trace_ctx, is_error=True)
             await self._report_telemetry(
                 trace_ctx=trace_ctx,
                 metadata=metadata,
@@ -270,6 +272,7 @@ class ProxyHandler:
                 ttft_ms=None,
                 first_chunk_ms=None,
                 ownership=ownership,
+                sampled=should_report,
             )
             return web.Response(
                 status=502,
@@ -362,6 +365,8 @@ class ProxyHandler:
         except (ConnectionResetError, asyncio.TimeoutError) as e:
             logger.warning("Streaming interrupted: %s", e)
             elapsed_ms = (time.perf_counter() - start_time) * 1000
+            # BLOCKER-1: Re-evaluate sampling for error report
+            should_report = self._should_sample_for_ctx(trace_ctx, is_error=True)
             await self._report_telemetry(
                 trace_ctx=trace_ctx, metadata=metadata, request_meta=request_meta,
                 start_wall=start_wall, elapsed_ms=elapsed_ms,
@@ -371,6 +376,7 @@ class ProxyHandler:
                 response_payload=accumulator.build_response() if should_sample else None,
                 ttft_ms=ttft_ms, first_chunk_ms=first_chunk_ms,
                 ownership=ownership,
+                sampled=should_report,
             )
             if not response.prepared:
                 return web.Response(status=502, text="Streaming error")
@@ -409,6 +415,7 @@ class ProxyHandler:
             response_payload=response_payload,
             ttft_ms=ttft_ms, first_chunk_ms=first_chunk_ms,
             ownership=ownership,
+            sampled=should_sample,
         )
 
         return response
@@ -475,6 +482,7 @@ class ProxyHandler:
             response_payload=response_payload,
             ttft_ms=ttft_ms, first_chunk_ms=first_chunk_ms,
             ownership=ownership,
+            sampled=should_sample,
         )
 
         return web.Response(
@@ -496,11 +504,17 @@ class ProxyHandler:
         P0-2: When traceparent is inherited, sampling decision comes from flags.
         When root trace (no inherited traceparent), apply config.sample_rate.
         Errors are always captured (if error_always_capture).
+
+        BLOCKER-1: For inherited traces, ALWAYS respect upstream sampling decision.
+        Even on HTTP 500, do NOT force-report a GATEWAY span if upstream flags=00.
+        error_always_capture only applies to root traces (Proxy as Root).
         """
-        if is_error and self.config.error_always_capture:
-            return True
+        # BLOCKER-1: Inherited traces — always respect upstream flags, even on error.
         if trace_ctx.inherited:
             return trace_ctx.sampled
+        # Root traces — error_always_capture can override sample_rate
+        if is_error and self.config.error_always_capture:
+            return True
         import random
         return random.random() < self.config.sample_rate
 
@@ -521,12 +535,23 @@ class ProxyHandler:
         ttft_ms: Optional[float],
         first_chunk_ms: Optional[float],
         ownership: Optional[str] = None,
+        sampled: bool = True,
     ):
         """Build and queue telemetry record.
+
+        BLOCKER-1: Sampling gate — if sampled=False, do NOT report.
+        This ensures sample_rate=0 produces 0 GATEWAY spans, matching
+        the 0 AGENT and 0 LLM spans from the SDK side.
 
         P1-04: Uses self.config.gateway_name instead of hardcoded 'one-api-proxy'.
         P0-NEW-02: Reports ttft_ms and first_chunk_ms (no ttfc_ms).
         """
+        # BLOCKER-1: Unified sampling gate — if not sampled, skip entirely.
+        # This prevents orphan GATEWAY spans when sample_rate=0 or when
+        # inherited traceparent has flags=00.
+        if not sampled:
+            return
+
         # Build attributes (OpenTelemetry GenAI semantic conventions)
         attributes = {
             "gen_ai.request.model": request_meta.get("model", "unknown"),

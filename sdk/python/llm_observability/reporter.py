@@ -145,15 +145,18 @@ class Reporter:
 
         self._stop = True
 
-        # Schedule stop coroutine on the loop
-        if self._loop and not self._loop.is_closed():
-            future = asyncio.run_coroutine_threadsafe(self.stop(), self._loop)
-            try:
-                future.result(timeout=10.0)
-            except Exception as e:
-                logger.error("Reporter stop error: %s", e)
+        # P1-3: Use shutdown_timeout + grace period instead of hardcoded 10s.
+        # The internal stop() coroutine may take up to shutdown_timeout to drain
+        # the queue. Using the same value risks cutting it short.
+        wait_timeout = self.shutdown_timeout + 2.0
+        future = asyncio.run_coroutine_threadsafe(self.stop(), self._loop)
+        try:
+            future.result(timeout=wait_timeout)
+        except Exception as e:
+            logger.error("Reporter stop error: %s", e)
 
-            # Stop the loop and join thread
+        # Stop the loop and join thread
+        if self._loop and not self._loop.is_closed():
             self._loop.call_soon_threadsafe(self._loop.stop)
 
         if self._thread.is_alive():

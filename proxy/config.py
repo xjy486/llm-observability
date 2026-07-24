@@ -6,14 +6,16 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
-# P1-4: Import unified sensitive keys from shared privacy_constants
-_sdk_utils_path = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "sdk", "python", "llm_observability", "utils"
+# BLOCKER-2: Import unified sensitive keys and regex patterns from common/privacy
+# module (repo-root shared package). Previously used sys.path.insert to import
+# from SDK source tree, which broke Docker builds.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from common.privacy.constants import (
+    SENSITIVE_KEYS as _UNIFIED_SENSITIVE_KEYS,
+    SENSITIVE_REGEX_PATTERNS as _UNIFIED_REGEX_PATTERNS,
 )
-if _sdk_utils_path not in sys.path:
-    sys.path.insert(0, _sdk_utils_path)
-from privacy_constants import SENSITIVE_KEYS as _UNIFIED_SENSITIVE_KEYS
 
 
 @dataclass
@@ -54,13 +56,9 @@ class ProxyConfig:
     ])
 
     # Fields to mask in payload (regex-based content masking)
-    mask_patterns: list = field(default_factory=lambda: [
-        r"sk-[a-zA-Z0-9]+",  # OpenAI keys
-        r"Bearer\s+[a-zA-Z0-9\-._]+",
-        r"password['\"]?\s*[:=]\s*['\"]?[^\s'\"]+",
-        r"token['\"]?\s*[:=]\s*['\"]?[^\s'\"]+",
-        r"secret['\"]?\s*[:=]\s*['\"]?[^\s'\"]+",
-    ])
+    # BLOCKER-2: Uses unified SENSITIVE_REGEX_PATTERNS from common/privacy module.
+    # Previously maintained a separate set of regex patterns, leading to behavior drift.
+    mask_patterns: list = field(default_factory=lambda: [(p, r) for p, r in _UNIFIED_REGEX_PATTERNS])
 
     # Keys whose VALUES should be entirely redacted (key-based masking)
     # P1-4: Uses unified SENSITIVE_KEYS from privacy_constants (shared with SDK)

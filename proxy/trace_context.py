@@ -34,11 +34,16 @@ class TraceContext:
 
     @property
     def sampled(self) -> bool:
-        """P0-2: Whether this trace is sampled, derived from trace_flags.
+        """P1-4: Whether this trace is sampled, derived from trace_flags.
 
-        flags=01 means sampled, flags=00 means not sampled.
+        W3C trace-flags is a bit field. The sampled flag is bit 0 (lowest bit).
+        Therefore:
+          00 → False, 01 → True, 02 → False, 03 → True, ff → True
         """
-        return self.trace_flags == "01"
+        try:
+            return bool(int(self.trace_flags, 16) & 0x01)
+        except ValueError:
+            return False
 
 
 def parse_traceparent(header_value: str) -> Optional[TraceContext]:
