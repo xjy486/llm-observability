@@ -46,7 +46,8 @@ class ProxyConfig:
     ])
 
     # Keys whose VALUES should be entirely redacted (key-based masking)
-    mask_keys: list = field(default_factory=lambda: [
+    # P1-NEW-03: MASK_KEYS env var can override/augment the defaults
+    _default_mask_keys: list = field(default_factory=lambda: [
         "authorization",
         "api_key",
         "apikey",
@@ -62,6 +63,20 @@ class ProxyConfig:
         "credential",
         "cookie",
     ])
+
+    @property
+    def mask_keys(self) -> list:
+        """P1-NEW-03: Merge defaults with MASK_KEYS env var (comma-separated)."""
+        env_keys = os.getenv("MASK_KEYS", "")
+        if env_keys:
+            extra_keys = [k.strip() for k in env_keys.split(",") if k.strip()]
+            # Merge: env keys extend (and can override) defaults
+            merged = list(self._default_mask_keys)
+            for k in extra_keys:
+                if k not in merged:
+                    merged.append(k)
+            return merged
+        return self._default_mask_keys
 
     # Paths to intercept
     observed_paths: list = field(default_factory=lambda: [

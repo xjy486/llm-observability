@@ -9,7 +9,8 @@ export interface SpanRecord {
   duration_ms: number
   status: string
   http_status: number | null
-  ttft_ms: number | null
+  ttft_ms: number | null          // Time To First Token (streaming only, NULL for non-streaming)
+  first_chunk_ms: number | null   // Time To First SSE Chunk (streaming only, NULL for non-streaming)
   session_id: string | null
   user_id: string | null
   app_name: string | null
@@ -77,18 +78,28 @@ export interface TraceDetail {
 }
 
 export interface MetricsSummary {
-  total_requests: number
+  // Trace-level
+  trace_count: number
   error_count: number
   error_rate: number
+  // LLM Call-level
+  llm_call_count: number
   p50_latency_ms: number
   p95_latency_ms: number
   p99_latency_ms: number
   avg_ttft_ms: number | null
   p50_ttft_ms: number | null
   p95_ttft_ms: number | null
+  avg_first_chunk_ms: number | null
+  p50_first_chunk_ms: number | null
+  p95_first_chunk_ms: number | null
+  // Tokens
   total_input_tokens: number
   total_output_tokens: number
   total_tokens: number
+  // Span-level (debugging)
+  span_count: number
+  // Dimensional
   unique_models: number
   unique_users: number
   unique_sessions: number
@@ -96,17 +107,23 @@ export interface MetricsSummary {
 
 export interface TimeSeriesPoint {
   bucket: number
-  count: number
-  errors: number
-  avg_latency: number
+  trace_count: number           // P1-NEW-01: distinct traces in bucket
+  trace_error_count: number     // P1-NEW-01: traces with any ERROR span
+  llm_call_count: number        // P1-NEW-01: LLM spans in bucket
+  llm_error_count: number       // P1-NEW-01: ERROR LLM spans
+  llm_avg_latency_ms: number    // P1-NEW-01: avg duration_ms of LLM spans
+  avg_ttft_ms: number | null    // P1-NEW-01: avg ttft_ms of LLM spans (streaming only)
+  avg_first_chunk_ms: number | null  // P1-NEW-01: avg first_chunk_ms (streaming only)
+  span_count: number            // P1-NEW-01: total spans in bucket
   tokens: number
-  avg_ttft: number | null
 }
 
 export interface ModelInfo {
   model: string
-  count: number
-  errors: number
+  span_count: number
+  llm_call_count: number
+  trace_count: number
+  llm_errors: number            // P0-NEW-01: renamed from "errors" for clarity
 }
 
 export interface TraceListResponse {

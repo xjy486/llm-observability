@@ -27,12 +27,12 @@ LLM Provider (OpenAI,     Web UI (:3000)
 
 - ✅ Transparent proxy for `/v1/chat/completions` (non-streaming + SSE streaming)
 - ✅ W3C Trace Context propagation (inherit upstream or auto-create)
-- ✅ LLM Span: Model, Status, Latency, TTFT/TTFC, Tokens, Error
+- ✅ LLM Span: Model, Status, Latency, TTFT, first_chunk_ms, Tokens, Error
 - ✅ Payload capture with OFF / Metadata Only / Masked / Full strategies
 - ✅ Key-based recursive masking (`MASK_KEYS`) in addition to regex patterns
 - ✅ Trace List with filtering (status, model, session, user, time range)
 - ✅ Trace Detail with Span Tree
-- ✅ Dashboard: Trace count, LLM call count, Span count, error rate, P50/P95/P99 latency, TTFT/TTFC, tokens
+- ✅ Dashboard: Trace count, LLM call count, Span count, error rate, P50/P95/P99 latency, TTFT, first_chunk_ms, tokens
 - ✅ Async telemetry reporting (never blocks main LLM request)
 - ✅ Streaming response aggregation (SSE chunks → standardized OpenAI response)
 - ✅ Configurable gateway name (`GATEWAY_NAME` env var)

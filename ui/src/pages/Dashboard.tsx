@@ -57,7 +57,7 @@ export default function Dashboard() {
         <>
           {/* Stat cards */}
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
-            <StatCard label="Total Requests" value={metrics.total_requests} />
+            <StatCard label="Traces" value={metrics.trace_count} />
             <StatCard
               label="Error Rate"
               value={`${metrics.error_rate}%`}
@@ -82,7 +82,7 @@ export default function Dashboard() {
                 Request Volume (per {Math.max(60, duration)}s)
               </h3>
               <MiniChart
-                data={timeseries.map((p) => ({ x: p.bucket, y: p.count }))}
+                data={timeseries.map((p) => ({ x: p.bucket, y: p.llm_call_count || 0 }))}
                 color="#3b82f6"
                 label="requests"
               />
@@ -94,7 +94,7 @@ export default function Dashboard() {
               <MiniChart
                 data={timeseries.map((p) => ({
                   x: p.bucket,
-                  y: p.count > 0 ? (p.errors / p.count) * 100 : 0,
+                  y: p.llm_call_count > 0 ? (p.llm_error_count / p.llm_call_count) * 100 : 0,
                 }))}
                 color="#ef4444"
                 label="%"
@@ -105,7 +105,7 @@ export default function Dashboard() {
                 Avg Latency Over Time
               </h3>
               <MiniChart
-                data={timeseries.map((p) => ({ x: p.bucket, y: p.avg_latency || 0 }))}
+                data={timeseries.map((p) => ({ x: p.bucket, y: p.llm_avg_latency_ms || 0 }))}
                 color="#f59e0b"
                 label="ms"
               />
@@ -141,16 +141,16 @@ export default function Dashboard() {
                   {models.map((m) => (
                     <tr key={m.model} className="border-b border-gray-100">
                       <td className="py-2 font-mono text-xs">{m.model}</td>
-                      <td className="py-2 text-right">{m.count}</td>
+                      <td className="py-2 text-right">{m.llm_call_count}</td>
                       <td className="py-2 text-right">
-                        {m.errors > 0 ? (
-                          <span className="text-red-600">{m.errors}</span>
+                        {m.llm_errors > 0 ? (
+                          <span className="text-red-600">{m.llm_errors}</span>
                         ) : (
                           '0'
                         )}
                       </td>
                       <td className="py-2 text-right">
-                        {m.count > 0 ? ((m.errors / m.count) * 100).toFixed(1) : '0.0'}%
+                        {m.llm_call_count > 0 ? ((m.llm_errors / m.llm_call_count) * 100).toFixed(1) : '0.0'}%
                       </td>
                     </tr>
                   ))}

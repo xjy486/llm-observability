@@ -4,10 +4,11 @@ SQLite storage layer for the Observability Core.
 Stores spans in a single table; traces are derived by aggregating spans
 with the same trace_id. Supports incremental assembly for late-arriving spans.
 
-P0-05: Metrics distinguish Trace / LLM Call / Span levels.
-P0-06: Trace filtering uses two-phase query (find matching trace_ids, then aggregate all spans).
-P0-07: Pagination returns correct total count.
-P0-04: TTFT/TTFC semantics separated.
+P0-NEW-02: ttfc_ms deleted; first_chunk_ms added alongside ttft_ms.
+P0-NEW-03: Trace filter uses CTE — status/duration at trace level, model at span level (EXISTS).
+P0-NEW-04: Schema migration via ALTER TABLE + metadata table; ingest returns proper status.
+P1-NEW-01: TimeSeries fields match Summary semantics (trace/LLM/span separation).
+P1-NEW-02: Pagination via CTE/subquery — no loading all trace_ids into Python.
 """
 import sqlite3
 import json
@@ -18,6 +19,41 @@ from typing import Optional
 from collections import defaultdict
 
 logger = logging.getLogger("core.storage")
+
+# Current schema version
+SCHEMA_VERSION = "2"
+
+# Columns that should exist in the spans table (schema v2)
+EXPECTED_SPAN_COLUMNS = {
+    "trace_id", "span_id", "parent_span_id", "span_name", "span_kind",
+    "start_time", "end_time", "duration_ms", "status", "http_status",
+    "ttft_ms", "first_chunk_ms",  # v2: ttfc_ms removed, first_chunk_ms added
+    "session_id", "user_id", "app_name", "business_scene",
+    "attributes", "events", "error_type", "error_message",
+    "payload", "request_metadata", "payload_ref", "trace_inherited",
+    "model", "input_tokens", "output_tokens", "total_tokens", "is_stream",
+    "created_at",
+}
+
+# Columns that may need ALTER TABLE for old (v1) databases.
+# The migration checks each against existing columns and only adds missing ones,
+# so listing columns that already exist in v1 is harmless.
+V2_NEW_COLUMNS = {
+    "parent_span_id": "TEXT",
+    "span_name": "TEXT",
+    "http_status": "INTEGER",
+    "first_chunk_ms": "REAL",
+    "app_name": "TEXT",
+    "business_scene": "TEXT",
+    "payload_ref": "TEXT",
+    "trace_inherited": "INTEGER DEFAULT 0",
+    "model": "TEXT",
+    "input_tokens": "INTEGER",
+    "output_tokens": "INTEGER",
+    "total_tokens": "INTEGER",
+    "is_stream": "INTEGER",
+    "created_at": "REAL",  # ALTER TABLE doesn't allow non-constant defaults
+}
 
 
 class Storage:
@@ -43,11 +79,25 @@ class Storage:
         return self._local.conn
 
     def _init_db(self):
-        """Initialize database schema."""
+        """Initialize database schema with migration support.
+
+        P0-NEW-04: Checks existing schema and runs ALTER TABLE for missing columns.
+        A metadata(key, value) table tracks schema_version.
+        Old databases with ttfc_ms → first_chunk_ms values migrated automatically.
+        """
         with self._init_lock:
             if self._initialized:
                 return
             conn = self._get_conn()
+
+            # Create metadata table for schema versioning
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS spans (
                     trace_id TEXT NOT NULL,
@@ -61,17 +111,17 @@ class Storage:
                     status TEXT NOT NULL,
                     http_status INTEGER,
                     ttft_ms REAL,
-                    ttfc_ms REAL,
+                    first_chunk_ms REAL,
                     session_id TEXT,
                     user_id TEXT,
                     app_name TEXT,
                     business_scene TEXT,
-                    attributes TEXT,  -- JSON
-                    events TEXT,      -- JSON
+                    attributes TEXT,
+                    events TEXT,
                     error_type TEXT,
                     error_message TEXT,
-                    payload TEXT,     -- JSON
-                    request_metadata TEXT,  -- JSON
+                    payload TEXT,
+                    request_metadata TEXT,
                     payload_ref TEXT,
                     trace_inherited INTEGER DEFAULT 0,
                     model TEXT,
@@ -82,7 +132,28 @@ class Storage:
                     created_at REAL DEFAULT (strftime('%s', 'now')),
                     PRIMARY KEY (trace_id, span_id)
                 );
+            """)
 
+            # ── P0-NEW-04: Schema Migration ──
+            existing_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(spans)").fetchall()
+            }
+
+            # Add any v2 columns that are missing from the existing table
+            for col_name, col_type in V2_NEW_COLUMNS.items():
+                if col_name not in existing_cols:
+                    logger.info("Schema migration: adding column %s %s", col_name, col_type)
+                    conn.execute(f"ALTER TABLE spans ADD COLUMN {col_name} {col_type}")
+
+                    # If old ttfc_ms exists, copy values to first_chunk_ms
+                    if col_name == "first_chunk_ms" and "ttfc_ms" in existing_cols:
+                        conn.execute(
+                            "UPDATE spans SET first_chunk_ms = ttfc_ms WHERE first_chunk_ms IS NULL"
+                        )
+                        logger.info("Migration: copied ttfc_ms → first_chunk_ms")
+
+            # Create indexes AFTER migration so all columns exist
+            conn.executescript("""
                 CREATE INDEX IF NOT EXISTS idx_spans_trace_id ON spans(trace_id);
                 CREATE INDEX IF NOT EXISTS idx_spans_start_time ON spans(start_time);
                 CREATE INDEX IF NOT EXISTS idx_spans_status ON spans(status);
@@ -91,12 +162,21 @@ class Storage:
                 CREATE INDEX IF NOT EXISTS idx_spans_model ON spans(model);
                 CREATE INDEX IF NOT EXISTS idx_spans_kind ON spans(span_kind);
             """)
+
+            # Record schema version
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+                ("schema_version", SCHEMA_VERSION),
+            )
             conn.commit()
             self._initialized = True
-            logger.info("Storage initialized: %s", self.db_path)
+            logger.info("Storage initialized (schema v%s): %s", SCHEMA_VERSION, self.db_path)
 
     def insert_span(self, record: dict) -> bool:
-        """Insert or replace a span record."""
+        """Insert or replace a span record.
+
+        P0-NEW-02: Uses first_chunk_ms instead of ttfc_ms.
+        """
         conn = self._get_conn()
 
         # Extract model and tokens from attributes
@@ -111,7 +191,7 @@ class Storage:
             INSERT OR REPLACE INTO spans (
                 trace_id, span_id, parent_span_id, span_name, span_kind,
                 start_time, end_time, duration_ms, status, http_status,
-                ttft_ms, ttfc_ms, session_id, user_id, app_name, business_scene,
+                ttft_ms, first_chunk_ms, session_id, user_id, app_name, business_scene,
                 attributes, events, error_type, error_message, payload,
                 request_metadata, payload_ref, trace_inherited,
                 model, input_tokens, output_tokens, total_tokens, is_stream
@@ -128,7 +208,7 @@ class Storage:
             record.get("status", "OK"),
             record.get("http_status"),
             record.get("ttft_ms"),
-            record.get("ttfc_ms"),
+            record.get("first_chunk_ms"),
             record.get("session_id"),
             record.get("user_id"),
             record.get("app_name"),
@@ -191,75 +271,144 @@ class Storage:
     ) -> dict:
         """Get trace summaries with filtering.
 
-        P0-06: Two-phase query — first find trace_ids that match filters,
-        then aggregate ALL spans for those trace_ids (no partial traces).
+        P0-NEW-03: Trace filter semantics:
+        - status: trace-level aggregate (any span ERROR → trace ERROR)
+        - min/max_duration_ms: trace-level aggregate (MAX(end) - MIN(start))
+        - model: span-level EXISTS (trace contains at least one span with this model)
+        - session_id/user_id/trace_id/app_name/business_scene: span-level EXISTS
 
-        P0-07: Returns dict with 'traces' list and 'total' count for pagination.
+        P1-NEW-02: Pagination via CTE/subquery — no loading all trace_ids into Python.
+        All filtering, counting, sorting, and pagination done in SQL.
 
         Returns:
             {"traces": [...], "total": int}
         """
         conn = self._get_conn()
 
-        # ── Phase 1: Find matching trace_ids ──
-        # Build WHERE for span-level filters
-        conditions = []
-        params = []
+        # ── Build CTE for trace-level aggregation ──
+        # trace_agg computes per-trace: start, end, duration, status
+        trace_agg_conditions = []
+        trace_agg_params: list = []
 
+        # Time filters apply at span level (any span in the time window)
         if time_start is not None:
-            conditions.append("start_time >= ?")
-            params.append(time_start)
+            trace_agg_conditions.append("start_time >= ?")
+            trace_agg_params.append(time_start)
         if time_end is not None:
-            conditions.append("start_time <= ?")
-            params.append(time_end)
-        if status is not None:
-            conditions.append("status = ?")
-            params.append(status)
+            trace_agg_conditions.append("start_time <= ?")
+            trace_agg_params.append(time_end)
+
+        # These are span-level EXISTS filters — applied as conditions on individual spans
+        # but they determine which traces are included
+        span_exists_conditions = []
+        span_exists_params: list = []
+
         if model is not None:
-            conditions.append("model = ?")
-            params.append(model)
+            span_exists_conditions.append("model = ?")
+            span_exists_params.append(model)
         if session_id is not None:
-            conditions.append("session_id = ?")
-            params.append(session_id)
+            span_exists_conditions.append("session_id = ?")
+            span_exists_params.append(session_id)
         if user_id is not None:
-            conditions.append("user_id = ?")
-            params.append(user_id)
+            span_exists_conditions.append("user_id = ?")
+            span_exists_params.append(user_id)
         if trace_id is not None:
-            conditions.append("trace_id = ?")
-            params.append(trace_id)
+            span_exists_conditions.append("trace_id = ?")
+            span_exists_params.append(trace_id)
         if app_name is not None:
-            conditions.append("app_name = ?")
-            params.append(app_name)
+            span_exists_conditions.append("app_name = ?")
+            span_exists_params.append(app_name)
         if business_scene is not None:
-            conditions.append("business_scene = ?")
-            params.append(business_scene)
+            span_exists_conditions.append("business_scene = ?")
+            span_exists_params.append(business_scene)
 
-        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        # Build the base WHERE for selecting spans that go into trace_agg
+        base_conditions = list(trace_agg_conditions) + list(span_exists_conditions)
+        base_params = list(trace_agg_params) + list(span_exists_params)
+        base_where = " AND ".join(base_conditions) if base_conditions else "1=1"
 
-        # Get distinct trace_ids that have at least one matching span
-        matching_trace_ids_query = f"""
-            SELECT DISTINCT trace_id FROM spans WHERE {where_clause}
-        """
-        matching_rows = conn.execute(matching_trace_ids_query, params).fetchall()
-        matching_trace_ids = [r["trace_id"] for r in matching_rows]
+        # Build trace-level HAVING conditions (status, duration)
+        having_conditions = []
+        having_params: list = []
 
-        if not matching_trace_ids:
-            return {"traces": [], "total": 0}
+        if status is not None:
+            having_conditions.append("trace_status = ?")
+            having_params.append(status)
+        if min_duration_ms is not None:
+            having_conditions.append("trace_duration_ms >= ?")
+            having_params.append(min_duration_ms)
+        if max_duration_ms is not None:
+            having_conditions.append("trace_duration_ms <= ?")
+            having_params.append(max_duration_ms)
 
-        total = len(matching_trace_ids)
-
-        # ── Phase 2: Aggregate ALL spans for matching trace_ids ──
-        # Use a CTE for trace_id list, then aggregate without span-level WHERE
-        placeholders = ",".join("?" * len(matching_trace_ids))
+        having_clause = " AND ".join(having_conditions) if having_conditions else "1=1"
 
         # Valid sort columns (map to trace-level aggregate expressions)
         trace_sort_map = {
-            "start_time": "MIN(s.start_time)",
-            "duration_ms": "(MAX(s.end_time) - MIN(s.start_time)) * 1000",
-            "end_time": "MAX(s.end_time)",
+            "start_time": "trace_start",
+            "duration_ms": "trace_duration_ms",
+            "end_time": "trace_end",
         }
-        sort_expr = trace_sort_map.get(sort_by, "MIN(s.start_time)")
+        sort_expr = trace_sort_map.get(sort_by, "trace_start")
         sort_dir = "DESC" if sort_order.lower() == "desc" else "ASC"
+
+        # ── P1-NEW-02: Single CTE-based query for count ──
+        count_query = f"""
+            WITH trace_agg AS (
+                SELECT
+                    trace_id,
+                    MIN(start_time) AS trace_start,
+                    MAX(end_time) AS trace_end,
+                    (MAX(end_time) - MIN(start_time)) * 1000 AS trace_duration_ms,
+                    CASE
+                        WHEN SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END) > 0
+                        THEN 'ERROR' ELSE 'OK'
+                    END AS trace_status
+                FROM spans
+                WHERE {base_where}
+                GROUP BY trace_id
+                HAVING {having_clause}
+            )
+            SELECT COUNT(*) AS total FROM trace_agg
+        """
+        count_params = base_params + having_params
+        total_row = conn.execute(count_query, count_params).fetchone()
+        total = total_row["total"] if total_row else 0
+
+        if total == 0:
+            return {"traces": [], "total": 0}
+
+        # ── P1-NEW-02: CTE-based query with pagination ──
+        # Get the page of trace_ids first, then aggregate all spans for those traces
+        page_query = f"""
+            WITH trace_agg AS (
+                SELECT
+                    trace_id,
+                    MIN(start_time) AS trace_start,
+                    MAX(end_time) AS trace_end,
+                    (MAX(end_time) - MIN(start_time)) * 1000 AS trace_duration_ms,
+                    CASE
+                        WHEN SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END) > 0
+                        THEN 'ERROR' ELSE 'OK'
+                    END AS trace_status
+                FROM spans
+                WHERE {base_where}
+                GROUP BY trace_id
+                HAVING {having_clause}
+            )
+            SELECT trace_id FROM trace_agg
+            ORDER BY {sort_expr} {sort_dir}
+            LIMIT ? OFFSET ?
+        """
+        page_params = base_params + having_params + [limit, offset]
+        page_rows = conn.execute(page_query, page_params).fetchall()
+        page_trace_ids = [r["trace_id"] for r in page_rows]
+
+        if not page_trace_ids:
+            return {"traces": [], "total": total}
+
+        # ── Phase 2: Aggregate ALL spans for the page's trace_ids ──
+        placeholders = ",".join("?" * len(page_trace_ids))
 
         query = f"""
             SELECT
@@ -283,12 +432,14 @@ class Storage:
             FROM spans s
             WHERE s.trace_id IN ({placeholders})
             GROUP BY s.trace_id
-            ORDER BY {sort_expr} {sort_dir}
-            LIMIT ? OFFSET ?
         """
-        agg_params = list(matching_trace_ids) + [limit, offset]
+        agg_params = list(page_trace_ids)
 
         rows = conn.execute(query, agg_params).fetchall()
+
+        # Sort results in Python to match the CTE ordering (since IN() doesn't preserve order)
+        # Build a sort key mapping
+        sort_index = {tid: i for i, tid in enumerate(page_trace_ids)}
         results = []
         for row in rows:
             d = dict(row)
@@ -324,9 +475,13 @@ class Storage:
                     if isinstance(content, str):
                         d["output_summary"] = content[:200]
 
-            results.append(d)
+            results.append((sort_index.get(tid, 0), d))
 
-        return {"traces": results, "total": total}
+        # Sort by the CTE ordering
+        results.sort(key=lambda x: x[0])
+        final_results = [d for _, d in results]
+
+        return {"traces": final_results, "total": total}
 
     def get_trace_detail(self, trace_id: str) -> Optional[dict]:
         """Get full trace detail with all spans."""
@@ -376,16 +531,12 @@ class Storage:
         time_end: Optional[float] = None,
         model: Optional[str] = None,
         session_id: Optional[str] = None,
-        user_id: Optional[float] = None,
+        user_id: Optional[str] = None,
     ) -> dict:
         """Compute aggregated metrics for dashboard.
 
-        P0-05: Separates metrics into three levels:
-        - Trace metrics: trace_count, error_count, error_rate
-        - LLM Call metrics: llm_call_count, latency percentiles, ttft/ttfc, tokens
-        - Span metrics: span_count (debugging only)
-
-        P0-04: TTFT = Time To First Token; TTFC = Time To Complete.
+        P0-NEW-02: TTFC metrics removed. Only duration_ms, ttft_ms, first_chunk_ms.
+        Metrics separated into three levels: Trace / LLM Call / Span.
         Latency percentiles computed from LLM spans only.
         """
         conn = self._get_conn()
@@ -412,6 +563,7 @@ class Storage:
         where_clause = " AND ".join(conditions) if conditions else "1=1"
 
         # ── Trace-level metrics ──
+        # Trace status: any span ERROR → trace ERROR
         trace_row = conn.execute(
             f"""SELECT
                 COUNT(DISTINCT trace_id) as trace_count,
@@ -441,10 +593,6 @@ class Storage:
         ).fetchone()
 
         llm_call_count = llm_row["llm_call_count"] or 0
-        llm_error_count = llm_row["llm_error_count"] or 0
-        if trace_count > 0:
-            # Keep error_rate at trace level — it's more meaningful
-            pass
 
         # Latency percentiles (LLM spans only)
         latency_rows = conn.execute(
@@ -459,7 +607,7 @@ class Storage:
         p95 = self._percentile(latencies, 95)
         p99 = self._percentile(latencies, 99)
 
-        # TTFT percentiles (LLM spans only)
+        # TTFT percentiles (LLM spans only, streaming only — ttft_ms is null for non-streaming)
         ttft_rows = conn.execute(
             f"""SELECT ttft_ms FROM spans
                 WHERE {llm_where} AND ttft_ms IS NOT NULL
@@ -472,24 +620,20 @@ class Storage:
         p50_ttft = self._percentile(ttfts, 50) if ttfts else None
         p95_ttft = self._percentile(ttfts, 95) if ttfts else None
 
-        # TTFC percentiles (LLM spans only) — P0-04
-        ttfc_rows = conn.execute(
-            f"""SELECT ttfc_ms FROM spans
-                WHERE {llm_where} AND ttfc_ms IS NOT NULL
-                ORDER BY ttfc_ms""",
+        # P0-NEW-02: TTFC metrics removed — duration_ms already represents total latency
+
+        # P0-NEW-02: first_chunk_ms percentiles (LLM spans only, streaming only)
+        first_chunk_rows = conn.execute(
+            f"""SELECT first_chunk_ms FROM spans
+                WHERE {llm_where} AND first_chunk_ms IS NOT NULL
+                ORDER BY first_chunk_ms""",
             params
         ).fetchall()
-        ttfcs = [r["ttfc_ms"] for r in ttfc_rows]
+        first_chunks = [r["first_chunk_ms"] for r in first_chunk_rows]
 
-        avg_ttfc = sum(ttfcs) / len(ttfcs) if ttfcs else None
-        p50_ttfc = self._percentile(ttfcs, 50) if ttfcs else None
-        p95_ttfc = self._percentile(ttfcs, 95) if ttfcs else None
-
-        # Fallback: if ttfc_ms is not populated, use latency as TTFC
-        if not ttfcs and latencies:
-            avg_ttfc = sum(latencies) / len(latencies)
-            p50_ttfc = p50
-            p95_ttfc = p95
+        avg_first_chunk = sum(first_chunks) / len(first_chunks) if first_chunks else None
+        p50_first_chunk = self._percentile(first_chunks, 50) if first_chunks else None
+        p95_first_chunk = self._percentile(first_chunks, 95) if first_chunks else None
 
         # ── Span-level metrics (debugging) ──
         span_row = conn.execute(
@@ -512,9 +656,9 @@ class Storage:
             "avg_ttft_ms": round(avg_ttft, 2) if avg_ttft else None,
             "p50_ttft_ms": round(p50_ttft, 2) if p50_ttft else None,
             "p95_ttft_ms": round(p95_ttft, 2) if p95_ttft else None,
-            "avg_ttfc_ms": round(avg_ttfc, 2) if avg_ttfc else None,
-            "p50_ttfc_ms": round(p50_ttfc, 2) if p50_ttfc else None,
-            "p95_ttfc_ms": round(p95_ttfc, 2) if p95_ttfc else None,
+            "avg_first_chunk_ms": round(avg_first_chunk, 2) if avg_first_chunk else None,
+            "p50_first_chunk_ms": round(p50_first_chunk, 2) if p50_first_chunk else None,
+            "p95_first_chunk_ms": round(p95_first_chunk, 2) if p95_first_chunk else None,
 
             # Tokens (LLM spans only)
             "total_input_tokens": llm_row["input_tokens"] or 0,
@@ -537,7 +681,18 @@ class Storage:
         interval_seconds: int = 60,
         model: Optional[str] = None,
     ) -> list[dict]:
-        """Get time series data for charts."""
+        """Get time series data for charts.
+
+        P1-NEW-01: TimeSeries fields match Summary semantics:
+        - trace_count: distinct traces in bucket
+        - trace_error_count: traces with any ERROR span
+        - llm_call_count: LLM spans in bucket
+        - llm_error_count: ERROR LLM spans
+        - llm_avg_latency_ms: avg duration_ms of LLM spans
+        - avg_ttft_ms: avg ttft_ms of LLM spans (streaming only)
+        - span_count: total spans in bucket
+        - tokens: sum of total_tokens
+        """
         conn = self._get_conn()
 
         conditions = ["start_time >= ?", "start_time <= ?"]
@@ -554,10 +709,11 @@ class Storage:
                 COUNT(DISTINCT trace_id) as trace_count,
                 COUNT(CASE WHEN span_kind = 'LLM' THEN 1 END) as llm_call_count,
                 COUNT(*) as span_count,
-                SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END) as errors,
-                AVG(duration_ms) as avg_latency,
+                SUM(CASE WHEN status = 'ERROR' AND span_kind = 'LLM' THEN 1 ELSE 0 END) as llm_error_count,
+                AVG(CASE WHEN span_kind = 'LLM' THEN duration_ms END) as llm_avg_latency_ms,
                 SUM(COALESCE(total_tokens, 0)) as tokens,
-                AVG(CASE WHEN ttft_ms IS NOT NULL THEN ttft_ms END) as avg_ttft
+                AVG(CASE WHEN span_kind = 'LLM' AND ttft_ms IS NOT NULL THEN ttft_ms END) as avg_ttft_ms,
+                AVG(CASE WHEN span_kind = 'LLM' AND first_chunk_ms IS NOT NULL THEN first_chunk_ms END) as avg_first_chunk_ms
             FROM spans
             WHERE {where_clause}
             GROUP BY bucket
@@ -565,17 +721,38 @@ class Storage:
             params
         ).fetchall()
 
-        return [dict(r) for r in rows]
+        # Compute trace_error_count separately per bucket (traces with any ERROR span)
+        result = []
+        for r in rows:
+            d = dict(r)
+            bucket = d["bucket"]
+            # Count distinct traces with ERROR status in this bucket
+            err_row = conn.execute(
+                f"""SELECT COUNT(DISTINCT trace_id) as cnt
+                    FROM spans
+                    WHERE {where_clause}
+                      AND status = 'ERROR'
+                      AND CAST(start_time / {interval_seconds} AS INTEGER) * {interval_seconds} = ?""",
+                params + [bucket]
+            ).fetchone()
+            d["trace_error_count"] = err_row["cnt"] if err_row else 0
+            result.append(d)
+
+        return result
 
     def get_models_list(self) -> list[dict]:
-        """Get list of models with counts."""
+        """Get list of models with counts.
+
+        P0-NEW-01: ModelInfo fields aligned with frontend:
+        - model, trace_count, llm_call_count, span_count, llm_errors
+        """
         conn = self._get_conn()
         rows = conn.execute(
             """SELECT model,
                       COUNT(*) as span_count,
                       SUM(CASE WHEN span_kind = 'LLM' THEN 1 ELSE 0 END) as llm_call_count,
                       COUNT(DISTINCT trace_id) as trace_count,
-                      SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END) as errors
+                      SUM(CASE WHEN status = 'ERROR' AND span_kind = 'LLM' THEN 1 ELSE 0 END) as llm_errors
                FROM spans WHERE model IS NOT NULL
                GROUP BY model ORDER BY llm_call_count DESC"""
         ).fetchall()

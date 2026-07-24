@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from models import IngestRequest
 from storage import Storage
@@ -46,16 +47,54 @@ app.add_middleware(
 
 @app.post("/api/v1/ingest")
 async def ingest(request: IngestRequest):
-    """Ingest batch of telemetry records from proxy/SDK."""
+    """Ingest batch of telemetry records from proxy/SDK.
+
+    P0-NEW-04: Returns proper HTTP status:
+    - All inserts succeed → 200, status="ok"
+    - Some fail → 200, status="partial"
+    - All fail → 502, status="error"
+    """
     inserted = 0
-    for record in request.records:
+    errors = []
+    for i, record in enumerate(request.records):
         try:
             d = record.model_dump()
             storage.insert_span(d)
             inserted += 1
         except Exception as e:
-            logger.error("Failed to insert span: %s", e)
-    return {"status": "ok", "inserted": inserted, "total": len(request.records)}
+            logger.error("Failed to insert span %d: %s", i, e)
+            errors.append(str(e))
+
+    total = len(request.records)
+    failed = total - inserted
+
+    if total > 0 and inserted == 0:
+        # All failed
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "status": "error",
+                "inserted": 0,
+                "failed": total,
+                "total": total,
+                "errors": errors[:10],  # cap error list
+            },
+        )
+
+    if failed > 0:
+        # Partial failure
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "partial",
+                "inserted": inserted,
+                "failed": failed,
+                "total": total,
+                "errors": errors[:10],
+            },
+        )
+
+    return {"status": "ok", "inserted": inserted, "total": total}
 
 
 @app.get("/api/v1/traces")

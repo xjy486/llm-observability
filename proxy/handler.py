@@ -5,9 +5,15 @@ Handles:
 - Non-streaming /v1/chat/completions
 - Streaming SSE /v1/chat/completions
 - W3C Trace Context propagation (P0-02: inject traceparent for downstream)
-- TTFT/TTFC measurement (P0-04: TTFT = first token, TTFC = complete)
+- Timing measurement (P0-NEW-02):
+    ttft_ms        = Time To First Token — first content delta (streaming only; NULL for non-streaming)
+    first_chunk_ms = Time To First SSE Chunk — any SSE data chunk (streaming only; NULL for non-streaming)
+    duration_ms    = Total request duration (always set)
+    ttfc_ms is REMOVED — it was redundant with duration_ms.
 - Streaming response aggregation (P0-03: aggregate into standardized response)
 - Streaming memory optimization (P1-05: incremental accumulator, no raw chunk storage)
+- P1-NEW-04: When payload capture is off, don't accumulate full content — only track
+  model, usage, finish_reason, chunk_count, and timing.
 - Token / usage extraction
 - Error capture
 - Payload capture with masking strategies
@@ -36,11 +42,14 @@ class StreamingAccumulator:
 
     P0-03: Aggregates streaming chunks into a standardized non-streaming response.
     P1-05: Does NOT store raw chunks — extracts only necessary fields incrementally.
+    P1-NEW-04: When capture_content=False, skips content/reasoning/tool_calls
+    accumulation to save memory; still tracks model, id, finish_reason, usage, chunk_count.
     """
 
-    def __init__(self):
+    def __init__(self, capture_content: bool = True):
         self.model: Optional[str] = None
         self.id: Optional[str] = None
+        self.capture_content: bool = capture_content
         self.content_parts: list[str] = []  # concatenated content deltas
         self.reasoning_parts: list[str] = []  # reasoning/thinking content
         self.tool_calls: list[dict] = []
@@ -48,9 +57,13 @@ class StreamingAccumulator:
         self.usage: dict = {}
         self.chunk_count: int = 0
         self.first_chunk_received: bool = False
+        self.first_content_received: bool = False
 
-    def feed(self, chunk: dict) -> None:
-        """Process a single SSE chunk incrementally."""
+    def feed(self, chunk: dict) -> bool:
+        """Process a single SSE chunk incrementally.
+
+        Returns True if this chunk contained a content delta (for TTFT tracking).
+        """
         self.chunk_count += 1
 
         if not self.model:
@@ -58,6 +71,7 @@ class StreamingAccumulator:
         if not self.id:
             self.id = chunk.get("id")
 
+        had_content = False
         choices = chunk.get("choices", [])
         for choice in choices:
             delta = choice.get("delta", {})
@@ -65,27 +79,31 @@ class StreamingAccumulator:
                 # Content delta
                 content = delta.get("content")
                 if content:
-                    self.content_parts.append(content)
+                    had_content = True
+                    if self.capture_content:
+                        self.content_parts.append(content)
 
                 # Reasoning content (some models)
                 reasoning = delta.get("reasoning_content")
                 if reasoning:
-                    self.reasoning_parts.append(reasoning)
+                    if self.capture_content:
+                        self.reasoning_parts.append(reasoning)
 
                 # Tool calls
                 tc = delta.get("tool_calls")
                 if tc:
-                    for t in tc:
-                        idx = t.get("index", len(self.tool_calls))
-                        while len(self.tool_calls) <= idx:
-                            self.tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
-                        if t.get("id"):
-                            self.tool_calls[idx]["id"] = t["id"]
-                        func = t.get("function", {})
-                        if func.get("name"):
-                            self.tool_calls[idx]["function"]["name"] += func["name"]
-                        if func.get("arguments"):
-                            self.tool_calls[idx]["function"]["arguments"] += func["arguments"]
+                    if self.capture_content:
+                        for t in tc:
+                            idx = t.get("index", len(self.tool_calls))
+                            while len(self.tool_calls) <= idx:
+                                self.tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                            if t.get("id"):
+                                self.tool_calls[idx]["id"] = t["id"]
+                            func = t.get("function", {})
+                            if func.get("name"):
+                                self.tool_calls[idx]["function"]["name"] += func["name"]
+                            if func.get("arguments"):
+                                self.tool_calls[idx]["function"]["arguments"] += func["arguments"]
 
             # Finish reason (usually on last chunk)
             fr = choice.get("finish_reason")
@@ -97,13 +115,15 @@ class StreamingAccumulator:
         if u and isinstance(u, dict):
             self.usage = u
 
+        return had_content
+
     def build_response(self) -> dict:
         """Build a standardized non-streaming response object."""
-        full_content = "".join(self.content_parts)
+        full_content = "".join(self.content_parts) if self.capture_content else ""
         message = {"role": "assistant", "content": full_content if full_content else None}
-        if self.reasoning_parts:
+        if self.capture_content and self.reasoning_parts:
             message["reasoning_content"] = "".join(self.reasoning_parts)
-        if self.tool_calls:
+        if self.capture_content and self.tool_calls:
             message["tool_calls"] = self.tool_calls
 
         return {
@@ -242,7 +262,7 @@ class ProxyHandler:
                 processed_payload=processed_payload if should_sample else None,
                 response_payload=None,
                 ttft_ms=None,
-                ttfc_ms=None,
+                first_chunk_ms=None,
             )
             return web.Response(
                 status=502,
@@ -274,11 +294,13 @@ class ProxyHandler:
         processed_payload,
         should_sample: bool,
     ) -> web.StreamResponse:
-        """Handle SSE streaming response with TTFT/TTFC measurement.
+        """Handle SSE streaming response with timing measurement.
 
+        P0-NEW-02: Measures first_chunk_ms (any SSE data chunk) and
+        ttft_ms (first content token). Both are NULL for non-streaming.
         P0-03: Uses StreamingAccumulator to build standardized response.
         P1-05: Does NOT store raw SSE chunks — only incremental accumulation.
-        P0-04: Measures both TTFT (first token) and TTFC (complete).
+        P1-NEW-04: When payload capture is off, doesn't accumulate content.
         """
         # Create streaming response
         response = web.StreamResponse(
@@ -287,9 +309,14 @@ class ProxyHandler:
         )
         await response.prepare(request)
 
-        ttft_ms = None
-        accumulator = StreamingAccumulator()
+        ttft_ms = None       # Time to first content token
+        first_chunk_ms = None  # Time to first SSE data chunk
         first_chunk_time = None
+        first_token_time = None
+
+        # P1-NEW-04: Only accumulate content if we're sampling AND payload strategy is not "off"
+        capture_content = should_sample and self.config.payload_strategy != "off"
+        accumulator = StreamingAccumulator(capture_content=capture_content)
 
         try:
             async for line in upstream_resp.content:
@@ -304,10 +331,18 @@ class ProxyHandler:
                         continue
                     try:
                         chunk = json.loads(data_str)
-                        accumulator.feed(chunk)
+                        had_content = accumulator.feed(chunk)
+
+                        # Track first_chunk_ms: first SSE data chunk received
                         if first_chunk_time is None:
                             first_chunk_time = time.perf_counter()
-                            ttft_ms = (first_chunk_time - start_time) * 1000
+                            first_chunk_ms = (first_chunk_time - start_time) * 1000
+
+                        # Track ttft_ms: first content token (delta with actual content)
+                        if had_content and first_token_time is None:
+                            first_token_time = time.perf_counter()
+                            ttft_ms = (first_token_time - start_time) * 1000
+
                     except json.JSONDecodeError:
                         pass
 
@@ -323,7 +358,7 @@ class ProxyHandler:
                 error_type="stream_interrupted", error_message=str(e),
                 is_stream=True, processed_payload=processed_payload if should_sample else None,
                 response_payload=accumulator.build_response() if should_sample else None,
-                ttft_ms=ttft_ms, ttfc_ms=elapsed_ms,
+                ttft_ms=ttft_ms, first_chunk_ms=first_chunk_ms,
             )
             if not response.prepared:
                 return web.Response(status=502, text="Streaming error")
@@ -335,9 +370,6 @@ class ProxyHandler:
         # P0-03: Build standardized response from accumulator
         aggregated_response = accumulator.build_response()
 
-        # P0-04: TTFC = total time from request to last byte
-        ttfc_ms = elapsed_ms
-
         # Extract response metadata from aggregated response
         response_meta = extract_response_metadata(
             upstream_resp.status, aggregated_response, []
@@ -346,7 +378,7 @@ class ProxyHandler:
         # Process response payload
         response_payload = None
         if should_sample and self.config.payload_strategy != "off":
-            if self.config.payload_strategy == "metadata_only":
+            if self.config.payload_strategy == "metadata-only":
                 response_payload = response_meta
             else:
                 response_payload = aggregated_response
@@ -363,7 +395,7 @@ class ProxyHandler:
             error_message=None if not is_error else f"HTTP {upstream_resp.status}",
             is_stream=True, processed_payload=processed_payload if should_sample else None,
             response_payload=response_payload,
-            ttft_ms=ttft_ms, ttfc_ms=ttfc_ms,
+            ttft_ms=ttft_ms, first_chunk_ms=first_chunk_ms,
         )
 
         return response
@@ -382,7 +414,8 @@ class ProxyHandler:
     ) -> web.Response:
         """Handle non-streaming response.
 
-        P0-04: For non-streaming, TTFT = TTFC = total response time.
+        P0-NEW-02: For non-streaming, ttft_ms=NULL and first_chunk_ms=NULL.
+        duration_ms is the total response time.
         """
         resp_body_raw = await upstream_resp.read()
 
@@ -394,9 +427,9 @@ class ProxyHandler:
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         is_error = upstream_resp.status >= 400
 
-        # P0-04: For non-streaming, TTFT = TTFC = total time
-        ttft_ms = elapsed_ms if not is_error else None
-        ttfc_ms = elapsed_ms
+        # P0-NEW-02: Non-streaming — no first token or first chunk timing
+        ttft_ms = None
+        first_chunk_ms = None
 
         # Extract response metadata
         response_meta = extract_response_metadata(upstream_resp.status, resp_body, [])
@@ -423,7 +456,7 @@ class ProxyHandler:
             error_type=error_type, error_message=error_message,
             is_stream=is_stream, processed_payload=processed_payload if should_sample else None,
             response_payload=response_payload,
-            ttft_ms=ttft_ms, ttfc_ms=ttfc_ms,
+            ttft_ms=ttft_ms, first_chunk_ms=first_chunk_ms,
         )
 
         return web.Response(
@@ -454,12 +487,12 @@ class ProxyHandler:
         processed_payload: Optional[dict],
         response_payload: Optional[dict],
         ttft_ms: Optional[float],
-        ttfc_ms: Optional[float],
+        first_chunk_ms: Optional[float],
     ):
         """Build and queue telemetry record.
 
         P1-04: Uses self.config.gateway_name instead of hardcoded 'one-api-proxy'.
-        P0-04: Reports both ttft_ms and ttfc_ms.
+        P0-NEW-02: Reports ttft_ms and first_chunk_ms (no ttfc_ms).
         """
         # Build attributes (OpenTelemetry GenAI semantic conventions)
         attributes = {
@@ -503,21 +536,20 @@ class ProxyHandler:
         if total_tokens is not None:
             attributes["gen_ai.usage.total_tokens"] = total_tokens
 
-        # TTFT event
+        # Timing events
         events = []
+        if first_chunk_ms is not None:
+            events.append({
+                "name": "first_chunk",
+                "timestamp": start_wall + (first_chunk_ms / 1000),
+                "attributes": {"time_to_first_chunk_ms": round(first_chunk_ms, 2)},
+            })
+
         if ttft_ms is not None:
             events.append({
                 "name": "first_token",
                 "timestamp": start_wall + (ttft_ms / 1000),
                 "attributes": {"time_to_first_token_ms": round(ttft_ms, 2)},
-            })
-
-        # TTFC event
-        if ttfc_ms is not None:
-            events.append({
-                "name": "response_complete",
-                "timestamp": start_wall + (ttfc_ms / 1000),
-                "attributes": {"time_to_complete_ms": round(ttfc_ms, 2)},
             })
 
         # Error event
@@ -545,7 +577,7 @@ class ProxyHandler:
             "status": status,
             "http_status": http_status,
             "ttft_ms": round(ttft_ms, 2) if ttft_ms is not None else None,
-            "ttfc_ms": round(ttfc_ms, 2) if ttfc_ms is not None else None,
+            "first_chunk_ms": round(first_chunk_ms, 2) if first_chunk_ms is not None else None,
             "session_id": metadata.get("session_id"),
             "user_id": metadata.get("user_id"),
             "app_name": metadata.get("app_name", "unknown"),

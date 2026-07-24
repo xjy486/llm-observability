@@ -2,6 +2,12 @@
 Data models for the Observability Core.
 
 Based on the PRD's Trace/Span semantics and OpenTelemetry GenAI conventions.
+
+P0-NEW-02: Timing semantics —
+  ttft_ms        = Time To First Token (streaming only; NULL for non-streaming)
+  first_chunk_ms = Time To First SSE Chunk (streaming only; NULL for non-streaming)
+  duration_ms    = Total request duration (always set)
+  ttfc_ms is REMOVED — it was redundant with duration_ms.
 """
 from datetime import datetime, timezone
 from typing import Optional, Any
@@ -27,8 +33,8 @@ class SpanRecord(BaseModel):
     duration_ms: float
     status: str  # OK / ERROR / UNSET
     http_status: Optional[int] = None
-    ttft_ms: Optional[float] = None  # Time To First Token (ms): request start → first response byte
-    ttfc_ms: Optional[float] = None  # Time To Complete (ms): request start → last response byte (= duration_ms for non-streaming)
+    ttft_ms: Optional[float] = None  # Time To First Token (streaming only, NULL for non-streaming)
+    first_chunk_ms: Optional[float] = None  # Time To First SSE Chunk (streaming only, NULL for non-streaming)
     session_id: Optional[str] = None
     user_id: Optional[str] = None
     app_name: Optional[str] = None
@@ -63,8 +69,8 @@ class IngestRecord(BaseModel):
     duration_ms: float
     status: str = "OK"
     http_status: Optional[int] = None
-    ttft_ms: Optional[float] = None  # Time To First Token (ms)
-    ttfc_ms: Optional[float] = None  # Time To Complete (ms)
+    ttft_ms: Optional[float] = None  # Time To First Token (streaming only)
+    first_chunk_ms: Optional[float] = None  # Time To First SSE Chunk (streaming only)
     session_id: Optional[str] = None
     user_id: Optional[str] = None
     app_name: Optional[str] = None
@@ -75,6 +81,9 @@ class IngestRecord(BaseModel):
     error_message: Optional[str] = None
     payload: Optional[dict[str, Any]] = None
     request_metadata: Optional[dict[str, Any]] = None
+
+    # Accept ttfc_ms for backward compatibility (ignored)
+    ttfc_ms: Optional[float] = None
 
 
 class IngestRequest(BaseModel):
@@ -130,8 +139,10 @@ class MetricsSummary(BaseModel):
 
     Metrics are separated into three levels:
     - Trace metrics: trace_count, error_rate (at trace level)
-    - LLM Call metrics: llm_call_count, latency percentiles, ttft, tokens (LLM spans only)
+    - LLM Call metrics: llm_call_count, latency percentiles, ttft/first_chunk, tokens (LLM spans only)
     - Span metrics: span_count (debugging only)
+
+    P0-NEW-02: ttfc_ms replaced by first_chunk_ms.
     """
     # Trace-level metrics
     trace_count: int = 0
@@ -146,9 +157,9 @@ class MetricsSummary(BaseModel):
     avg_ttft_ms: Optional[float] = None
     p50_ttft_ms: Optional[float] = None
     p95_ttft_ms: Optional[float] = None
-    avg_ttfc_ms: Optional[float] = None
-    p50_ttfc_ms: Optional[float] = None
-    p95_ttfc_ms: Optional[float] = None
+    avg_first_chunk_ms: Optional[float] = None
+    p50_first_chunk_ms: Optional[float] = None
+    p95_first_chunk_ms: Optional[float] = None
 
     # Token metrics (LLM spans only)
     total_input_tokens: int = 0
