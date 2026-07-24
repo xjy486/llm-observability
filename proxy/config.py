@@ -31,9 +31,16 @@ class ProxyConfig:
     error_always_capture: bool = True
 
     # Sensitive headers to strip/mask
+    # P1-5: Internal observability headers are stripped before forwarding to upstream
     sensitive_headers: list = field(default_factory=lambda: [
         "authorization", "api-key", "cookie", "x-api-key",
         "x-auth-token", "proxy-authorization",
+        # P1-5: Internal observability headers — consumed by proxy, must not leak to Provider
+        "x-llm-obs-span-role",
+        "x-session-id",
+        "x-user-id",
+        "x-app-name",
+        "x-business-scene",
     ])
 
     # Fields to mask in payload (regex-based content masking)

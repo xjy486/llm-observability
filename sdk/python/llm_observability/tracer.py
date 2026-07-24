@@ -2,8 +2,11 @@
 
 Provides the Observability.trace() context manager that creates an
 AGENT root span (spec §10, §11).
+
+P1-2: Implements head sampling at root trace creation.
 """
 import logging
+import random
 from typing import Optional
 
 from .config import Config
@@ -22,6 +25,9 @@ class TraceContextManager:
     On exit: records end_time, sets status, enqueues to reporter,
              restores parent context.
     On exception: sets ERROR status, re-raises.
+
+    P1-2: Respects sample_rate — if not sampled, span is still created
+          (for context propagation) but not reported to the backend.
     """
 
     def __init__(
@@ -39,18 +45,22 @@ class TraceContextManager:
         self._business_scene = business_scene
         self._span: Optional[Span] = None
         self._token = None
+        self._sampled = True
 
     def __enter__(self):
         trace_id = generate_trace_id()
         span_id = generate_span_id()
         parent = get_current_context()
 
+        # P1-2: Head sampling at root trace creation
+        self._sampled = random.random() < self._tracer.config.sample_rate
+
         ctx = SpanContext(
             trace_id=trace_id,
             span_id=span_id,
             parent_span_id=parent.span_id if parent else None,
             span_kind=SpanKind.AGENT,
-            sampled=True,
+            sampled=self._sampled,
         )
         self._token = set_context(ctx)
 
@@ -79,11 +89,12 @@ class TraceContextManager:
 
         self._span.end()
 
-        # Fail-open: report errors should not propagate
-        try:
-            self._tracer.reporter.report(self._span.to_record())
-        except Exception as e:
-            logger.error("Failed to report span: %s", e)
+        # P1-2: Only report if sampled
+        if self._sampled:
+            try:
+                self._tracer.reporter.report(self._span.to_record())
+            except Exception as e:
+                logger.error("Failed to report span: %s", e)
 
         reset_context(self._token)
         return False  # do not suppress exceptions

@@ -1,12 +1,16 @@
 """End-to-end integration tests for SDK → Proxy → Core.
 
 Tests spec §29 scenarios using mock Core.
+
+P0-1: Tests use Public API only — no manual reporter.start().
+P0-2: Tests use instance-level _original_create patching.
 """
 import sys
 import os
 import asyncio
 import json
 import threading
+import time
 from unittest.mock import MagicMock, patch
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -67,7 +71,8 @@ def mock_core():
 def reset_sdk():
     """Ensure SDK is reset between tests."""
     yield
-    Observability.shutdown()
+    if Observability._initialized:
+        Observability.shutdown()
 
 
 def _make_fake_response():
@@ -91,8 +96,10 @@ def _make_fake_response():
 def test_scenario_b_sdk_single_llm(mock_core):
     """Scenario B: SDK Trace → OpenAI → Proxy → GATEWAY span.
 
+    P0-1: Uses Public API only — init() auto-starts the reporter.
     Asserts: TraceID same, AGENT parent=None, LLM parent=AGENT.
     """
+    # P0-1: init() auto-starts reporter — no manual start needed
     Observability.init(
         app_name="test-app",
         endpoint=mock_core,
@@ -104,17 +111,15 @@ def test_scenario_b_sdk_single_llm(mock_core):
 
     fake_response = _make_fake_response()
 
-    async def run():
-        await tracer.reporter.start()
-        with patch("llm_observability.instrumentation.openai._original_create") as mock_orig:
-            mock_orig.return_value = fake_response
-            with tracer.trace(name="demo-task"):
-                client = openai.OpenAI(api_key="fake", base_url="http://localhost:99999")
-                client.chat.completions.create(model="gpt-4", messages=[{"role": "user", "content": "hi"}])
-        await asyncio.sleep(0.2)  # wait for flush
-        await tracer.reporter.stop()
+    # P0-2: Patch instance-level _original_create
+    with patch.object(instr, "_original_create", return_value=fake_response) as mock_orig:
+        with tracer.trace(name="demo-task"):
+            client = openai.OpenAI(api_key="fake", base_url="http://localhost:99999")
+            client.chat.completions.create(model="gpt-4", messages=[{"role": "user", "content": "hi"}])
 
-    asyncio.run(run())
+    # Wait for async flush
+    time.sleep(1.0)
+
     instr.uninstrument()
     Observability.shutdown()
 
@@ -144,7 +149,10 @@ def test_scenario_a_no_sdk_compatible():
 
 @pytest.mark.skipif(not HAS_OPENAI, reason="openai not installed")
 def test_scenario_c_multi_llm_same_trace(mock_core):
-    """Scenario C: Multiple LLM calls in one trace, same TraceID."""
+    """Scenario C: Multiple LLM calls in one trace, same TraceID.
+
+    P0-1: Uses Public API only.
+    """
     Observability.init(
         app_name="test-app",
         endpoint=mock_core,
@@ -156,18 +164,14 @@ def test_scenario_c_multi_llm_same_trace(mock_core):
 
     fake_response = _make_fake_response()
 
-    async def run():
-        await tracer.reporter.start()
-        with patch("llm_observability.instrumentation.openai._original_create") as mock_orig:
-            mock_orig.return_value = fake_response
-            with tracer.trace(name="multi-llm-task"):
-                client = openai.OpenAI(api_key="fake", base_url="http://localhost:99999")
-                client.chat.completions.create(model="gpt-4", messages=[{"role": "user", "content": "1"}])
-                client.chat.completions.create(model="gpt-4", messages=[{"role": "user", "content": "2"}])
-        await asyncio.sleep(0.2)  # wait for flush
-        await tracer.reporter.stop()
+    with patch.object(instr, "_original_create", return_value=fake_response) as mock_orig:
+        with tracer.trace(name="multi-llm-task"):
+            client = openai.OpenAI(api_key="fake", base_url="http://localhost:99999")
+            client.chat.completions.create(model="gpt-4", messages=[{"role": "user", "content": "1"}])
+            client.chat.completions.create(model="gpt-4", messages=[{"role": "user", "content": "2"}])
 
-    asyncio.run(run())
+    time.sleep(1.0)
+
     instr.uninstrument()
     Observability.shutdown()
 
@@ -180,7 +184,10 @@ def test_scenario_c_multi_llm_same_trace(mock_core):
 
 @pytest.mark.skipif(not HAS_OPENAI, reason="openai not installed")
 def test_reporter_failure_does_not_block_business():
-    """Spec §29.6: Reporter failure does not affect business call."""
+    """Spec §29.6: Reporter failure does not affect business call.
+
+    P0-1: Reporter auto-started, failures are fail-open.
+    """
     Observability.init(
         app_name="test-app",
         endpoint="http://localhost:1",  # unreachable
@@ -193,8 +200,7 @@ def test_reporter_failure_does_not_block_business():
     fake_response = _make_fake_response()
 
     call_succeeded = False
-    with patch("llm_observability.instrumentation.openai._original_create") as mock_orig:
-        mock_orig.return_value = fake_response
+    with patch.object(instr, "_original_create", return_value=fake_response) as mock_orig:
         with tracer.trace(name="fail-open-test"):
             client = openai.OpenAI(api_key="fake", base_url="http://localhost:99999")
             result = client.chat.completions.create(model="gpt-4", messages=[{"role": "user", "content": "hi"}])
@@ -208,7 +214,10 @@ def test_reporter_failure_does_not_block_business():
 
 @pytest.mark.skipif(not HAS_OPENAI, reason="openai not installed")
 def test_duplicate_llm_dedup():
-    """Spec §29.7: One OpenAI call = one logical LLM span."""
+    """Spec §29.7: One OpenAI call = one logical LLM span.
+
+    P1-4: Dedup still propagates traceparent but creates no new span.
+    """
     Observability.init(
         app_name="test-app",
         endpoint="http://localhost:99999",
@@ -220,8 +229,7 @@ def test_duplicate_llm_dedup():
 
     fake_response = _make_fake_response()
 
-    with patch("llm_observability.instrumentation.openai._original_create") as mock_orig:
-        mock_orig.return_value = fake_response
+    with patch.object(instr, "_original_create", return_value=fake_response) as mock_orig:
         with tracer.trace(name="dedup-test"):
             client = openai.OpenAI(api_key="fake", base_url="http://localhost:99999")
             client.chat.completions.create(model="gpt-4", messages=[{"role": "user", "content": "hi"}])

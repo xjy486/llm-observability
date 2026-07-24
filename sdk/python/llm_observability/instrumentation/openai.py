@@ -5,6 +5,12 @@ Patches openai.resources.chat.completions.Completions.create to:
 2. Inject traceparent + ownership marker headers
 3. Record response metadata (model, tokens)
 4. Handle dedup via logical_llm_span_active flag (spec §19)
+
+P0-2: All state (_tracer, _original_create, _patched) is instance-level,
+      not module-level, to ensure correct lifecycle across init/shutdown/re-init.
+P0-3: Streaming responses are wrapped in ObservedStream to defer span
+      finalization until the stream is fully consumed.
+P1-4: Dedup still injects traceparent + ownership marker headers.
 """
 import logging
 from typing import Optional
@@ -18,13 +24,17 @@ from ..utils.ids import generate_span_id
 
 logger = logging.getLogger("llm_obs.instrumentation.openai")
 
-# Module-level reference to the tracer, set during instrument()
-_tracer = None
-_original_create = None
-
 
 class OpenAIInstrumentor(BaseInstrumentor):
-    """Instruments OpenAI SDK's chat.completions.create."""
+    """Instruments OpenAI SDK's chat.completions.create.
+
+    P0-2: All state is instance-level to support correct init/shutdown/re-init.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._tracer = None
+        self._original_create = None
 
     def instrument(self, tracer=None, **kwargs):
         """Patch OpenAI chat.completions.create.
@@ -32,7 +42,6 @@ class OpenAIInstrumentor(BaseInstrumentor):
         Args:
             tracer: The Tracer instance to use for span creation.
         """
-        global _tracer, _original_create
         if self._patched:
             return
 
@@ -42,102 +51,157 @@ class OpenAIInstrumentor(BaseInstrumentor):
             logger.warning("openai package not installed — cannot instrument")
             return
 
-        _tracer = tracer
+        self._tracer = tracer
         target = openai.resources.chat.completions.Completions
-        _original_create = target.create
-        target.create = _patched_create
+        self._original_create = target.create
+
+        # Use a closure that captures self for instance-level state access
+        instrumentor = self
+
+        def _patched(self_inner, *args, **kwargs):
+            return instrumentor._do_patch(self_inner, *args, **kwargs)
+
+        target.create = _patched
         self._patched = True
         logger.info("OpenAI instrumentation installed")
 
     def uninstrument(self):
         """Restore original OpenAI create."""
-        global _tracer, _original_create
         if not self._patched:
             return
 
         try:
             import openai
             target = openai.resources.chat.completions.Completions
-            if _original_create is not None:
-                target.create = _original_create
+            if self._original_create is not None:
+                target.create = self._original_create
         except ImportError:
             pass
 
-        _tracer = None
-        _original_create = None
+        self._tracer = None
+        self._original_create = None
         self._patched = False
         logger.info("OpenAI instrumentation removed")
 
+    def _do_patch(self, self_inner, *args, **kwargs):
+        """Patched version of chat.completions.create.
 
-def _patched_create(self, *args, **kwargs):
-    """Patched version of chat.completions.create.
+        Creates an LLM span, injects headers, calls original, records result.
+        P1-4: Dedup — if logical_llm_span_active is True, skips span creation
+              but STILL injects traceparent + ownership marker.
+        P0-3: For streaming, wraps the Stream in ObservedStream to defer
+              span finalization until stream consumption completes.
+        """
+        if self._tracer is None or self._original_create is None:
+            return self._original_create(self_inner, *args, **kwargs)
 
-    Creates an LLM span, injects headers, calls original, records result.
-    Dedup: if logical_llm_span_active is True, skips span creation.
-    """
-    if _tracer is None or _original_create is None:
-        return _original_create(self, *args, **kwargs)
+        current_ctx = get_current_context()
 
-    current_ctx = get_current_context()
+        # If no active context at all, call original (no trace)
+        if current_ctx is None:
+            return self._original_create(self_inner, *args, **kwargs)
 
-    # Dedup: skip if a logical LLM span is already active (spec §19)
-    if current_ctx and current_ctx.logical_llm_span_active:
-        return _original_create(self, *args, **kwargs)
+        stream = kwargs.get("stream", False)
 
-    # If no active context at all, still call original (no trace)
-    if current_ctx is None:
-        return _original_create(self, *args, **kwargs)
+        # P1-4: Dedup — skip span creation but still propagate context
+        if current_ctx.logical_llm_span_active:
+            # Still inject traceparent + ownership marker
+            headers = kwargs.pop("extra_headers", None) or {}
+            inject = inject_headers(
+                current_ctx,
+                is_logical_llm=True,
+                session_id=self._tracer.config and None,  # metadata from context
+            )
+            headers.update(inject)
+            kwargs["extra_headers"] = headers
+            return self._original_create(self_inner, *args, **kwargs)
 
-    # Create LLM span
-    span_id = generate_span_id()
-    llm_ctx = SpanContext(
-        trace_id=current_ctx.trace_id,
-        span_id=span_id,
-        parent_span_id=current_ctx.span_id,
-        span_kind=SpanKind.LLM,
-        sampled=current_ctx.sampled,
-        logical_llm_span_active=True,
-    )
-    token = set_context(llm_ctx)
+        # Create LLM span
+        span_id = generate_span_id()
+        llm_ctx = SpanContext(
+            trace_id=current_ctx.trace_id,
+            span_id=span_id,
+            parent_span_id=current_ctx.span_id,
+            span_kind=SpanKind.LLM,
+            sampled=current_ctx.sampled,
+            logical_llm_span_active=True,
+        )
+        token = set_context(llm_ctx)
 
-    span = Span(
-        trace_id=current_ctx.trace_id,
-        span_id=span_id,
-        parent_span_id=current_ctx.span_id,
-        span_name="llm.completion",
-        span_kind=SpanKind.LLM,
-    )
+        span = Span(
+            trace_id=current_ctx.trace_id,
+            span_id=span_id,
+            parent_span_id=current_ctx.span_id,
+            span_name="llm.completion",
+            span_kind=SpanKind.LLM,
+        )
 
-    # Extract request info for attributes
-    model = kwargs.get("model", "unknown")
-    messages = kwargs.get("messages", [])
-    stream = kwargs.get("stream", False)
+        # Extract request info for attributes
+        model = kwargs.get("model", "unknown")
+        messages = kwargs.get("messages", [])
 
-    span.set_attribute("gen_ai.request.model", model)
-    span.set_attribute("gen_ai.operation.name", "chat")
-    span.set_attribute("llm.stream", stream)
+        span.set_attribute("gen_ai.request.model", model)
+        span.set_attribute("gen_ai.operation.name", "chat")
+        span.set_attribute("llm.stream", stream)
 
-    # Payload (masked per config strategy)
-    if _tracer.config.payload_strategy != "off":
-        from ..utils.masking import mask_payload
-        span.set_attribute("llm.input.messages", mask_payload(messages, _tracer.config.payload_strategy))
+        # Payload (masked per config strategy)
+        if self._tracer.config.payload_strategy != "off":
+            from ..utils.masking import mask_payload
+            span.set_attribute(
+                "llm.input.messages",
+                mask_payload(messages, self._tracer.config.payload_strategy),
+            )
 
-    span.start()
+        span.start()
 
-    # Inject traceparent + ownership marker into headers
-    headers = kwargs.pop("extra_headers", None) or {}
-    inject = inject_headers(
-        llm_ctx,
-        is_logical_llm=True,
-    )
-    headers.update(inject)
-    kwargs["extra_headers"] = headers
+        # Inject traceparent + ownership marker into headers
+        headers = kwargs.pop("extra_headers", None) or {}
+        inject = inject_headers(
+            llm_ctx,
+            is_logical_llm=True,
+        )
+        headers.update(inject)
+        kwargs["extra_headers"] = headers
 
-    try:
-        response = _original_create(self, *args, **kwargs)
-        span.set_status("OK")
+        try:
+            response = self._original_create(self_inner, *args, **kwargs)
 
-        # Extract response metadata
+            # P0-3: For streaming, wrap in ObservedStream
+            if stream:
+                return ObservedStream(
+                    response,
+                    span,
+                    self._tracer,
+                    token,
+                )
+
+            # Non-streaming: process and finalize immediately
+            span.set_status("OK")
+            self._extract_response_metadata(span, response)
+
+            # Store response payload (masked)
+            if self._tracer.config.payload_strategy != "off" and response:
+                from ..utils.masking import mask_payload
+                try:
+                    resp_dict = response.model_dump() if hasattr(response, "model_dump") else None
+                    if resp_dict:
+                        span.set_attribute(
+                            "llm.output",
+                            mask_payload(resp_dict, self._tracer.config.payload_strategy),
+                        )
+                except Exception:
+                    pass
+
+            self._finalize_span(span, token)
+            return response
+
+        except Exception as e:
+            span.set_error(error_type=type(e).__name__, error_message=str(e))
+            self._finalize_span(span, token)
+            raise
+
+    def _extract_response_metadata(self, span: Span, response):
+        """Extract model and usage from response."""
         if hasattr(response, "model") and response.model:
             span.set_attribute("gen_ai.response.model", response.model)
         if hasattr(response, "usage") and response.usage:
@@ -149,26 +213,138 @@ def _patched_create(self, *args, **kwargs):
             if hasattr(usage, "total_tokens") and usage.total_tokens is not None:
                 span.set_attribute("gen_ai.usage.total_tokens", usage.total_tokens)
 
-        # Store response payload (masked)
-        if _tracer.config.payload_strategy != "off" and response:
-            from ..utils.masking import mask_payload
-            try:
-                resp_dict = response.model_dump() if hasattr(response, "model_dump") else None
-                if resp_dict:
-                    span.set_attribute("llm.output", mask_payload(resp_dict, _tracer.config.payload_strategy))
-            except Exception:
-                pass
-
-        return response
-
-    except Exception as e:
-        span.set_error(error_type=type(e).__name__, error_message=str(e))
-        raise
-
-    finally:
+    def _finalize_span(self, span: Span, token):
+        """End and report a span, then reset context."""
         span.end()
         try:
-            _tracer.reporter.report(span.to_record())
+            self._tracer.reporter.report(span.to_record())
         except Exception as e:
             logger.error("Failed to report LLM span: %s", e)
         reset_context(token)
+
+
+class ObservedStream:
+    """Wrapper for OpenAI streaming responses.
+
+    P0-3: Defers LLM span finalization until the stream is fully consumed.
+    The span is finalized when:
+    - The iterator is exhausted (normal completion)
+    - close() is called
+    - An exception occurs during iteration
+
+    Maintains original OpenAI Stream behavior — all attributes and methods
+    are delegated to the wrapped stream.
+    """
+
+    def __init__(self, stream, span: Span, tracer, token):
+        self._stream = stream
+        self._span = span
+        self._tracer = tracer
+        self._token = token
+        self._finalized = False
+        self._collected_content = []
+
+    def _finalize(self, error: Optional[Exception] = None):
+        """Finalize the span — end, report, reset context."""
+        if self._finalized:
+            return
+        self._finalized = True
+
+        if error is not None:
+            self._span.set_error(
+                error_type=type(error).__name__,
+                error_message=str(error),
+            )
+        else:
+            self._span.set_status("OK")
+
+        # Try to extract usage from the stream's last chunk
+        # OpenAI streams may have usage in the last chunk when stream_options.include_usage=True
+        # We also try to get it from any accumulated data
+        self._try_extract_stream_usage()
+
+        # Store aggregated content if available
+        if self._tracer.config.payload_strategy != "off" and self._collected_content:
+            from ..utils.masking import mask_payload
+            try:
+                content = "".join(self._collected_content)
+                self._span.set_attribute(
+                    "llm.output",
+                    mask_payload({"content": content}, self._tracer.config.payload_strategy),
+                )
+            except Exception:
+                pass
+
+        self._span.end()
+        try:
+            self._tracer.reporter.report(self._span.to_record())
+        except Exception as e:
+            logger.error("Failed to report LLM span: %s", e)
+        reset_context(self._token)
+
+    def _try_extract_stream_usage(self):
+        """Try to extract usage info from stream attributes."""
+        # Some OpenAI stream objects may have usage stored
+        # when stream_options={"include_usage": True} is set
+        # The last chunk typically contains usage data
+        # We check if the stream has any accessible usage
+        try:
+            # Check if we captured usage from the last chunk
+            if hasattr(self, "_last_usage") and self._last_usage:
+                usage = self._last_usage
+                if hasattr(usage, "prompt_tokens") and usage.prompt_tokens is not None:
+                    self._span.set_attribute("gen_ai.usage.input_tokens", usage.prompt_tokens)
+                if hasattr(usage, "completion_tokens") and usage.completion_tokens is not None:
+                    self._span.set_attribute("gen_ai.usage.output_tokens", usage.completion_tokens)
+                if hasattr(usage, "total_tokens") and usage.total_tokens is not None:
+                    self._span.set_attribute("gen_ai.usage.total_tokens", usage.total_tokens)
+        except Exception:
+            pass
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            chunk = next(self._stream)
+            # Collect content deltas for potential usage
+            try:
+                if hasattr(chunk, "choices") and chunk.choices:
+                    delta = chunk.choices[0].delta if hasattr(chunk.choices[0], "delta") else None
+                    if delta and hasattr(delta, "content") and delta.content:
+                        self._collected_content.append(delta.content)
+                # Check for usage in this chunk
+                if hasattr(chunk, "usage") and chunk.usage:
+                    self._last_usage = chunk.usage
+            except Exception:
+                pass
+            return chunk
+        except StopIteration:
+            self._finalize()
+            raise
+        except Exception as e:
+            self._finalize(error=e)
+            raise
+
+    def close(self):
+        """Close the stream and finalize the span."""
+        try:
+            if hasattr(self._stream, "close"):
+                self._stream.close()
+        except Exception:
+            pass
+        self._finalize()
+
+    def __getattr__(self, name):
+        """Delegate attribute access to the wrapped stream."""
+        return getattr(self._stream, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            self._finalize(error=exc_val)
+        else:
+            self._finalize()
+        return False

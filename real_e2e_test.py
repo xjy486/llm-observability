@@ -212,17 +212,15 @@ async def run_e2e_tests(svc: ServiceManager):
     from llm_observability import Observability
 
     # ═════════════════════════════════════════════════════════
-    # Initialize SDK ONCE — start the async reporter manually
-    # so AGENT/LLM spans get flushed to Core.
+    # Initialize SDK — P0-1: Reporter auto-started by init()
+    # NO manual reporter.start() needed anymore.
     # ═════════════════════════════════════════════════════════
     Observability.init(
         app_name="e2e-real-test",
         endpoint=svc.core_url,
         auto_instrument_openai=True,
     )
-    # Reporter needs an event loop to start its background flush task
-    await Observability._reporter.start()
-    print("  ✅ SDK initialized, reporter started")
+    print("  ✅ SDK initialized, reporter auto-started")
 
     # Create a single OpenAI client pointing to proxy
     client = openai.OpenAI(
@@ -540,10 +538,10 @@ async def run_e2e_tests(svc: ServiceManager):
         check("Time series has span_count", "span_count" in bucket)
 
     # ═════════════════════════════════════════════════════════
-    # Shutdown SDK — flush remaining spans
+    # Shutdown SDK — P0-1: Reporter auto-stopped by shutdown()
+    # NO manual reporter.stop() needed anymore.
     # ═════════════════════════════════════════════════════════
     print("\n🧹 Shutting down SDK...")
-    await Observability._reporter.stop()
     Observability.shutdown()
     print("  ✅ SDK shutdown complete")
 

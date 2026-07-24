@@ -9,14 +9,21 @@ from llm_observability.tracer import Tracer
 from llm_observability.context import get_current_context
 
 
+def _clean_init(**kwargs):
+    """Ensure clean state before init."""
+    if Observability._initialized:
+        Observability.shutdown()
+    Observability.init(**kwargs)
+    return Observability._tracer
+
+
 def test_trace_creates_agent_root_span():
     """trace() creates an AGENT root span and sets it as current context."""
-    Observability.init(
+    tracer = _clean_init(
         app_name="test-app",
         endpoint="http://localhost:99999",
         auto_instrument_openai=False,
     )
-    tracer = Observability._tracer
 
     with tracer.trace(name="my-task", session_id="s1", user_id="u1"):
         ctx = get_current_context()
@@ -33,12 +40,11 @@ def test_trace_creates_agent_root_span():
 
 def test_trace_records_span_on_exit():
     """trace() enqueues a span record to the reporter on exit."""
-    Observability.init(
+    tracer = _clean_init(
         app_name="test-app",
         endpoint="http://localhost:99999",
         auto_instrument_openai=False,
     )
-    tracer = Observability._tracer
 
     with tracer.trace(name="my-task"):
         pass
@@ -56,12 +62,11 @@ def test_trace_records_span_on_exit():
 
 def test_trace_exception_sets_error_and_reraises():
     """trace() sets ERROR status on exception and re-raises."""
-    Observability.init(
+    tracer = _clean_init(
         app_name="test-app",
         endpoint="http://localhost:99999",
         auto_instrument_openai=False,
     )
-    tracer = Observability._tracer
 
     raised = False
     try:
@@ -82,12 +87,11 @@ def test_trace_exception_sets_error_and_reraises():
 
 def test_trace_includes_metadata():
     """trace() propagates session_id, user_id, business_scene."""
-    Observability.init(
+    tracer = _clean_init(
         app_name="test-app",
         endpoint="http://localhost:99999",
         auto_instrument_openai=False,
     )
-    tracer = Observability._tracer
 
     with tracer.trace(
         name="task-with-meta",
@@ -108,12 +112,11 @@ def test_trace_includes_metadata():
 
 def test_observability_init_is_idempotent():
     """Repeated init() must not create duplicate tracers or re-patch."""
-    Observability.init(
+    tracer1 = _clean_init(
         app_name="app1",
         endpoint="http://localhost:99999",
         auto_instrument_openai=False,
     )
-    tracer1 = Observability._tracer
 
     Observability.init(
         app_name="app2",

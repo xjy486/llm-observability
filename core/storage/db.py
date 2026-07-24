@@ -440,17 +440,17 @@ class Storage:
                 (MAX(s.end_time) - MIN(s.start_time)) * 1000 as duration_ms,
                 CASE WHEN SUM(CASE WHEN s.status = 'ERROR' THEN 1 ELSE 0 END) > 0
                      THEN 'ERROR' ELSE 'OK' END as status,
-                s.session_id,
-                s.user_id,
-                s.app_name,
-                s.business_scene,
+                MAX(CASE WHEN s.span_kind = 'AGENT' THEN s.session_id END) as session_id,
+                MAX(CASE WHEN s.span_kind = 'AGENT' THEN s.user_id END) as user_id,
+                MAX(CASE WHEN s.span_kind = 'AGENT' THEN s.app_name END) as app_name,
+                MAX(CASE WHEN s.span_kind = 'AGENT' THEN s.business_scene END) as business_scene,
                 COUNT(*) as span_count,
                 SUM(CASE WHEN s.span_kind = 'LLM' THEN 1 ELSE 0 END) as llm_call_count,
-                SUM(COALESCE(s.input_tokens, 0)) as input_tokens,
-                SUM(COALESCE(s.output_tokens, 0)) as output_tokens,
-                SUM(COALESCE(s.total_tokens, 0)) as total_tokens,
-                s.model,
-                s.error_type
+                SUM(CASE WHEN s.span_kind = 'LLM' THEN COALESCE(s.input_tokens, 0) ELSE 0 END) as input_tokens,
+                SUM(CASE WHEN s.span_kind = 'LLM' THEN COALESCE(s.output_tokens, 0) ELSE 0 END) as output_tokens,
+                SUM(CASE WHEN s.span_kind = 'LLM' THEN COALESCE(s.total_tokens, 0) ELSE 0 END) as total_tokens,
+                MAX(CASE WHEN s.model IS NOT NULL THEN s.model END) as model,
+                MAX(CASE WHEN s.error_type IS NOT NULL THEN s.error_type END) as error_type
             FROM spans s
             WHERE s.trace_id IN ({placeholders})
             GROUP BY s.trace_id
@@ -523,6 +523,18 @@ class Storage:
         root_spans = [s for s in spans if not s["parent_span_id"]]
         root_span_id = root_spans[0]["span_id"] if root_spans else spans[0]["span_id"]
 
+        # Trace-level metadata: prefer root/AGENT span, fallback to first non-NULL
+        meta_span = root_spans[0] if root_spans else spans[0]
+        agent_spans = [s for s in spans if s["span_kind"] == "AGENT"]
+        if agent_spans:
+            meta_span = agent_spans[0]
+
+        def _first_non_null(key):
+            for s in spans:
+                if s.get(key):
+                    return s[key]
+            return None
+
         llm_spans = [s for s in spans if s["span_kind"] == "LLM"]
         input_tokens = sum(s.get("input_tokens") or 0 for s in llm_spans)
         output_tokens = sum(s.get("output_tokens") or 0 for s in llm_spans)
@@ -535,10 +547,10 @@ class Storage:
             "end_time": trace_end,
             "duration_ms": duration_ms,
             "status": status,
-            "session_id": spans[0].get("session_id"),
-            "user_id": spans[0].get("user_id"),
-            "app_name": spans[0].get("app_name"),
-            "business_scene": spans[0].get("business_scene"),
+            "session_id": meta_span.get("session_id") or _first_non_null("session_id"),
+            "user_id": meta_span.get("user_id") or _first_non_null("user_id"),
+            "app_name": meta_span.get("app_name") or _first_non_null("app_name"),
+            "business_scene": meta_span.get("business_scene") or _first_non_null("business_scene"),
             "span_count": len(spans),
             "llm_call_count": len(llm_spans),
             "input_tokens": input_tokens,
@@ -733,7 +745,7 @@ class Storage:
                 COUNT(*) as span_count,
                 SUM(CASE WHEN status = 'ERROR' AND span_kind = 'LLM' THEN 1 ELSE 0 END) as llm_error_count,
                 AVG(CASE WHEN span_kind = 'LLM' THEN duration_ms END) as llm_avg_latency_ms,
-                SUM(COALESCE(total_tokens, 0)) as tokens,
+                SUM(CASE WHEN span_kind = 'LLM' THEN COALESCE(total_tokens, 0) ELSE 0 END) as tokens,
                 AVG(CASE WHEN span_kind = 'LLM' AND ttft_ms IS NOT NULL THEN ttft_ms END) as avg_ttft_ms,
                 AVG(CASE WHEN span_kind = 'LLM' AND first_chunk_ms IS NOT NULL THEN first_chunk_ms END) as avg_first_chunk_ms
             FROM spans

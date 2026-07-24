@@ -1,4 +1,8 @@
-"""Tests for OpenAI instrumentation."""
+"""Tests for OpenAI instrumentation.
+
+P0-2: Tests use the instance-level API (instrumentor._original_create)
+      instead of module-level patching.
+"""
 import sys
 import os
 from unittest.mock import MagicMock, patch
@@ -23,6 +27,8 @@ pytestmark = pytest.mark.skipif(not HAS_OPENAI, reason="openai not installed")
 
 def _setup_sdk():
     """Initialize SDK without auto-instrumentation, return tracer."""
+    if Observability._initialized:
+        Observability.shutdown()
     Observability.init(
         app_name="test-app",
         endpoint="http://localhost:99999",
@@ -52,8 +58,9 @@ def _make_fake_response():
 def test_instrumentor_patches_openai():
     """instrument() patches chat.completions.create."""
     original = openai.resources.chat.completions.Completions.create
+    tracer = _setup_sdk()
     instr = OpenAIInstrumentor()
-    instr.instrument(tracer=_setup_sdk())
+    instr.instrument(tracer=tracer)
     assert openai.resources.chat.completions.Completions.create is not original
     instr.uninstrument()
     assert openai.resources.chat.completions.Completions.create is original
@@ -61,16 +68,18 @@ def test_instrumentor_patches_openai():
 
 
 def test_llm_span_created_on_openai_call():
-    """A call to chat.completions.create creates an LLM span."""
+    """A call to chat.completions.create creates an LLM span.
+
+    P0-2: Uses instance-level _original_create instead of module-level patching.
+    """
     tracer = _setup_sdk()
     instr = OpenAIInstrumentor()
     instr.instrument(tracer=tracer)
 
     fake_response = _make_fake_response()
 
-    # Patch the module-level _original_create so the patched wrapper calls our mock
-    with patch("llm_observability.instrumentation.openai._original_create") as mock_orig:
-        mock_orig.return_value = fake_response
+    # Patch the instance-level _original_create
+    with patch.object(instr, "_original_create", return_value=fake_response) as mock_orig:
         with tracer.trace(name="test-task"):
             client = openai.OpenAI(api_key="fake", base_url="http://localhost:99999")
             client.chat.completions.create(
@@ -100,8 +109,7 @@ def test_llm_span_parent_is_agent():
 
     fake_response = _make_fake_response()
 
-    with patch("llm_observability.instrumentation.openai._original_create") as mock_orig:
-        mock_orig.return_value = fake_response
+    with patch.object(instr, "_original_create", return_value=fake_response) as mock_orig:
         with tracer.trace(name="parent-test"):
             ctx_before = get_current_context()
             agent_span_id = ctx_before.span_id
@@ -125,8 +133,7 @@ def test_llm_span_error_on_exception():
 
     raised = False
     try:
-        with patch("llm_observability.instrumentation.openai._original_create") as mock_orig:
-            mock_orig.side_effect = RuntimeError("API error")
+        with patch.object(instr, "_original_create", side_effect=RuntimeError("API error")) as mock_orig:
             with tracer.trace(name="error-task"):
                 client = openai.OpenAI(api_key="fake", base_url="http://localhost:99999")
                 client.chat.completions.create(model="gpt-4", messages=[{"role": "user", "content": "hi"}])
@@ -144,7 +151,10 @@ def test_llm_span_error_on_exception():
 
 
 def test_dedup_skips_llm_span_when_active():
-    """When logical_llm_span_active is True, no new LLM span is created."""
+    """When logical_llm_span_active is True, no new LLM span is created.
+
+    P1-4: Dedup still injects traceparent + ownership marker but skips span creation.
+    """
     tracer = _setup_sdk()
     instr = OpenAIInstrumentor()
     instr.instrument(tracer=tracer)
@@ -164,13 +174,21 @@ def test_dedup_skips_llm_span_when_active():
 
     queue_before = len(tracer.reporter._queue)
 
-    with patch("llm_observability.instrumentation.openai._original_create") as mock_orig:
-        mock_orig.return_value = fake_response
+    with patch.object(instr, "_original_create", return_value=fake_response) as mock_orig:
         client = openai.OpenAI(api_key="fake", base_url="http://localhost:99999")
         client.chat.completions.create(model="gpt-4", messages=[{"role": "user", "content": "hi"}])
 
     queue_after = len(tracer.reporter._queue)
-    assert queue_after == queue_before  # no new span
+    assert queue_after == queue_before  # no new span created
+
+    # P1-4: Verify traceparent + ownership marker were still injected
+    # The mock_orig should have been called with extra_headers containing traceparent
+    call_kwargs = mock_orig.call_args
+    if call_kwargs.kwargs.get("extra_headers"):
+        headers = call_kwargs.kwargs["extra_headers"]
+        assert "traceparent" in headers, "P1-4: traceparent must be injected even during dedup"
+        assert headers.get("X-LLM-OBS-Span-Role") == "llm", \
+            "P1-4: ownership marker must be injected even during dedup"
 
     reset_context(token)
     instr.uninstrument()
