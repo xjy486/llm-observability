@@ -30,7 +30,7 @@ import aiohttp
 from aiohttp import web
 
 from config import ProxyConfig
-from trace_context import resolve_trace_context, extract_metadata_headers
+from trace_context import resolve_trace_context, extract_metadata_headers, extract_ownership
 from payload import process_payload, extract_request_metadata, extract_response_metadata
 from reporter import TelemetryReporter
 
@@ -216,6 +216,7 @@ class ProxyHandler:
         headers_dict = {k: v for k, v in request.headers.items()}
         trace_ctx = resolve_trace_context(headers_dict)
         metadata = extract_metadata_headers(headers_dict)
+        ownership = extract_ownership(headers_dict)
 
         # Read request body
         request_body_raw = await request.read()
@@ -268,6 +269,7 @@ class ProxyHandler:
                 response_payload=None,
                 ttft_ms=None,
                 first_chunk_ms=None,
+                ownership=ownership,
             )
             return web.Response(
                 status=502,
@@ -279,12 +281,12 @@ class ProxyHandler:
         if is_stream and upstream_resp.status == 200:
             return await self._handle_streaming_response(
                 request, upstream_resp, trace_ctx, metadata, request_meta,
-                start_time, start_wall, processed_payload, should_sample,
+                start_time, start_wall, processed_payload, should_sample, ownership,
             )
         else:
             return await self._handle_nonstreaming_response(
                 upstream_resp, trace_ctx, metadata, request_meta,
-                start_time, start_wall, processed_payload, should_sample, is_stream,
+                start_time, start_wall, processed_payload, should_sample, is_stream, ownership,
             )
 
     async def _handle_streaming_response(
@@ -298,6 +300,7 @@ class ProxyHandler:
         start_wall: float,
         processed_payload,
         should_sample: bool,
+        ownership: Optional[str] = None,
     ) -> web.StreamResponse:
         """Handle SSE streaming response with timing measurement.
 
@@ -367,6 +370,7 @@ class ProxyHandler:
                 is_stream=True, processed_payload=processed_payload if should_sample else None,
                 response_payload=accumulator.build_response() if should_sample else None,
                 ttft_ms=ttft_ms, first_chunk_ms=first_chunk_ms,
+                ownership=ownership,
             )
             if not response.prepared:
                 return web.Response(status=502, text="Streaming error")
@@ -404,6 +408,7 @@ class ProxyHandler:
             is_stream=True, processed_payload=processed_payload if should_sample else None,
             response_payload=response_payload,
             ttft_ms=ttft_ms, first_chunk_ms=first_chunk_ms,
+            ownership=ownership,
         )
 
         return response
@@ -419,6 +424,7 @@ class ProxyHandler:
         processed_payload,
         should_sample: bool,
         is_stream: bool,
+        ownership: Optional[str] = None,
     ) -> web.Response:
         """Handle non-streaming response.
 
@@ -468,6 +474,7 @@ class ProxyHandler:
             is_stream=is_stream, processed_payload=processed_payload if should_sample else None,
             response_payload=response_payload,
             ttft_ms=ttft_ms, first_chunk_ms=first_chunk_ms,
+            ownership=ownership,
         )
 
         return web.Response(
@@ -499,6 +506,7 @@ class ProxyHandler:
         response_payload: Optional[dict],
         ttft_ms: Optional[float],
         first_chunk_ms: Optional[float],
+        ownership: Optional[str] = None,
     ):
         """Build and queue telemetry record.
 
@@ -575,13 +583,21 @@ class ProxyHandler:
             })
 
         # Build telemetry record
+        # Determine span kind based on ownership marker (spec §7.2)
+        if ownership == "llm":
+            span_kind = "GATEWAY"
+            span_name = "proxy.request"
+        else:
+            span_kind = "LLM"
+            span_name = "llm.completion"
+
         record = {
             "trace_id": trace_ctx.trace_id,
             "span_id": trace_ctx.span_id,
             "parent_span_id": trace_ctx.parent_span_id,
             "trace_inherited": trace_ctx.inherited,
-            "span_name": "llm.completion",
-            "span_kind": "LLM",
+            "span_name": span_name,
+            "span_kind": span_kind,
             "start_time": start_wall,
             "end_time": start_wall + (elapsed_ms / 1000),
             "duration_ms": round(elapsed_ms, 2),

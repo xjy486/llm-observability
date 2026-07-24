@@ -120,3 +120,22 @@ def extract_metadata_headers(headers: dict) -> dict:
             attr_key = kl.replace("x-trace-", "")
             meta[f"attr_{attr_key}"] = v
     return meta
+
+
+def extract_ownership(headers: dict) -> Optional[str]:
+    """Extract span ownership marker from headers (spec §7.3).
+
+    Checks for the X-LLM-OBS-Span-Role header. When present and set to 'llm',
+    it means the upstream SDK has already created a logical LLM span, so the
+    proxy should create a GATEWAY span instead of a duplicate LLM span.
+
+    Args:
+        headers: Request headers dict.
+
+    Returns:
+        'llm' if the marker is present, None otherwise.
+    """
+    for k, v in headers.items():
+        if k.lower() == "x-llm-obs-span-role":
+            return v.strip().lower()
+    return None
