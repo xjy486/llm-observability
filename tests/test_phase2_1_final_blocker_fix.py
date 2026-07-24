@@ -160,6 +160,126 @@ class TestBlocker1ProxySamplingGate:
         result = handler._should_sample_for_ctx(ctx, is_error=True)
         assert result is True, "Root trace error should be captured when error_always_capture=True"
 
+    def test_nonstreaming_http500_force_reports_on_error_always_capture(self):
+        """P1-fix: Non-streaming HTTP 500 must re-evaluate sampling with is_error=True.
+
+        Setup: root trace, sample_rate=0, error_always_capture=True.
+        At request start, should_sample=False (is_error=False, sample_rate=0).
+        Upstream returns HTTP 500 → is_error=True → must force-report.
+
+        This test simulates the _handle_nonstreaming_response call site by
+        invoking it with a mock upstream response returning status 500.
+        """
+        from handler import ProxyHandler
+        from reporter import TelemetryReporter
+        from config import ProxyConfig
+        from trace_context import TraceContext
+
+        config = ProxyConfig()
+        config.error_always_capture = True
+        config.sample_rate = 0.0
+        reporter = TelemetryReporter(endpoint="http://localhost:99999")
+        handler = ProxyHandler(config, reporter)
+
+        report_calls = []
+        def tracking_report(record):
+            report_calls.append(record)
+        reporter.report = tracking_report
+
+        ctx = TraceContext(
+            trace_id="a" * 32, span_id="c" * 16, parent_span_id=None,
+            trace_flags="01", inherited=False,
+        )
+
+        # Build a mock upstream response with status 500
+        import json as _json
+        error_body = _json.dumps({"error": {"message": "Internal error", "type": "server_error"}}).encode()
+
+        class MockResp:
+            status = 500
+            headers = {}
+            async def read(self):
+                return error_body
+
+        # should_sample at request start: sample_rate=0, is_error=False → False
+        should_sample_at_start = handler._should_sample_for_ctx(ctx, is_error=False)
+        assert should_sample_at_start is False, "Precondition: sample_rate=0 → not sampled at start"
+
+        asyncio.run(handler._handle_nonstreaming_response(
+            upstream_resp=MockResp(),
+            trace_ctx=ctx,
+            metadata={},
+            request_meta={"model": "test"},
+            start_time=time.perf_counter(),
+            start_wall=time.time(),
+            processed_payload=None,
+            should_sample=should_sample_at_start,
+            is_stream=False,
+            ownership=None,
+        ))
+
+        assert len(report_calls) == 1, (
+            "HTTP 500 with error_always_capture=True must force-report even when "
+            "should_sample at request start was False"
+        )
+        record = report_calls[0]
+        assert record["status"] == "ERROR"
+        assert record["http_status"] == 500
+
+    def test_nonstreaming_http200_not_reported_when_sample_rate_zero(self):
+        """P1-fix: Non-streaming HTTP 200 with sample_rate=0 must NOT report.
+
+        Ensures the re-evaluation doesn't accidentally over-report successful
+        requests. is_error=False → _should_sample_for_ctx returns False → no report.
+        """
+        from handler import ProxyHandler
+        from reporter import TelemetryReporter
+        from config import ProxyConfig
+        from trace_context import TraceContext
+
+        config = ProxyConfig()
+        config.error_always_capture = True
+        config.sample_rate = 0.0
+        reporter = TelemetryReporter(endpoint="http://localhost:99999")
+        handler = ProxyHandler(config, reporter)
+
+        report_calls = []
+        def tracking_report(record):
+            report_calls.append(record)
+        reporter.report = tracking_report
+
+        ctx = TraceContext(
+            trace_id="a" * 32, span_id="c" * 16, parent_span_id=None,
+            trace_flags="01", inherited=False,
+        )
+
+        import json as _json
+        ok_body = _json.dumps({"choices": [{"message": {"content": "hi"}}]}).encode()
+
+        class MockResp:
+            status = 200
+            headers = {}
+            async def read(self):
+                return ok_body
+
+        should_sample_at_start = handler._should_sample_for_ctx(ctx, is_error=False)
+        assert should_sample_at_start is False
+
+        asyncio.run(handler._handle_nonstreaming_response(
+            upstream_resp=MockResp(),
+            trace_ctx=ctx,
+            metadata={},
+            request_meta={"model": "test"},
+            start_time=time.perf_counter(),
+            start_wall=time.time(),
+            processed_payload=None,
+            should_sample=should_sample_at_start,
+            is_stream=False,
+            ownership=None,
+        ))
+
+        assert len(report_calls) == 0, "HTTP 200 with sample_rate=0 must NOT report"
+
 
 # ═══════════════════════════════════════════════════════════════
 # BLOCKER-2: Common Privacy Module
@@ -352,6 +472,151 @@ class TestP11UniqueUsersTraceLevel:
         })
 
         metrics = storage.get_metrics()
+        assert metrics["unique_users"] == 1, f"Expected 1, got {metrics['unique_users']}"
+        assert metrics["unique_sessions"] == 1, f"Expected 1, got {metrics['unique_sessions']}"
+
+    def test_unique_users_with_model_filter_preserves_agent_metadata(self):
+        """P1-fix: model filter must NOT drop AGENT spans from user/session aggregation.
+
+        Scenario:
+          Trace A: AGENT(U1/S1, model=NULL) → LLM(model=gpt-4, user=NULL)
+          Query: get_metrics(model='gpt-4')
+
+        The model filter selects the trace via the LLM span, but user_id/session_id
+        live on the AGENT span (model=NULL). If the metadata subquery applies the
+        model filter directly, AGENT is dropped → unique_users=0 (WRONG).
+        Correct: unique_users=1, unique_sessions=1.
+        """
+        from storage.db import Storage
+        storage = Storage(db_path=":memory:")
+        base = time.time() - 60
+
+        # AGENT span carries user/session metadata, model is NULL
+        storage.insert_span({
+            "trace_id": "tA", "span_id": "agentA", "parent_span_id": None,
+            "span_kind": "AGENT", "span_name": "agent.run",
+            "start_time": base, "end_time": base + 1.0,
+            "duration_ms": 1000, "status": "OK",
+            "ttft_ms": None, "first_chunk_ms": None,
+            "session_id": "S1", "user_id": "U1",
+            "app_name": "App", "business_scene": None,
+            "attributes": {}, "events": [], "payload": None, "request_metadata": None,
+        })
+        # LLM span has model=gpt-4 but user/session are NULL
+        storage.insert_span({
+            "trace_id": "tA", "span_id": "llmA0", "parent_span_id": "agentA",
+            "span_kind": "LLM", "span_name": "llm.completion",
+            "start_time": base + 0.1, "end_time": base + 0.5,
+            "duration_ms": 400, "status": "OK",
+            "ttft_ms": None, "first_chunk_ms": None,
+            "session_id": None, "user_id": None,
+            "app_name": None, "business_scene": None,
+            "attributes": {"gen_ai.request.model": "gpt-4"},
+            "events": [], "payload": None, "request_metadata": None,
+        })
+
+        metrics = storage.get_metrics(model="gpt-4")
+        assert metrics["trace_count"] == 1, f"Expected 1 trace, got {metrics['trace_count']}"
+        assert metrics["llm_call_count"] == 1, f"Expected 1 LLM call, got {metrics['llm_call_count']}"
+        assert metrics["unique_users"] == 1, (
+            f"model filter must not drop AGENT metadata: expected 1, got {metrics['unique_users']}"
+        )
+        assert metrics["unique_sessions"] == 1, (
+            f"model filter must not drop AGENT metadata: expected 1, got {metrics['unique_sessions']}"
+        )
+
+    def test_unique_users_with_model_filter_multiple_traces(self):
+        """P1-fix: model filter with multiple traces, each with AGENT metadata.
+
+        Two traces, both have AGENT(user/session) + LLM(model=gpt-4).
+        Query model=gpt-4 → unique_users=2, unique_sessions=2.
+        """
+        from storage.db import Storage
+        storage = Storage(db_path=":memory:")
+        base = time.time() - 60
+
+        for tid, uid, sid in [("tA", "U1", "S1"), ("tB", "U2", "S2")]:
+            storage.insert_span({
+                "trace_id": tid, "span_id": f"agent_{tid}", "parent_span_id": None,
+                "span_kind": "AGENT", "span_name": "agent.run",
+                "start_time": base, "end_time": base + 1.0,
+                "duration_ms": 1000, "status": "OK",
+                "ttft_ms": None, "first_chunk_ms": None,
+                "session_id": sid, "user_id": uid,
+                "app_name": "App", "business_scene": None,
+                "attributes": {}, "events": [], "payload": None, "request_metadata": None,
+            })
+            storage.insert_span({
+                "trace_id": tid, "span_id": f"llm_{tid}", "parent_span_id": f"agent_{tid}",
+                "span_kind": "LLM", "span_name": "llm.completion",
+                "start_time": base + 0.1, "end_time": base + 0.5,
+                "duration_ms": 400, "status": "OK",
+                "ttft_ms": None, "first_chunk_ms": None,
+                "session_id": None, "user_id": None,
+                "app_name": None, "business_scene": None,
+                "attributes": {"gen_ai.request.model": "gpt-4"},
+                "events": [], "payload": None, "request_metadata": None,
+            })
+
+        metrics = storage.get_metrics(model="gpt-4")
+        assert metrics["trace_count"] == 2
+        assert metrics["llm_call_count"] == 2
+        assert metrics["unique_users"] == 2, f"Expected 2, got {metrics['unique_users']}"
+        assert metrics["unique_sessions"] == 2, f"Expected 2, got {metrics['unique_sessions']}"
+
+    def test_model_filter_excludes_non_matching_traces(self):
+        """P1-fix: model filter should still correctly exclude traces without that model."""
+        from storage.db import Storage
+        storage = Storage(db_path=":memory:")
+        base = time.time() - 60
+
+        # Trace A: AGENT(U1/S1) + LLM(gpt-4)
+        storage.insert_span({
+            "trace_id": "tA", "span_id": "agentA", "parent_span_id": None,
+            "span_kind": "AGENT", "span_name": "agent.run",
+            "start_time": base, "end_time": base + 1.0,
+            "duration_ms": 1000, "status": "OK",
+            "ttft_ms": None, "first_chunk_ms": None,
+            "session_id": "S1", "user_id": "U1",
+            "app_name": "App", "business_scene": None,
+            "attributes": {}, "events": [], "payload": None, "request_metadata": None,
+        })
+        storage.insert_span({
+            "trace_id": "tA", "span_id": "llmA", "parent_span_id": "agentA",
+            "span_kind": "LLM", "span_name": "llm.completion",
+            "start_time": base + 0.1, "end_time": base + 0.5,
+            "duration_ms": 400, "status": "OK",
+            "ttft_ms": None, "first_chunk_ms": None,
+            "session_id": None, "user_id": None,
+            "app_name": None, "business_scene": None,
+            "attributes": {"gen_ai.request.model": "gpt-4"},
+            "events": [], "payload": None, "request_metadata": None,
+        })
+        # Trace B: AGENT(U2/S2) + LLM(claude-3) — different model
+        storage.insert_span({
+            "trace_id": "tB", "span_id": "agentB", "parent_span_id": None,
+            "span_kind": "AGENT", "span_name": "agent.run",
+            "start_time": base + 1, "end_time": base + 2.0,
+            "duration_ms": 1000, "status": "OK",
+            "ttft_ms": None, "first_chunk_ms": None,
+            "session_id": "S2", "user_id": "U2",
+            "app_name": "App", "business_scene": None,
+            "attributes": {}, "events": [], "payload": None, "request_metadata": None,
+        })
+        storage.insert_span({
+            "trace_id": "tB", "span_id": "llmB", "parent_span_id": "agentB",
+            "span_kind": "LLM", "span_name": "llm.completion",
+            "start_time": base + 1.1, "end_time": base + 1.5,
+            "duration_ms": 400, "status": "OK",
+            "ttft_ms": None, "first_chunk_ms": None,
+            "session_id": None, "user_id": None,
+            "app_name": None, "business_scene": None,
+            "attributes": {"gen_ai.request.model": "claude-3"},
+            "events": [], "payload": None, "request_metadata": None,
+        })
+
+        metrics = storage.get_metrics(model="gpt-4")
+        assert metrics["trace_count"] == 1, f"Expected 1 trace, got {metrics['trace_count']}"
         assert metrics["unique_users"] == 1, f"Expected 1, got {metrics['unique_users']}"
         assert metrics["unique_sessions"] == 1, f"Expected 1, got {metrics['unique_sessions']}"
 

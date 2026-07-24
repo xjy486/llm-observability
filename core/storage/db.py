@@ -672,6 +672,12 @@ class Storage:
         # Counting DISTINCT on LLM spans gives 0. Instead, compute trace-level
         # user_id/session_id (preferring AGENT span, fallback to any non-NULL),
         # then count DISTINCT on those trace-level values.
+        #
+        # P1-fix: The metadata subquery must aggregate ALL spans of candidate
+        # traces, NOT just filter-matched spans. The model/time filter selects
+        # candidate trace IDs; user_id/session_id lives on the AGENT span which
+        # has model=NULL, so applying the model filter directly to the metadata
+        # subquery would drop AGENT spans and produce NULL trace_user_id.
         unique_dims_row = conn.execute(
             f"""SELECT
                 COUNT(DISTINCT trace_user_id) as unique_users,
@@ -688,7 +694,10 @@ class Storage:
                         MAX(session_id)
                     ) AS trace_session_id
                 FROM spans s
-                WHERE {where_clause}
+                WHERE trace_id IN (
+                    SELECT DISTINCT trace_id FROM spans s2
+                    WHERE {where_clause}
+                )
                 GROUP BY trace_id
             )""",
             params

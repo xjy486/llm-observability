@@ -405,6 +405,12 @@ class ProxyHandler:
 
         status = "ERROR" if is_error else "OK"
 
+        # BLOCKER-1-fix: Re-evaluate sampling now that is_error is known.
+        # should_sample was decided at request start (is_error=False). If the
+        # upstream returned an error status (e.g. via streaming error chunk),
+        # error_always_capture should still force-report.
+        should_report = self._should_sample_for_ctx(trace_ctx, is_error=is_error)
+
         await self._report_telemetry(
             trace_ctx=trace_ctx, metadata=metadata, request_meta=request_meta,
             start_wall=start_wall, elapsed_ms=elapsed_ms,
@@ -415,7 +421,7 @@ class ProxyHandler:
             response_payload=response_payload,
             ttft_ms=ttft_ms, first_chunk_ms=first_chunk_ms,
             ownership=ownership,
-            sampled=should_sample,
+            sampled=should_report,
         )
 
         return response
@@ -473,6 +479,13 @@ class ProxyHandler:
 
         status = "ERROR" if is_error else "OK"
 
+        # BLOCKER-1-fix: Re-evaluate sampling now that is_error is known.
+        # should_sample was decided at request start (is_error=False), so
+        # error_always_capture never had a chance to force-report.
+        # Without this, a root trace with sample_rate=0 + HTTP 500 is silently
+        # dropped even though error_always_capture=True.
+        should_report = self._should_sample_for_ctx(trace_ctx, is_error=is_error)
+
         await self._report_telemetry(
             trace_ctx=trace_ctx, metadata=metadata, request_meta=request_meta,
             start_wall=start_wall, elapsed_ms=elapsed_ms,
@@ -482,7 +495,7 @@ class ProxyHandler:
             response_payload=response_payload,
             ttft_ms=ttft_ms, first_chunk_ms=first_chunk_ms,
             ownership=ownership,
-            sampled=should_sample,
+            sampled=should_report,
         )
 
         return web.Response(
