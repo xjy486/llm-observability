@@ -42,6 +42,7 @@ class Reporter:
         batch_size: int = 50,
         flush_interval: float = 5.0,
         timeout: float = 10.0,
+        shutdown_timeout: float = 10.0,
     ):
         self.ingest_url = endpoint.rstrip("/") + "/api/v1/ingest"
         self.api_key = api_key
@@ -49,6 +50,7 @@ class Reporter:
         self.batch_size = batch_size
         self.flush_interval = flush_interval
         self.timeout = timeout
+        self.shutdown_timeout = shutdown_timeout
         self._queue: deque = deque()
         self._session: Optional[aiohttp.ClientSession] = None
         self._flush_task: Optional[asyncio.Task] = None
@@ -71,7 +73,13 @@ class Reporter:
         logger.info("SDK reporter started, endpoint=%s", self.ingest_url)
 
     async def stop(self):
-        """Stop the reporter and flush remaining items (async context)."""
+        """Stop the reporter and drain remaining items (async context).
+
+        P1-1: Drains the entire queue in batches, not just one flush.
+        Respects shutdown_timeout to avoid hanging if Core is unavailable.
+        """
+        import time as _time
+
         self._stop = True
         if self._flush_task:
             self._flush_task.cancel()
@@ -79,7 +87,19 @@ class Reporter:
                 await self._flush_task
             except asyncio.CancelledError:
                 pass
-        await self._flush()
+
+        # P1-1: Drain the entire queue, not just one batch
+        deadline = _time.monotonic() + self.shutdown_timeout
+        while self._queue and _time.monotonic() < deadline:
+            await self._flush()
+
+        if self._queue:
+            self._dropped_count += len(self._queue)
+            logger.warning(
+                "SDK shutdown timeout: %d records dropped", len(self._queue)
+            )
+            self._queue.clear()
+
         if self._session:
             await self._session.close()
         logger.info(

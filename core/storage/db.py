@@ -440,10 +440,22 @@ class Storage:
                 (MAX(s.end_time) - MIN(s.start_time)) * 1000 as duration_ms,
                 CASE WHEN SUM(CASE WHEN s.status = 'ERROR' THEN 1 ELSE 0 END) > 0
                      THEN 'ERROR' ELSE 'OK' END as status,
-                MAX(CASE WHEN s.span_kind = 'AGENT' THEN s.session_id END) as session_id,
-                MAX(CASE WHEN s.span_kind = 'AGENT' THEN s.user_id END) as user_id,
-                MAX(CASE WHEN s.span_kind = 'AGENT' THEN s.app_name END) as app_name,
-                MAX(CASE WHEN s.span_kind = 'AGENT' THEN s.business_scene END) as business_scene,
+                COALESCE(
+                    MAX(CASE WHEN s.span_kind = 'AGENT' THEN s.session_id END),
+                    MAX(s.session_id)
+                ) as session_id,
+                COALESCE(
+                    MAX(CASE WHEN s.span_kind = 'AGENT' THEN s.user_id END),
+                    MAX(s.user_id)
+                ) as user_id,
+                COALESCE(
+                    MAX(CASE WHEN s.span_kind = 'AGENT' THEN s.app_name END),
+                    MAX(s.app_name)
+                ) as app_name,
+                COALESCE(
+                    MAX(CASE WHEN s.span_kind = 'AGENT' THEN s.business_scene END),
+                    MAX(s.business_scene)
+                ) as business_scene,
                 COUNT(*) as span_count,
                 SUM(CASE WHEN s.span_kind = 'LLM' THEN 1 ELSE 0 END) as llm_call_count,
                 SUM(CASE WHEN s.span_kind = 'LLM' THEN COALESCE(s.input_tokens, 0) ELSE 0 END) as input_tokens,
@@ -572,29 +584,58 @@ class Storage:
         P0-NEW-02: TTFC metrics removed. Only duration_ms, ttft_ms, first_chunk_ms.
         Metrics separated into three levels: Trace / LLM Call / Span.
         Latency percentiles computed from LLM spans only.
+
+        P1-3: session_id/user_id are trace-level filters — a trace qualifies if
+        ANY span in it has the matching value. All spans (especially child LLM
+        spans with NULL session_id) of qualifying traces are then aggregated.
         """
         conn = self._get_conn()
 
-        # Build WHERE clause
-        conditions = []
-        params: list = []
-        if time_start is not None:
-            conditions.append("start_time >= ?")
-            params.append(time_start)
-        if time_end is not None:
-            conditions.append("start_time <= ?")
-            params.append(time_end)
-        if model is not None:
-            conditions.append("model = ?")
-            params.append(model)
-        if session_id is not None:
-            conditions.append("session_id = ?")
-            params.append(session_id)
-        if user_id is not None:
-            conditions.append("user_id = ?")
-            params.append(user_id)
+        # ── P1-3: Trace-level filter via CTE ──
+        # If session_id or user_id is provided, first find candidate trace_ids
+        # where ANY span in the trace matches. Then aggregate ALL spans of those
+        # traces. Other filters (time, model) remain at span level.
+        needs_trace_filter = session_id is not None or user_id is not None
 
-        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        # Build span-level conditions (time, model)
+        span_conditions = []
+        span_params: list = []
+        if time_start is not None:
+            span_conditions.append("start_time >= ?")
+            span_params.append(time_start)
+        if time_end is not None:
+            span_conditions.append("start_time <= ?")
+            span_params.append(time_end)
+        if model is not None:
+            span_conditions.append("model = ?")
+            span_params.append(model)
+
+        span_where = " AND ".join(span_conditions) if span_conditions else "1=1"
+
+        if needs_trace_filter:
+            # Phase 1: find candidate trace_ids
+            trace_filter_conditions = []
+            trace_filter_params: list = []
+            if session_id is not None:
+                trace_filter_conditions.append(
+                    "EXISTS (SELECT 1 FROM spans s2 WHERE s2.trace_id = s.trace_id AND s2.session_id = ?)"
+                )
+                trace_filter_params.append(session_id)
+            if user_id is not None:
+                trace_filter_conditions.append(
+                    "EXISTS (SELECT 1 FROM spans s2 WHERE s2.trace_id = s.trace_id AND s2.user_id = ?)"
+                )
+                trace_filter_params.append(user_id)
+
+            trace_filter_clause = " AND ".join(trace_filter_conditions)
+
+            # Build the effective WHERE clause for span queries:
+            # span-level filters + trace must be in candidate set
+            where_clause = f"({span_where}) AND ({trace_filter_clause})"
+            params = span_params + trace_filter_params
+        else:
+            where_clause = span_where
+            params = span_params
 
         # ── Trace-level metrics ──
         # Trace status: any span ERROR → trace ERROR
@@ -602,7 +643,7 @@ class Storage:
             f"""SELECT
                 COUNT(DISTINCT trace_id) as trace_count,
                 COUNT(DISTINCT CASE WHEN status = 'ERROR' THEN trace_id END) as error_trace_count
-            FROM spans WHERE {where_clause}""",
+            FROM spans s WHERE {where_clause}""",
             params
         ).fetchone()
 
@@ -611,7 +652,7 @@ class Storage:
         error_rate = (error_trace_count / trace_count * 100) if trace_count > 0 else 0.0
 
         # ── LLM Call-level metrics ──
-        llm_where = f"{where_clause} AND span_kind = 'LLM'"
+        llm_where = f"({where_clause}) AND span_kind = 'LLM'"
         llm_row = conn.execute(
             f"""SELECT
                 COUNT(*) as llm_call_count,
@@ -622,7 +663,7 @@ class Storage:
                 COUNT(DISTINCT model) as unique_models,
                 COUNT(DISTINCT user_id) as unique_users,
                 COUNT(DISTINCT session_id) as unique_sessions
-            FROM spans WHERE {llm_where}""",
+            FROM spans s WHERE {llm_where}""",
             params
         ).fetchone()
 
@@ -630,7 +671,7 @@ class Storage:
 
         # Latency percentiles (LLM spans only)
         latency_rows = conn.execute(
-            f"""SELECT duration_ms FROM spans
+            f"""SELECT duration_ms FROM spans s
                 WHERE {llm_where} AND duration_ms IS NOT NULL
                 ORDER BY duration_ms""",
             params
@@ -643,7 +684,7 @@ class Storage:
 
         # TTFT percentiles (LLM spans only, streaming only — ttft_ms is null for non-streaming)
         ttft_rows = conn.execute(
-            f"""SELECT ttft_ms FROM spans
+            f"""SELECT ttft_ms FROM spans s
                 WHERE {llm_where} AND ttft_ms IS NOT NULL
                 ORDER BY ttft_ms""",
             params
@@ -658,7 +699,7 @@ class Storage:
 
         # P0-NEW-02: first_chunk_ms percentiles (LLM spans only, streaming only)
         first_chunk_rows = conn.execute(
-            f"""SELECT first_chunk_ms FROM spans
+            f"""SELECT first_chunk_ms FROM spans s
                 WHERE {llm_where} AND first_chunk_ms IS NOT NULL
                 ORDER BY first_chunk_ms""",
             params
@@ -671,7 +712,7 @@ class Storage:
 
         # ── Span-level metrics (debugging) ──
         span_row = conn.execute(
-            f"""SELECT COUNT(*) as span_count FROM spans WHERE {where_clause}""",
+            f"""SELECT COUNT(*) as span_count FROM spans s WHERE {where_clause}""",
             params
         ).fetchone()
         span_count = span_row["span_count"] or 0

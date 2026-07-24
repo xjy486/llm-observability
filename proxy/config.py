@@ -2,8 +2,18 @@
 Proxy configuration.
 """
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import Optional
+
+# P1-4: Import unified sensitive keys from shared privacy_constants
+_sdk_utils_path = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "sdk", "python", "llm_observability", "utils"
+)
+if _sdk_utils_path not in sys.path:
+    sys.path.insert(0, _sdk_utils_path)
+from privacy_constants import SENSITIVE_KEYS as _UNIFIED_SENSITIVE_KEYS
 
 
 @dataclass
@@ -53,23 +63,9 @@ class ProxyConfig:
     ])
 
     # Keys whose VALUES should be entirely redacted (key-based masking)
+    # P1-4: Uses unified SENSITIVE_KEYS from privacy_constants (shared with SDK)
     # P1-NEW-03: MASK_KEYS env var can override/augment the defaults
-    _default_mask_keys: list = field(default_factory=lambda: [
-        "authorization",
-        "api_key",
-        "apikey",
-        "api-key",
-        "x-api-key",
-        "x-auth-token",
-        "access_token",
-        "refresh_token",
-        "private_key",
-        "secret_key",
-        "password",
-        "passwd",
-        "credential",
-        "cookie",
-    ])
+    _default_mask_keys: list = field(default_factory=lambda: list(_UNIFIED_SENSITIVE_KEYS))
 
     @property
     def mask_keys(self) -> list:

@@ -2,38 +2,25 @@
 
 Strategies: off / metadata_only / masked / full
 
-P1-3: Unified masking rules with Proxy — covers key-based + regex patterns:
-  - api_key / authorization / token / secret / password (key-based)
-  - sk-* (OpenAI-style keys)
-  - Bearer tokens
-  - Cookies
-  - Text patterns: password=..., token=..., secret=...
+P1-4: Unified masking rules with Proxy — imports canonical SENSITIVE_KEYS
+and SENSITIVE_REGEX_PATTERNS from privacy_constants to ensure both SDK and
+Proxy share the exact same sensitive key set and regex patterns.
 """
 import copy
 import re
 from typing import Any
 
-# Keys that are always masked regardless of strategy
-SENSITIVE_KEYS = {
-    "api_key", "apikey", "authorization", "token", "secret",
-    "password", "passwd", "credential", "cookie", "set-cookie",
-}
+# P1-4: Import unified constants from privacy_constants (single source of truth)
+from llm_observability.utils.privacy_constants import (
+    SENSITIVE_KEYS as _CANONICAL_SENSITIVE_KEYS,
+    SENSITIVE_REGEX_PATTERNS as _CANONICAL_REGEX_PATTERNS,
+)
 
-# P1-3: Regex patterns for masking sensitive values in text content
-SENSITIVE_PATTERNS = [
-    # OpenAI-style API keys: sk-...
-    (re.compile(r"sk-[a-zA-Z0-9]{20,}", re.IGNORECASE), "sk-***REDACTED***"),
-    # Bearer tokens: Bearer xxx
-    (re.compile(r"(?i)bearer\s+[a-zA-Z0-9\-._~+/]+=*", re.IGNORECASE), "Bearer ***REDACTED***"),
-    # password=xxx or password: xxx
-    (re.compile(r"(?i)(password|passwd)\s*[=:]\s*\S+", re.IGNORECASE), r"\1=***REDACTED***"),
-    # token=xxx or token: xxx
-    (re.compile(r"(?i)(token|secret)\s*[=:]\s*\S+", re.IGNORECASE), r"\1=***REDACTED***"),
-    # api_key=xxx
-    (re.compile(r"(?i)api[_-]?key\s*[=:]\s*\S+", re.IGNORECASE), "api_key=***REDACTED***"),
-    # Authorization header value
-    (re.compile(r"(?i)authorization\s*[=:]\s*\S+", re.IGNORECASE), "authorization=***REDACTED***"),
-]
+# Keys that are always masked regardless of strategy (from unified constants)
+SENSITIVE_KEYS = set(_CANONICAL_SENSITIVE_KEYS)
+
+# P1-4: Regex patterns from unified constants
+SENSITIVE_PATTERNS = _CANONICAL_REGEX_PATTERNS
 
 
 def mask_payload(data: Any, strategy: str = "masked") -> Any:
@@ -76,8 +63,9 @@ def _mask_recursive(data: Any) -> Any:
 def _mask_string_patterns(text: str) -> str:
     """Apply regex masking patterns to string content.
 
-    P1-3: Masks sensitive patterns found in text content,
-    such as 'my key is sk-xxxx' or 'password=secret123'.
+    P1-4: Uses unified SENSITIVE_REGEX_PATTERNS from privacy_constants.
+    Masks sensitive patterns found in text content, such as
+    'my key is sk-xxxx' or 'password=secret123'.
     """
     if not isinstance(text, str):
         return text

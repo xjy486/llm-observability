@@ -60,3 +60,13 @@
 - Proxy Span Ownership: GATEWAY detection from X-LLM-OBS-Span-Role header — complete
 - UI GATEWAY support: teal tag, waterfall color, detail fields — complete
 - E2E Tests: context propagation, dedup, fail-open, multi-LLM — complete (31 SDK tests + 65 proxy/core tests all pass)
+
+## Current Status — Phase 2.1 Final Closeout (P0/P1) COMPLETE / FROZEN
+- P0-1: Streaming ContextVar decoupled from Span lifetime — ContextVar restored immediately after create(), ObservedStream only manages Span lifecycle
+- P0-2: Sampling inherited across full trace — SDK inherits from SpanContext.sampled, Proxy inherits from traceparent flags; sampled=False → no AGENT/LLM/GATEWAY reported
+- P1-1: Reporter shutdown drains full queue — stop() loops _flush() until queue empty or shutdown_timeout; dropped_count tracks overflow
+- P1-2: No-SDK trace metadata fallback — COALESCE(MAX(AGENT metadata), MAX(any span metadata)) in get_trace_summaries
+- P1-3: Session/User metrics trace-level filter — get_metrics uses EXISTS subquery to find candidate trace_ids, then aggregates ALL spans of those traces
+- P1-4: Unified masking key set — shared privacy_constants.py (SENSITIVE_KEYS + SENSITIVE_REGEX_PATTERNS) imported by both SDK masking.py and Proxy config.py
+- Tests: 156 tests pass (28 final closeout + 128 existing)
+- Phase 2.1 is now COMPLETE / FROZEN — next: Phase 2.2 Tool Span

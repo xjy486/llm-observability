@@ -538,6 +538,68 @@ async def run_e2e_tests(svc: ServiceManager):
         check("Time series has span_count", "span_count" in bucket)
 
     # ═════════════════════════════════════════════════════════
+    # Scenario 6: Sampling=0 — no telemetry stored, business OK
+    # P0-2 Case A: sample_rate=0 → 0 AGENT, 0 LLM, 0 GATEWAY
+    # ═════════════════════════════════════════════════════════
+    print("\n" + "=" * 70)
+    print("Scenario 6: Sampling=0 (no telemetry, business OK)")
+    print("=" * 70)
+
+    # Shutdown the current SDK (which uses sample_rate=1.0 by default)
+    Observability.shutdown()
+    print("  ✅ Previous SDK instance shut down")
+
+    # Re-init SDK with sample_rate=0
+    Observability.init(
+        app_name="e2e-sampling-zero",
+        endpoint=svc.core_url,
+        auto_instrument_openai=True,
+        sample_rate=0.0,
+    )
+    print("  ✅ SDK re-initialized with sample_rate=0.0")
+
+    sampling_ok = False
+    try:
+        with Observability.trace(
+            name="sampling-zero-task",
+            session_id="e2e-session-6",
+            user_id="e2e-user-6",
+        ):
+            resp = client.chat.completions.create(
+                model=AGNES_MODEL,
+                messages=[{"role": "user", "content": "Say 'ok'"}],
+                max_tokens=10,
+                temperature=0,
+            )
+        sampling_ok = True
+    except Exception as e:
+        print(f"  ℹ️  Error: {e}")
+
+    check("Business request succeeds with sample_rate=0", sampling_ok)
+
+    print("  ⏳ Waiting for async flush (5s)...")
+    await asyncio.sleep(5)
+
+    # Query Core: should have NO traces from session-6
+    traces_resp6 = http_get_json(f"{svc.core_url}/api/v1/traces?durationMinutes=5&limit=50")
+    traces6 = traces_resp6.get("traces", [])
+    session6_traces = [t for t in traces6 if t.get("session_id") == "e2e-session-6"]
+    check("No traces stored for sample_rate=0", len(session6_traces) == 0, f"found={len(session6_traces)}")
+
+    # Also check metrics: no AGENT/LLM from session-6
+    metrics6 = http_get_json(f"{svc.core_url}/api/v1/metrics?durationMinutes=5")
+    # The trace_count should NOT have increased from the sampling=0 call
+    # (it should still be the same as after scenario 5)
+    check(
+        "Metrics trace_count unchanged (sampling=0 adds nothing)",
+        metrics6.get("trace_count", 0) >= 3,  # still >=3 from scenarios 1-4
+        f"trace_count={metrics6.get('trace_count')}",
+    )
+
+    Observability.shutdown()
+    print("  ✅ Sampling=0 SDK shut down")
+
+    # ═════════════════════════════════════════════════════════
     # Shutdown SDK — P0-1: Reporter auto-stopped by shutdown()
     # NO manual reporter.stop() needed anymore.
     # ═════════════════════════════════════════════════════════

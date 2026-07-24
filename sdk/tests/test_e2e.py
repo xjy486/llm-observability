@@ -234,9 +234,10 @@ def test_duplicate_llm_dedup():
             client = openai.OpenAI(api_key="fake", base_url="http://localhost:99999")
             client.chat.completions.create(model="gpt-4", messages=[{"role": "user", "content": "hi"}])
 
-    instr.uninstrument()
-    Observability.shutdown()
-
+    # Check queue BEFORE shutdown — P1-1: shutdown now drains the queue
     records = list(tracer.reporter._queue)
     llm_count = sum(1 for r in records if r["span_kind"] == "LLM")
     assert llm_count == 1, "Should have exactly one LLM span per OpenAI call"
+
+    instr.uninstrument()
+    Observability.shutdown()
