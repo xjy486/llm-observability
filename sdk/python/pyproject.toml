@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "llm-observability-sdk"
+version = "0.1.0"
+description = "Application SDK for LLM Observability — Agent Trace & Span creation"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21", "openai>=1.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["llm_observability*"]
