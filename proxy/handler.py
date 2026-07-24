@@ -62,7 +62,10 @@ class StreamingAccumulator:
     def feed(self, chunk: dict) -> bool:
         """Process a single SSE chunk incrementally.
 
-        Returns True if this chunk contained a content delta (for TTFT tracking).
+        Returns True if this chunk contained a meaningful output delta (for TTFT tracking).
+        P0-NEW-02-fix: "meaningful output" = content OR reasoning_content OR tool_call.
+        Not just delta.content — reasoning models produce reasoning before content,
+        and tool-call-only responses have no content at all.
         """
         self.chunk_count += 1
 
@@ -71,7 +74,7 @@ class StreamingAccumulator:
         if not self.id:
             self.id = chunk.get("id")
 
-        had_content = False
+        had_meaningful_output = False
         choices = chunk.get("choices", [])
         for choice in choices:
             delta = choice.get("delta", {})
@@ -79,19 +82,21 @@ class StreamingAccumulator:
                 # Content delta
                 content = delta.get("content")
                 if content:
-                    had_content = True
+                    had_meaningful_output = True
                     if self.capture_content:
                         self.content_parts.append(content)
 
                 # Reasoning content (some models)
                 reasoning = delta.get("reasoning_content")
                 if reasoning:
+                    had_meaningful_output = True
                     if self.capture_content:
                         self.reasoning_parts.append(reasoning)
 
-                # Tool calls
+                # Tool calls — count as meaningful output
                 tc = delta.get("tool_calls")
                 if tc:
+                    had_meaningful_output = True
                     if self.capture_content:
                         for t in tc:
                             idx = t.get("index", len(self.tool_calls))
@@ -115,7 +120,7 @@ class StreamingAccumulator:
         if u and isinstance(u, dict):
             self.usage = u
 
-        return had_content
+        return had_meaningful_output
 
     def build_response(self) -> dict:
         """Build a standardized non-streaming response object."""
@@ -314,8 +319,10 @@ class ProxyHandler:
         first_chunk_time = None
         first_token_time = None
 
-        # P1-NEW-04: Only accumulate content if we're sampling AND payload strategy is not "off"
-        capture_content = should_sample and self.config.payload_strategy != "off"
+        # P1-NEW-04: Only accumulate content if we're sampling AND payload strategy
+        # allows content capture. metadata_only captures structural metadata only —
+        # NO content/reasoning/tool_calls. Only masked/full capture content.
+        capture_content = should_sample and self.config.payload_strategy in ("masked", "full")
         accumulator = StreamingAccumulator(capture_content=capture_content)
 
         try:
@@ -331,15 +338,16 @@ class ProxyHandler:
                         continue
                     try:
                         chunk = json.loads(data_str)
-                        had_content = accumulator.feed(chunk)
+                        had_meaningful_output = accumulator.feed(chunk)
 
                         # Track first_chunk_ms: first SSE data chunk received
                         if first_chunk_time is None:
                             first_chunk_time = time.perf_counter()
                             first_chunk_ms = (first_chunk_time - start_time) * 1000
 
-                        # Track ttft_ms: first content token (delta with actual content)
-                        if had_content and first_token_time is None:
+                        # Track ttft_ms: first meaningful output token
+                        # (content OR reasoning_content OR tool_call)
+                        if had_meaningful_output and first_token_time is None:
                             first_token_time = time.perf_counter()
                             ttft_ms = (first_token_time - start_time) * 1000
 
@@ -378,7 +386,7 @@ class ProxyHandler:
         # Process response payload
         response_payload = None
         if should_sample and self.config.payload_strategy != "off":
-            if self.config.payload_strategy == "metadata-only":
+            if self.config.payload_strategy == "metadata_only":
                 response_payload = response_meta
             else:
                 response_payload = aggregated_response
@@ -437,7 +445,10 @@ class ProxyHandler:
         # Process response payload
         response_payload = None
         if should_sample and self.config.payload_strategy != "off":
-            response_payload = process_payload(resp_body, self.config.payload_strategy, self.config)
+            if self.config.payload_strategy == "metadata_only":
+                response_payload = response_meta
+            else:
+                response_payload = process_payload(resp_body, self.config.payload_strategy, self.config)
 
         # Extract error info
         error_type = None

@@ -309,11 +309,16 @@ class TestSchemaMigration:
             assert "model" in cols, "Migration should add model column"
             assert "is_stream" in cols, "Migration should add is_stream column"
 
-            # Verify old data is preserved and ttfc_ms → first_chunk_ms copy worked
+            # Verify old data is preserved but timing fields are NULL
+            # P0-NEW-02-fix: old ttfc_ms values are NOT copied to first_chunk_ms
+            # because the timing semantics are incompatible.
             spans = storage.get_trace_spans("old-trace")
             assert len(spans) == 1, "Old data should survive migration"
-            # ttfc_ms value (80.0) should have been copied to first_chunk_ms
-            assert spans[0]["first_chunk_ms"] == 80.0, "ttfc_ms should migrate to first_chunk_ms"
+            assert spans[0]["first_chunk_ms"] is None, "first_chunk_ms must be NULL for legacy records"
+            # ttft_ms column didn't exist in v1, should be NULL after migration
+            assert spans[0]["ttft_ms"] is None, "ttft_ms must be NULL for legacy records"
+            # duration_ms is always preserved
+            assert spans[0]["duration_ms"] == 1500.0, "duration_ms should be preserved"
 
             # Verify metadata table has schema version
             meta = conn.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()

@@ -82,8 +82,9 @@ class Storage:
         """Initialize database schema with migration support.
 
         P0-NEW-04: Checks existing schema and runs ALTER TABLE for missing columns.
-        A metadata(key, value) table tracks schema_version.
-        Old databases with ttfc_ms → first_chunk_ms values migrated automatically.
+        Old databases with ttfc_ms are migrated — but old timing values are NOT
+        copied to new fields (incompatible semantics). first_chunk_ms and ttft_ms
+        are set to NULL for legacy records; duration_ms is preserved.
         """
         with self._init_lock:
             if self._initialized:
@@ -145,12 +146,23 @@ class Storage:
                     logger.info("Schema migration: adding column %s %s", col_name, col_type)
                     conn.execute(f"ALTER TABLE spans ADD COLUMN {col_name} {col_type}")
 
-                    # If old ttfc_ms exists, copy values to first_chunk_ms
+                    # P0-NEW-02-fix: Do NOT copy old ttfc_ms → first_chunk_ms.
+                    # Old timing semantics (ttfc_ms) are incompatible with new
+                    # semantics (first_chunk_ms / ttft_ms). Setting them to NULL
+                    # is the safest choice — old records keep duration_ms but lose
+                    # streaming-specific timing fields rather than carrying wrong data.
                     if col_name == "first_chunk_ms" and "ttfc_ms" in existing_cols:
-                        conn.execute(
-                            "UPDATE spans SET first_chunk_ms = ttfc_ms WHERE first_chunk_ms IS NULL"
+                        logger.info(
+                            "Migration: old ttfc_ms column detected — leaving "
+                            "first_chunk_ms NULL (incompatible timing semantics)"
                         )
-                        logger.info("Migration: copied ttfc_ms → first_chunk_ms")
+
+            # P0-NEW-02-fix: If migrating from v1 (ttfc_ms existed), NULL out
+            # old ttft_ms values too — the semantics changed between v1 and v2.
+            # ttft_ms existed in v1 but meant something subtly different; NULL is safer.
+            if "ttfc_ms" in existing_cols:
+                conn.execute("UPDATE spans SET ttft_ms = NULL WHERE ttft_ms IS NOT NULL")
+                logger.info("Migration: NULLed old ttft_ms values (incompatible semantics)")
 
             # Create indexes AFTER migration so all columns exist
             conn.executescript("""
@@ -271,63 +283,71 @@ class Storage:
     ) -> dict:
         """Get trace summaries with filtering.
 
-        P0-NEW-03: Trace filter semantics:
-        - status: trace-level aggregate (any span ERROR → trace ERROR)
-        - min/max_duration_ms: trace-level aggregate (MAX(end) - MIN(start))
-        - model: span-level EXISTS (trace contains at least one span with this model)
-        - session_id/user_id/trace_id/app_name/business_scene: span-level EXISTS
+        P0-NEW-03 (fix): TRUE EXISTS semantics:
+        - status: trace-level aggregate — computed from ALL spans of matching traces
+        - min/max_duration_ms: trace-level aggregate — computed from ALL spans
+        - model/session_id/user_id/app_name/business_scene: span-level EXISTS subquery
+          (trace qualifies if ≥1 span matches; but aggregation uses ALL spans)
 
-        P1-NEW-02: Pagination via CTE/subquery — no loading all trace_ids into Python.
-        All filtering, counting, sorting, and pagination done in SQL.
+        P1-NEW-02: Pagination via CTE — no loading all trace_ids into Python.
 
         Returns:
             {"traces": [...], "total": int}
         """
         conn = self._get_conn()
 
-        # ── Build CTE for trace-level aggregation ──
-        # trace_agg computes per-trace: start, end, duration, status
-        trace_agg_conditions = []
-        trace_agg_params: list = []
+        # ── Build trace-qualification WHERE clause ──
+        # Direct conditions (time, trace_id) filter which traces are "in scope"
+        direct_conditions = []
+        direct_params: list = []
 
-        # Time filters apply at span level (any span in the time window)
         if time_start is not None:
-            trace_agg_conditions.append("start_time >= ?")
-            trace_agg_params.append(time_start)
+            direct_conditions.append("s.start_time >= ?")
+            direct_params.append(time_start)
         if time_end is not None:
-            trace_agg_conditions.append("start_time <= ?")
-            trace_agg_params.append(time_end)
+            direct_conditions.append("s.start_time <= ?")
+            direct_params.append(time_end)
+        if trace_id is not None:
+            direct_conditions.append("s.trace_id = ?")
+            direct_params.append(trace_id)
 
-        # These are span-level EXISTS filters — applied as conditions on individual spans
-        # but they determine which traces are included
-        span_exists_conditions = []
-        span_exists_params: list = []
+        # EXISTS conditions: trace has ≥1 span matching the attribute
+        # These do NOT restrict which spans get aggregated — they only determine
+        # which trace_ids qualify.
+        exists_clauses = []
+        exists_params: list = []
 
         if model is not None:
-            span_exists_conditions.append("model = ?")
-            span_exists_params.append(model)
+            exists_clauses.append(
+                "EXISTS (SELECT 1 FROM spans s2 WHERE s2.trace_id = s.trace_id AND s2.model = ?)"
+            )
+            exists_params.append(model)
         if session_id is not None:
-            span_exists_conditions.append("session_id = ?")
-            span_exists_params.append(session_id)
+            exists_clauses.append(
+                "EXISTS (SELECT 1 FROM spans s2 WHERE s2.trace_id = s.trace_id AND s2.session_id = ?)"
+            )
+            exists_params.append(session_id)
         if user_id is not None:
-            span_exists_conditions.append("user_id = ?")
-            span_exists_params.append(user_id)
-        if trace_id is not None:
-            span_exists_conditions.append("trace_id = ?")
-            span_exists_params.append(trace_id)
+            exists_clauses.append(
+                "EXISTS (SELECT 1 FROM spans s2 WHERE s2.trace_id = s.trace_id AND s2.user_id = ?)"
+            )
+            exists_params.append(user_id)
         if app_name is not None:
-            span_exists_conditions.append("app_name = ?")
-            span_exists_params.append(app_name)
+            exists_clauses.append(
+                "EXISTS (SELECT 1 FROM spans s2 WHERE s2.trace_id = s.trace_id AND s2.app_name = ?)"
+            )
+            exists_params.append(app_name)
         if business_scene is not None:
-            span_exists_conditions.append("business_scene = ?")
-            span_exists_params.append(business_scene)
+            exists_clauses.append(
+                "EXISTS (SELECT 1 FROM spans s2 WHERE s2.trace_id = s.trace_id AND s2.business_scene = ?)"
+            )
+            exists_params.append(business_scene)
 
-        # Build the base WHERE for selecting spans that go into trace_agg
-        base_conditions = list(trace_agg_conditions) + list(span_exists_conditions)
-        base_params = list(trace_agg_params) + list(span_exists_params)
-        base_where = " AND ".join(base_conditions) if base_conditions else "1=1"
+        all_conditions = direct_conditions + exists_clauses
+        all_params = direct_params + exists_params
+        trace_where = " AND ".join(all_conditions) if all_conditions else "1=1"
 
-        # Build trace-level HAVING conditions (status, duration)
+        # ── HAVING: trace-level aggregate filters (status, duration) ──
         having_conditions = []
         having_params: list = []
 
@@ -352,9 +372,15 @@ class Storage:
         sort_expr = trace_sort_map.get(sort_by, "trace_start")
         sort_dir = "DESC" if sort_order.lower() == "desc" else "ASC"
 
-        # ── P1-NEW-02: Single CTE-based query for count ──
-        count_query = f"""
-            WITH trace_agg AS (
+        # The CTE template: qualified_traces finds trace_ids; trace_agg computes
+        # MIN/MAX/status from ALL spans of those traces; HAVING filters at trace level.
+        cte_template = f"""
+            WITH qualified_traces AS (
+                SELECT DISTINCT s.trace_id
+                FROM spans s
+                WHERE {trace_where}
+            ),
+            trace_agg AS (
                 SELECT
                     trace_id,
                     MIN(start_time) AS trace_start,
@@ -365,42 +391,24 @@ class Storage:
                         THEN 'ERROR' ELSE 'OK'
                     END AS trace_status
                 FROM spans
-                WHERE {base_where}
+                WHERE trace_id IN (SELECT trace_id FROM qualified_traces)
                 GROUP BY trace_id
                 HAVING {having_clause}
             )
-            SELECT COUNT(*) AS total FROM trace_agg
         """
-        count_params = base_params + having_params
+
+        # ── Count query ──
+        count_query = f"{cte_template} SELECT COUNT(*) AS total FROM trace_agg"
+        count_params = all_params + having_params
         total_row = conn.execute(count_query, count_params).fetchone()
         total = total_row["total"] if total_row else 0
 
         if total == 0:
             return {"traces": [], "total": 0}
 
-        # ── P1-NEW-02: CTE-based query with pagination ──
-        # Get the page of trace_ids first, then aggregate all spans for those traces
-        page_query = f"""
-            WITH trace_agg AS (
-                SELECT
-                    trace_id,
-                    MIN(start_time) AS trace_start,
-                    MAX(end_time) AS trace_end,
-                    (MAX(end_time) - MIN(start_time)) * 1000 AS trace_duration_ms,
-                    CASE
-                        WHEN SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END) > 0
-                        THEN 'ERROR' ELSE 'OK'
-                    END AS trace_status
-                FROM spans
-                WHERE {base_where}
-                GROUP BY trace_id
-                HAVING {having_clause}
-            )
-            SELECT trace_id FROM trace_agg
-            ORDER BY {sort_expr} {sort_dir}
-            LIMIT ? OFFSET ?
-        """
-        page_params = base_params + having_params + [limit, offset]
+        # ── Page query (get ordered trace_ids) ──
+        page_query = f"{cte_template} SELECT trace_id FROM trace_agg ORDER BY {sort_expr} {sort_dir} LIMIT ? OFFSET ?"
+        page_params = all_params + having_params + [limit, offset]
         page_rows = conn.execute(page_query, page_params).fetchall()
         page_trace_ids = [r["trace_id"] for r in page_rows]
 
