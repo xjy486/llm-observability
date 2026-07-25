@@ -538,6 +538,243 @@ async def run_e2e_tests(svc: ServiceManager):
         check("Time series has span_count", "span_count" in bucket)
 
     # ═════════════════════════════════════════════════════════
+    # Scenario 5b: Tool Span — AGENT → LLM + TOOL siblings
+    # Verifies: TOOL span as sibling of LLM span under AGENT
+    # ═════════════════════════════════════════════════════════
+    print("\n" + "=" * 70)
+    print("Scenario 5b: Tool Span — AGENT → LLM + TOOL siblings")
+    print("=" * 70)
+
+    with Observability.trace(
+        name="tool-llm-siblings",
+        session_id="e2e-session-5b",
+        user_id="e2e-user-5b",
+    ):
+        # TOOL span — a simulated "web_search" tool
+        with Observability.tool(
+            name="web_search",
+            tool_type="search",
+            input={"query": "capital of France"},
+        ) as tool:
+            tool.set_output({"results": ["Paris"], "count": 1})
+
+        # LLM span — an actual LLM call in the same trace
+        resp5b = client.chat.completions.create(
+            model=AGNES_MODEL,
+            messages=[{"role": "user", "content": "What is the capital of France? One word."}],
+            max_tokens=20,
+            temperature=0,
+        )
+
+    check("Scenario 5b: LLM response received", resp5b is not None and bool(resp5b.choices[0].message.content))
+
+    print("  ⏳ Waiting for async flush (8s)...")
+    await asyncio.sleep(8)
+
+    traces_resp5b = http_get_json(f"{svc.core_url}/api/v1/traces?durationMinutes=5&limit=20")
+    traces5b = traces_resp5b.get("traces", [])
+    trace5b = next((t for t in traces5b if t.get("session_id") == "e2e-session-5b"), None)
+    check("Scenario 5b: Tool+LLM trace found", trace5b is not None)
+
+    if trace5b:
+        check("Scenario 5b: trace has tool_call_count >= 1", trace5b.get("tool_call_count", 0) >= 1, f"tool_call_count={trace5b.get('tool_call_count')}")
+
+        detail5b = http_get_json(f"{svc.core_url}/api/v1/traces/{trace5b['trace_id']}")
+        spans5b = detail5b.get("spans", [])
+        tool_spans_5b = [s for s in spans5b if s["span_kind"] == "TOOL"]
+        llm_spans_5b = [s for s in spans5b if s["span_kind"] == "LLM"]
+        agent_spans_5b = [s for s in spans5b if s["span_kind"] == "AGENT"]
+
+        check("Scenario 5b: has TOOL span(s)", len(tool_spans_5b) >= 1, f"tool_count={len(tool_spans_5b)}")
+        check("Scenario 5b: has LLM span(s)", len(llm_spans_5b) >= 1, f"llm_count={len(llm_spans_5b)}")
+        check("Scenario 5b: has AGENT span", len(agent_spans_5b) == 1, f"agent_count={len(agent_spans_5b)}")
+
+        if tool_spans_5b and agent_spans_5b:
+            tool_s = tool_spans_5b[0]
+            agent_s = agent_spans_5b[0]
+            check(
+                "Scenario 5b: TOOL parent is AGENT",
+                tool_s["parent_span_id"] == agent_s["span_id"],
+                f"tool_parent={tool_s['parent_span_id']}, agent_id={agent_s['span_id']}",
+            )
+            check("Scenario 5b: TOOL span_name is tool.web_search", tool_s.get("span_name") == "tool.web_search", f"name={tool_s.get('span_name')}")
+            check("Scenario 5b: TOOL status is OK", tool_s.get("status") == "OK", f"status={tool_s.get('status')}")
+
+            # Check TOOL attributes
+            tool_attrs = tool_s.get("attributes", {})
+            check("Scenario 5b: TOOL has tool.name attr", tool_attrs.get("tool.name") == "web_search", f"name={tool_attrs.get('tool.name')}")
+            check("Scenario 5b: TOOL has tool.type attr", tool_attrs.get("tool.type") == "search", f"type={tool_attrs.get('tool.type')}")
+
+            # Check payload
+            tool_payload = tool_s.get("payload")
+            check("Scenario 5b: TOOL has payload", tool_payload is not None, f"payload={type(tool_payload)}")
+            if tool_payload:
+                check("Scenario 5b: TOOL payload has input", "input" in tool_payload, f"keys={list(tool_payload.keys())}")
+                check("Scenario 5b: TOOL payload has output", "output" in tool_payload, f"keys={list(tool_payload.keys())}")
+
+    # ═════════════════════════════════════════════════════════
+    # Scenario 5c: Tool with internal LLM call (TOOL → LLM)
+    # Verifies: TOOL span as parent of an LLM span
+    # ═════════════════════════════════════════════════════════
+    print("\n" + "=" * 70)
+    print("Scenario 5c: Tool with internal LLM call (TOOL → LLM)")
+    print("=" * 70)
+
+    with Observability.trace(
+        name="tool-with-llm-inside",
+        session_id="e2e-session-5c",
+        user_id="e2e-user-5c",
+    ):
+        with Observability.tool(
+            name="smart_lookup",
+            tool_type="rag",
+            input={"question": "What is 3*7?"},
+        ) as tool:
+            # LLM call inside the TOOL span
+            resp5c = client.chat.completions.create(
+                model=AGNES_MODEL,
+                messages=[{"role": "user", "content": "What is 3*7? Reply with just the number."}],
+                max_tokens=20,
+                temperature=0,
+            )
+            tool.set_output({"answer": resp5c.choices[0].message.content})
+
+    check("Scenario 5c: LLM inside tool succeeded", resp5c is not None and bool(resp5c.choices[0].message.content))
+
+    print("  ⏳ Waiting for async flush (8s)...")
+    await asyncio.sleep(8)
+
+    traces_resp5c = http_get_json(f"{svc.core_url}/api/v1/traces?durationMinutes=5&limit=20")
+    traces5c = traces_resp5c.get("traces", [])
+    trace5c = next((t for t in traces5c if t.get("session_id") == "e2e-session-5c"), None)
+    check("Scenario 5c: Tool+LLM trace found", trace5c is not None)
+
+    if trace5c:
+        detail5c = http_get_json(f"{svc.core_url}/api/v1/traces/{trace5c['trace_id']}")
+        spans5c = detail5c.get("spans", [])
+        tool_spans_5c = [s for s in spans5c if s["span_kind"] == "TOOL"]
+        llm_spans_5c = [s for s in spans5c if s["span_kind"] == "LLM"]
+
+        check("Scenario 5c: has TOOL span", len(tool_spans_5c) >= 1, f"tool_count={len(tool_spans_5c)}")
+        check("Scenario 5c: has LLM span(s)", len(llm_spans_5c) >= 1, f"llm_count={len(llm_spans_5c)}")
+
+        if tool_spans_5c and llm_spans_5c:
+            tool_s5c = tool_spans_5c[0]
+            llm_s5c = llm_spans_5c[0]
+            check(
+                "Scenario 5c: LLM parent is TOOL span",
+                llm_s5c["parent_span_id"] == tool_s5c["span_id"],
+                f"llm_parent={llm_s5c['parent_span_id']}, tool_id={tool_s5c['span_id']}",
+            )
+
+    # ═════════════════════════════════════════════════════════
+    # Scenario 5d: Tool Error (exception in tool)
+    # Verifies: TOOL span captures ERROR status, exception is re-raised
+    # ═════════════════════════════════════════════════════════
+    print("\n" + "=" * 70)
+    print("Scenario 5d: Tool Error (exception in tool)")
+    print("=" * 70)
+
+    tool_error_raised = False
+    with Observability.trace(
+        name="tool-error-task",
+        session_id="e2e-session-5d",
+        user_id="e2e-user-5d",
+    ):
+        try:
+            with Observability.tool(
+                name="failing_tool",
+                tool_type="http",
+                input={"url": "https://example.invalid/api"},
+            ) as tool:
+                raise ConnectionError("DNS resolution failed for example.invalid")
+        except ConnectionError:
+            tool_error_raised = True
+
+    check("Scenario 5d: Exception re-raised from tool", tool_error_raised)
+
+    print("  ⏳ Waiting for async flush (8s)...")
+    await asyncio.sleep(8)
+
+    traces_resp5d = http_get_json(f"{svc.core_url}/api/v1/traces?durationMinutes=5&limit=20")
+    traces5d = traces_resp5d.get("traces", [])
+    trace5d = next((t for t in traces5d if t.get("session_id") == "e2e-session-5d"), None)
+    check("Scenario 5d: Tool error trace found", trace5d is not None)
+
+    if trace5d:
+        check("Scenario 5d: trace status is ERROR", trace5d.get("status") == "ERROR", f"status={trace5d.get('status')}")
+        check("Scenario 5d: trace has tool_call_count >= 1", trace5d.get("tool_call_count", 0) >= 1, f"tool_call_count={trace5d.get('tool_call_count')}")
+
+        detail5d = http_get_json(f"{svc.core_url}/api/v1/traces/{trace5d['trace_id']}")
+        spans5d = detail5d.get("spans", [])
+        tool_spans_5d = [s for s in spans5d if s["span_kind"] == "TOOL"]
+
+        if tool_spans_5d:
+            err_tool = tool_spans_5d[0]
+            check("Scenario 5d: TOOL span status is ERROR", err_tool.get("status") == "ERROR", f"status={err_tool.get('status')}")
+            check(
+                "Scenario 5d: TOOL has error_type field",
+                bool(err_tool.get("error_type")),
+                f"error_type={err_tool.get('error_type')}",
+            )
+
+    # ═════════════════════════════════════════════════════════
+    # Scenario 5e: Tool Metrics Verification
+    # Verifies: tool_call_count, tool_error_count, tool_error_rate,
+    #           p50/p95/p99_tool_latency_ms in /metrics and /timeseries
+    # ═════════════════════════════════════════════════════════
+    print("\n" + "=" * 70)
+    print("Scenario 5e: Tool Metrics Verification")
+    print("=" * 70)
+
+    metrics5e = http_get_json(f"{svc.core_url}/api/v1/metrics?durationMinutes=5")
+    check(
+        "Scenario 5e: metrics tool_call_count >= 2",
+        metrics5e.get("tool_call_count", 0) >= 2,
+        f"tool_call_count={metrics5e.get('tool_call_count')}",
+    )
+    check(
+        "Scenario 5e: metrics tool_error_count >= 1",
+        metrics5e.get("tool_error_count", 0) >= 1,
+        f"tool_error_count={metrics5e.get('tool_error_count')}",
+    )
+    check(
+        "Scenario 5e: metrics tool_error_rate is present",
+        "tool_error_rate" in metrics5e,
+        f"keys={[k for k in metrics5e.keys() if 'tool' in k.lower()]}",
+    )
+    check(
+        "Scenario 5e: metrics p50_tool_latency_ms > 0",
+        metrics5e.get("p50_tool_latency_ms", 0) > 0,
+        f"p50={metrics5e.get('p50_tool_latency_ms')}",
+    )
+    check(
+        "Scenario 5e: metrics p95_tool_latency_ms > 0",
+        metrics5e.get("p95_tool_latency_ms", 0) > 0,
+        f"p95={metrics5e.get('p95_tool_latency_ms')}",
+    )
+    check(
+        "Scenario 5e: metrics p99_tool_latency_ms > 0",
+        metrics5e.get("p99_tool_latency_ms", 0) > 0,
+        f"p99={metrics5e.get('p99_tool_latency_ms')}",
+    )
+
+    ts5e = http_get_json(f"{svc.core_url}/api/v1/timeseries?durationMinutes=5&intervalSeconds=60")
+    check("Scenario 5e: timeseries non-empty", len(ts5e) > 0, f"ts_count={len(ts5e)}")
+    if ts5e:
+        bucket5e = ts5e[0]
+        check(
+            "Scenario 5e: timeseries has tool_call_count",
+            "tool_call_count" in bucket5e,
+            f"keys={list(bucket5e.keys())}",
+        )
+        check(
+            "Scenario 5e: timeseries has tool_error_count",
+            "tool_error_count" in bucket5e,
+            f"keys={list(bucket5e.keys())}",
+        )
+
+    # ═════════════════════════════════════════════════════════
     # Scenario 6: Sampling=0 — no telemetry stored, business OK
     # P0-2 Case A: sample_rate=0 → 0 AGENT, 0 LLM, 0 GATEWAY
     # BLOCKER-1: Strict before/after count comparison
