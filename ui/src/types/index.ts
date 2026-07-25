@@ -49,6 +49,7 @@ export interface TraceSummary {
   business_scene: string | null
   span_count: number
   llm_call_count: number
+  tool_call_count: number
   input_tokens: number
   output_tokens: number
   total_tokens: number
@@ -71,6 +72,7 @@ export interface TraceDetail {
   business_scene: string | null
   span_count: number
   llm_call_count: number
+  tool_call_count: number
   input_tokens: number
   output_tokens: number
   total_tokens: number
@@ -103,6 +105,13 @@ export interface MetricsSummary {
   unique_models: number
   unique_users: number
   unique_sessions: number
+  // Tool-level metrics (Phase 2.2)
+  tool_call_count: number
+  tool_error_count: number
+  tool_error_rate: number
+  p50_tool_latency_ms: number
+  p95_tool_latency_ms: number
+  p99_tool_latency_ms: number
 }
 
 export interface TimeSeriesPoint {
@@ -116,6 +125,10 @@ export interface TimeSeriesPoint {
   avg_first_chunk_ms: number | null  // P1-NEW-01: avg first_chunk_ms (streaming only)
   span_count: number            // P1-NEW-01: total spans in bucket
   tokens: number
+  // Tool-level metrics (Phase 2.2)
+  tool_call_count: number
+  tool_error_count: number
+  tool_avg_latency_ms: number | null
 }
 
 export interface ModelInfo {

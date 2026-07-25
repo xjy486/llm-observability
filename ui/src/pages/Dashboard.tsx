@@ -75,6 +75,20 @@ export default function Dashboard() {
             />
           </div>
 
+          {/* Tool metrics (Phase 2.2) */}
+          {metrics.tool_call_count > 0 && (
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+              <StatCard label="Tool Calls" value={metrics.tool_call_count} />
+              <StatCard
+                label="Tool Error Rate"
+                value={`${metrics.tool_error_rate}%`}
+                error={metrics.tool_error_rate > 5}
+              />
+              <StatCard label="p50 Tool Latency" value={`${metrics.p50_tool_latency_ms}ms`} />
+              <StatCard label="p95 Tool Latency" value={`${metrics.p95_tool_latency_ms}ms`} />
+            </div>
+          )}
+
           {/* Charts row */}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <div className="card">

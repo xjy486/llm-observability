@@ -14,7 +14,7 @@ import atexit
 import logging
 import random
 import threading
-from typing import Optional
+from typing import Optional, Any
 
 from .config import Config
 from .reporter import Reporter
@@ -141,6 +141,48 @@ class Observability:
             user_id=user_id,
             business_scene=business_scene,
         )
+
+    @classmethod
+    def tool(
+        cls,
+        name: str,
+        tool_type: Optional[str] = None,
+        input: Any = None,
+        call_id: Optional[str] = None,
+        attributes: Optional[dict] = None,
+    ):
+        """Create a Tool span within the current trace (Phase 2.2).
+
+        Requires an active trace (Observability.trace()).
+
+        Args:
+            name: Tool name (e.g. 'web_search'). Required.
+            tool_type: Optional type (e.g. 'search', 'http').
+            input: Optional input payload.
+            call_id: Optional LLM tool call ID for logical association.
+            attributes: Optional extra attributes.
+        """
+        if not cls._initialized or cls._tracer is None:
+            raise RuntimeError("Observability.init() must be called before tool()")
+        return cls._tracer.tool(
+            name=name, tool_type=tool_type, input=input,
+            call_id=call_id, attributes=attributes,
+        )
+
+    @classmethod
+    def instrument_tool(
+        cls,
+        name: str,
+        tool_type: Optional[str] = None,
+    ):
+        """Decorator that wraps a function with a TOOL span (Phase 2.2).
+
+        Captures function arguments as input, return value as output.
+        Supports both sync and async functions.
+        """
+        if not cls._initialized or cls._tracer is None:
+            raise RuntimeError("Observability.init() must be called before instrument_tool()")
+        return cls._tracer.instrument_tool(name=name, tool_type=tool_type)
 
     @classmethod
     def _instrument_openai(cls):

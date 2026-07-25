@@ -458,6 +458,7 @@ class Storage:
                 ) as business_scene,
                 COUNT(*) as span_count,
                 SUM(CASE WHEN s.span_kind = 'LLM' THEN 1 ELSE 0 END) as llm_call_count,
+                SUM(CASE WHEN s.span_kind = 'TOOL' THEN 1 ELSE 0 END) as tool_call_count,
                 SUM(CASE WHEN s.span_kind = 'LLM' THEN COALESCE(s.input_tokens, 0) ELSE 0 END) as input_tokens,
                 SUM(CASE WHEN s.span_kind = 'LLM' THEN COALESCE(s.output_tokens, 0) ELSE 0 END) as output_tokens,
                 SUM(CASE WHEN s.span_kind = 'LLM' THEN COALESCE(s.total_tokens, 0) ELSE 0 END) as total_tokens,
@@ -548,6 +549,7 @@ class Storage:
             return None
 
         llm_spans = [s for s in spans if s["span_kind"] == "LLM"]
+        tool_spans = [s for s in spans if s["span_kind"] == "TOOL"]
         input_tokens = sum(s.get("input_tokens") or 0 for s in llm_spans)
         output_tokens = sum(s.get("output_tokens") or 0 for s in llm_spans)
         total_tokens = sum(s.get("total_tokens") or 0 for s in llm_spans)
@@ -565,6 +567,7 @@ class Storage:
             "business_scene": meta_span.get("business_scene") or _first_non_null("business_scene"),
             "span_count": len(spans),
             "llm_call_count": len(llm_spans),
+            "tool_call_count": len(tool_spans),
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
@@ -747,6 +750,32 @@ class Storage:
         p50_first_chunk = self._percentile(first_chunks, 50) if first_chunks else None
         p95_first_chunk = self._percentile(first_chunks, 95) if first_chunks else None
 
+        # ── Tool-level metrics (Phase 2.2) ──
+        tool_where = f"({where_clause}) AND span_kind = 'TOOL'"
+        tool_row = conn.execute(
+            f"""SELECT
+                COUNT(*) as tool_call_count,
+                SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END) as tool_error_count
+            FROM spans s WHERE {tool_where}""",
+            params
+        ).fetchone()
+
+        tool_call_count = tool_row["tool_call_count"] or 0
+        tool_error_count = tool_row["tool_error_count"] or 0
+        tool_error_rate = (tool_error_count / tool_call_count * 100) if tool_call_count > 0 else 0.0
+
+        tool_latency_rows = conn.execute(
+            f"""SELECT duration_ms FROM spans s
+                WHERE {tool_where} AND duration_ms IS NOT NULL
+                ORDER BY duration_ms""",
+            params
+        ).fetchall()
+        tool_latencies = [r["duration_ms"] for r in tool_latency_rows]
+
+        p50_tool = self._percentile(tool_latencies, 50)
+        p95_tool = self._percentile(tool_latencies, 95)
+        p99_tool = self._percentile(tool_latencies, 99)
+
         # ── Span-level metrics (debugging) ──
         span_row = conn.execute(
             f"""SELECT COUNT(*) as span_count FROM spans s WHERE {where_clause}""",
@@ -784,6 +813,14 @@ class Storage:
             "unique_models": llm_row["unique_models"] or 0,
             "unique_users": unique_users,
             "unique_sessions": unique_sessions,
+
+            # Tool-level metrics (Phase 2.2)
+            "tool_call_count": tool_call_count,
+            "tool_error_count": tool_error_count,
+            "tool_error_rate": round(tool_error_rate, 2),
+            "p50_tool_latency_ms": round(p50_tool, 2) if p50_tool else 0.0,
+            "p95_tool_latency_ms": round(p95_tool, 2) if p95_tool else 0.0,
+            "p99_tool_latency_ms": round(p99_tool, 2) if p99_tool else 0.0,
         }
 
     def get_time_series(
@@ -825,7 +862,10 @@ class Storage:
                 AVG(CASE WHEN span_kind = 'LLM' THEN duration_ms END) as llm_avg_latency_ms,
                 SUM(CASE WHEN span_kind = 'LLM' THEN COALESCE(total_tokens, 0) ELSE 0 END) as tokens,
                 AVG(CASE WHEN span_kind = 'LLM' AND ttft_ms IS NOT NULL THEN ttft_ms END) as avg_ttft_ms,
-                AVG(CASE WHEN span_kind = 'LLM' AND first_chunk_ms IS NOT NULL THEN first_chunk_ms END) as avg_first_chunk_ms
+                AVG(CASE WHEN span_kind = 'LLM' AND first_chunk_ms IS NOT NULL THEN first_chunk_ms END) as avg_first_chunk_ms,
+                COUNT(CASE WHEN span_kind = 'TOOL' THEN 1 END) as tool_call_count,
+                SUM(CASE WHEN status = 'ERROR' AND span_kind = 'TOOL' THEN 1 ELSE 0 END) as tool_error_count,
+                AVG(CASE WHEN span_kind = 'TOOL' THEN duration_ms END) as tool_avg_latency_ms
             FROM spans
             WHERE {where_clause}
             GROUP BY bucket

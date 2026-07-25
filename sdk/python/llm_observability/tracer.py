@@ -7,7 +7,7 @@ P1-2: Implements head sampling at root trace creation.
 """
 import logging
 import random
-from typing import Optional
+from typing import Optional, Any
 
 from .config import Config
 from .context import SpanContext, get_current_context, set_context, reset_context
@@ -135,3 +135,30 @@ class Tracer:
             user_id=user_id,
             business_scene=business_scene,
         )
+
+    def tool(
+        self,
+        name: str,
+        tool_type: Optional[str] = None,
+        input: Any = None,
+        call_id: Optional[str] = None,
+        attributes: Optional[dict] = None,
+    ):
+        """Create a TOOL span context manager (Phase 2.2).
+
+        Requires an active trace (AGENT context). Raises RuntimeError otherwise.
+        """
+        from .tool import ToolContextManager
+        return ToolContextManager(
+            tracer=self,
+            name=name,
+            tool_type=tool_type,
+            input=input,
+            call_id=call_id,
+            attributes=attributes,
+        )
+
+    def instrument_tool(self, name: str, tool_type: Optional[str] = None):
+        """Create a tool decorator that wraps a function with a TOOL span (Phase 2.2)."""
+        from .tool import instrument_tool as _instrument_tool
+        return _instrument_tool(self, name=name, tool_type=tool_type)

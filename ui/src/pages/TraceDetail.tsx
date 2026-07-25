@@ -94,6 +94,12 @@ export default function TraceDetail() {
             <div className="text-xs text-gray-500">LLM Calls</div>
             <div className="text-sm">{trace.llm_call_count}</div>
           </div>
+          {trace.tool_call_count > 0 && (
+            <div>
+              <div className="text-xs text-gray-500">Tool Calls</div>
+              <div className="text-sm">{trace.tool_call_count}</div>
+            </div>
+          )}
           <div>
             <div className="text-xs text-gray-500">Total Tokens</div>
             <div className="text-sm">{trace.total_tokens.toLocaleString()}</div>
@@ -212,13 +218,61 @@ function SpanDetailPanel({ span }: { span: SpanRecord }) {
             <div>
               <span className="text-gray-500">Gateway:</span>
               <span className="ml-1 font-mono">
-                {span.attributes?.['llm.gateway.name'] || '—'}
+                {String(span.attributes?.['llm.gateway.name'] ?? '—')}
               </span>
             </div>
             {span.first_chunk_ms !== null && (
               <div>
                 <span className="text-gray-500">First Chunk:</span>
                 <span className="ml-1 font-mono">{Math.round(span.first_chunk_ms)}ms</span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* TOOL-specific fields (Phase 2.2) */}
+        {span.span_kind === 'TOOL' && (
+          <div className="grid grid-cols-2 gap-2 pt-2 border-t border-gray-100">
+            <div>
+              <span className="text-gray-500">Tool Name:</span>
+              <span className="ml-1 font-mono">
+                {String(span.attributes?.['tool.name'] ?? span.span_name)}
+              </span>
+            </div>
+            {span.attributes?.['tool.type'] != null && (
+              <div>
+                <span className="text-gray-500">Tool Type:</span>
+                <span className="ml-1 font-mono">{String(span.attributes['tool.type'])}</span>
+              </div>
+            )}
+            {span.attributes?.['tool.call_id'] != null && (
+              <div>
+                <span className="text-gray-500">Call ID:</span>
+                <span className="ml-1 font-mono text-xs">{String(span.attributes['tool.call_id'])}</span>
+              </div>
+            )}
+            {span.attributes?.['tool.input.type'] != null && (
+              <div>
+                <span className="text-gray-500">Input Type:</span>
+                <span className="ml-1 font-mono">{String(span.attributes['tool.input.type'])}</span>
+              </div>
+            )}
+            {span.attributes?.['tool.output.type'] != null && (
+              <div>
+                <span className="text-gray-500">Output Type:</span>
+                <span className="ml-1 font-mono">{String(span.attributes['tool.output.type'])}</span>
+              </div>
+            )}
+            {span.attributes?.['tool.input.truncated'] === true && (
+              <div>
+                <span className="text-gray-500">Input:</span>
+                <span className="ml-1 tag tag-error">Truncated</span>
+              </div>
+            )}
+            {span.attributes?.['tool.output.truncated'] === true && (
+              <div>
+                <span className="text-gray-500">Output:</span>
+                <span className="ml-1 tag tag-error">Truncated</span>
               </div>
             )}
           </div>

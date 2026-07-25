@@ -51,6 +51,8 @@ class Span:
     business_scene: Optional[str] = None
     error_type: Optional[str] = None
     error_message: Optional[str] = None
+    payload: Optional[dict[str, Any]] = None
+    request_metadata: Optional[dict[str, Any]] = None
 
     def start(self):
         """Mark the span as started."""
@@ -109,4 +111,6 @@ class Span:
             "events": self.events,
             "error_type": self.error_type,
             "error_message": self.error_message,
+            "payload": self.payload,
+            "request_metadata": self.request_metadata,
         }
