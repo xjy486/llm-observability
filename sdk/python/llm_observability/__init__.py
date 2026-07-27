@@ -177,12 +177,55 @@ class Observability:
     ):
         """Decorator that wraps a function with a TOOL span (Phase 2.2).
 
+        P0-1 fix: This decorator can be defined BEFORE Observability.init().
+        The SDK initialization check is deferred to function call time.
+
         Captures function arguments as input, return value as output.
         Supports both sync and async functions.
+
+        Error semantics:
+        - Definition time: no error (decorator just returns a wrapper)
+        - Call time before init: RuntimeError("init() must be called...")
+        - Call time without active trace: RuntimeError("requires an active trace")
         """
-        if not cls._initialized or cls._tracer is None:
-            raise RuntimeError("Observability.init() must be called before instrument_tool()")
-        return cls._tracer.instrument_tool(name=name, tool_type=tool_type)
+        import functools
+        import inspect as _inspect
+
+        def decorator(func):
+            is_async = _inspect.iscoroutinefunction(func)
+
+            if is_async:
+                @functools.wraps(func)
+                async def async_wrapper(*args, **kwargs):
+                    if not cls._initialized or cls._tracer is None:
+                        raise RuntimeError(
+                            "Observability.init() must be called before invoking an instrumented tool"
+                        )
+                    bound_input = _bind_decorator_args(func, args, kwargs)
+                    with cls._tracer.tool(
+                        name=name, tool_type=tool_type, input=bound_input,
+                    ) as tool:
+                        result = await func(*args, **kwargs)
+                        tool.set_output(result)
+                        return result
+                return async_wrapper
+            else:
+                @functools.wraps(func)
+                def sync_wrapper(*args, **kwargs):
+                    if not cls._initialized or cls._tracer is None:
+                        raise RuntimeError(
+                            "Observability.init() must be called before invoking an instrumented tool"
+                        )
+                    bound_input = _bind_decorator_args(func, args, kwargs)
+                    with cls._tracer.tool(
+                        name=name, tool_type=tool_type, input=bound_input,
+                    ) as tool:
+                        result = func(*args, **kwargs)
+                        tool.set_output(result)
+                        return result
+                return sync_wrapper
+
+        return decorator
 
     @classmethod
     def _instrument_openai(cls):
@@ -239,3 +282,24 @@ class Observability:
                 cls._reporter.stop_sync()
             except Exception:
                 pass
+
+
+def _bind_decorator_args(func, args, kwargs) -> dict:
+    """Bind function arguments to a dict, skipping self/cls.
+
+    P0-1: Used by the lazy-init instrument_tool decorator in Observability.
+    """
+    import inspect as _inspect
+    try:
+        sig = _inspect.signature(func)
+        bound = sig.bind(*args, **kwargs)
+        bound.apply_defaults()
+
+        result = {}
+        for param_name, value in bound.arguments.items():
+            if param_name in ("self", "cls"):
+                continue
+            result[param_name] = value
+        return result
+    except Exception:
+        return {"args": list(args), "kwargs": dict(kwargs)}

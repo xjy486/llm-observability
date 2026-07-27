@@ -109,14 +109,14 @@ class TestSafeSerialize:
 class TestSizeGuard:
     def test_small_data_unchanged(self):
         data = {"query": "hello"}
-        result, truncated = apply_size_guard(data)
+        result, truncated, original_size = apply_size_guard(data)
         assert result == {"query": "hello"}
         assert truncated is False
 
     def test_large_data_truncated(self):
         big_string = "x" * 100_000
         data = {"output": big_string}
-        result, truncated = apply_size_guard(data, max_bytes=1024)
+        result, truncated, original_size = apply_size_guard(data, max_bytes=1024)
         assert truncated is True
         assert result.get("_truncated") is True
         assert result.get("_original_size_bytes") > 1024
@@ -124,7 +124,7 @@ class TestSizeGuard:
 
     def test_size_guard_preserves_small_nested(self):
         data = {"a": {"b": "c"}}
-        result, truncated = apply_size_guard(data)
+        result, truncated, original_size = apply_size_guard(data)
         assert truncated is False
         assert result == {"a": {"b": "c"}}
 

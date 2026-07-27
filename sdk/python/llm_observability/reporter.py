@@ -11,6 +11,7 @@ The sync interface is used by Observability.init() to auto-manage the Reporter
 in a dedicated background thread with its own asyncio event loop.
 """
 import asyncio
+import json
 import logging
 import threading
 from collections import deque
@@ -19,6 +20,19 @@ from typing import Optional
 import aiohttp
 
 logger = logging.getLogger("llm_obs.reporter")
+
+
+def _record_is_json_safe(record: dict) -> bool:
+    """P0-2: Check if a single telemetry record is JSON-serializable.
+
+    This is the Reporter's final防线: a single bad record must not poison
+    the entire batch. Used as preflight before enqueueing or before sending.
+    """
+    try:
+        json.dumps(record)
+        return True
+    except (TypeError, ValueError, RecursionError):
+        return False
 
 
 class Reporter:
@@ -227,6 +241,8 @@ class Reporter:
     async def _flush(self):
         """Send queued records in batches.
 
+        P0-2: Per-record JSON preflight — a single bad record is dropped
+        rather than poisoning the entire batch.
         P1-2: Includes Authorization header if api_key is configured.
         """
         if not self._queue or not self._session:
@@ -239,6 +255,21 @@ class Reporter:
         if not batch:
             return
 
+        # P0-2: Preflight — separate good records from bad ones
+        good_records = []
+        for record in batch:
+            if _record_is_json_safe(record):
+                good_records.append(record)
+            else:
+                self._dropped_count += 1
+                logger.error(
+                    "SDK dropping unserializable record (dropped=%d)",
+                    self._dropped_count,
+                )
+
+        if not good_records:
+            return  # All records were bad
+
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -246,21 +277,21 @@ class Reporter:
         try:
             async with self._session.post(
                 self.ingest_url,
-                json={"records": batch},
+                json={"records": good_records},
                 headers=headers,
             ) as resp:
                 if resp.status == 200:
-                    self._sent_count += len(batch)
-                    logger.debug("SDK sent %d records", len(batch))
+                    self._sent_count += len(good_records)
+                    logger.debug("SDK sent %d records", len(good_records))
                 else:
-                    self._fail_count += len(batch)
+                    self._fail_count += len(good_records)
                     logger.error("SDK ingest failed: status=%d", resp.status)
-                    for item in reversed(batch):
+                    for item in reversed(good_records):
                         if len(self._queue) < self.max_queue_size:
                             self._queue.appendleft(item)
         except Exception as e:
-            self._fail_count += len(batch)
+            self._fail_count += len(good_records)
             logger.error("SDK report error: %s", e)
-            for item in reversed(batch):
+            for item in reversed(good_records):
                 if len(self._queue) < self.max_queue_size:
                     self._queue.appendleft(item)

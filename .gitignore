@@ -49,3 +49,4 @@ logs/
 # Database
 *.db
 *.sqlite3
+sdk/python/llm_observability/llm-observability-phase2.2-closeout-fix-requirements.md

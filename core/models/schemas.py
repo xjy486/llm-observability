@@ -105,6 +105,7 @@ class TraceSummary(BaseModel):
     business_scene: Optional[str] = None
     span_count: int = 0
     llm_call_count: int = 0
+    tool_call_count: int = 0  # P1-5: Phase 2.2 tool span count
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
@@ -128,6 +129,7 @@ class TraceDetail(BaseModel):
     business_scene: Optional[str] = None
     span_count: int = 0
     llm_call_count: int = 0
+    tool_call_count: int = 0  # P1-5: Phase 2.2 tool span count
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
@@ -140,9 +142,11 @@ class MetricsSummary(BaseModel):
     Metrics are separated into three levels:
     - Trace metrics: trace_count, error_rate (at trace level)
     - LLM Call metrics: llm_call_count, latency percentiles, ttft/first_chunk, tokens (LLM spans only)
+    - Tool metrics: tool_call_count, tool_error_rate, tool latency percentiles (Phase 2.2)
     - Span metrics: span_count (debugging only)
 
     P0-NEW-02: ttfc_ms replaced by first_chunk_ms.
+    P1-5: Tool metrics fields added for Phase 2.2 contract sync.
     """
     # Trace-level metrics
     trace_count: int = 0
@@ -165,6 +169,14 @@ class MetricsSummary(BaseModel):
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     total_tokens: int = 0
+
+    # Tool-level metrics (Phase 2.2, P1-5)
+    tool_call_count: int = 0
+    tool_error_count: int = 0
+    tool_error_rate: float = 0.0
+    p50_tool_latency_ms: float = 0.0
+    p95_tool_latency_ms: float = 0.0
+    p99_tool_latency_ms: float = 0.0
 
     # Span-level metrics (debugging)
     span_count: int = 0

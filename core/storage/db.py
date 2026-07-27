@@ -751,13 +751,29 @@ class Storage:
         p95_first_chunk = self._percentile(first_chunks, 95) if first_chunks else None
 
         # ── Tool-level metrics (Phase 2.2) ──
-        tool_where = f"({where_clause}) AND span_kind = 'TOOL'"
+        # P0-3 fix: model filter is a TRACE qualification filter, not a span-level filter.
+        # A TOOL span has model=NULL, so applying model=? directly to TOOL spans yields 0.
+        # Correct approach: find candidate trace_ids (traces with ≥1 LLM span matching model),
+        # then aggregate ALL TOOL spans of those candidate traces.
+        if model is not None:
+            # Build candidate trace subquery: traces that have a matching LLM span
+            # Combine with existing where_clause for time/session/user filters
+            tool_where = f"""trace_id IN (
+                SELECT DISTINCT trace_id FROM spans s2
+                WHERE {where_clause}
+            ) AND span_kind = 'TOOL'"""
+            # where_clause appears once in the subquery, so one copy of params
+            tool_params = params
+        else:
+            tool_where = f"({where_clause}) AND span_kind = 'TOOL'"
+            tool_params = params
+
         tool_row = conn.execute(
             f"""SELECT
                 COUNT(*) as tool_call_count,
                 SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END) as tool_error_count
             FROM spans s WHERE {tool_where}""",
-            params
+            tool_params
         ).fetchone()
 
         tool_call_count = tool_row["tool_call_count"] or 0
@@ -768,7 +784,7 @@ class Storage:
             f"""SELECT duration_ms FROM spans s
                 WHERE {tool_where} AND duration_ms IS NOT NULL
                 ORDER BY duration_ms""",
-            params
+            tool_params
         ).fetchall()
         tool_latencies = [r["duration_ms"] for r in tool_latency_rows]
 
@@ -832,18 +848,13 @@ class Storage:
     ) -> list[dict]:
         """Get time series data for charts.
 
-        P1-NEW-01: TimeSeries fields match Summary semantics:
-        - trace_count: distinct traces in bucket
-        - trace_error_count: traces with any ERROR span
-        - llm_call_count: LLM spans in bucket
-        - llm_error_count: ERROR LLM spans
-        - llm_avg_latency_ms: avg duration_ms of LLM spans
-        - avg_ttft_ms: avg ttft_ms of LLM spans (streaming only)
-        - span_count: total spans in bucket
-        - tokens: sum of total_tokens
+        P0-3 fix: When model filter is applied, tool metrics use trace qualification.
+        Tool spans have model=NULL, so a direct model=? filter on TOOL spans yields 0.
+        Tool metrics are computed in a separate query and merged into the result.
         """
         conn = self._get_conn()
 
+        # Main query: time filter + optional model filter for LLM/trace metrics
         conditions = ["start_time >= ?", "start_time <= ?"]
         params: list = [time_start, time_end]
         if model is not None:
@@ -862,10 +873,7 @@ class Storage:
                 AVG(CASE WHEN span_kind = 'LLM' THEN duration_ms END) as llm_avg_latency_ms,
                 SUM(CASE WHEN span_kind = 'LLM' THEN COALESCE(total_tokens, 0) ELSE 0 END) as tokens,
                 AVG(CASE WHEN span_kind = 'LLM' AND ttft_ms IS NOT NULL THEN ttft_ms END) as avg_ttft_ms,
-                AVG(CASE WHEN span_kind = 'LLM' AND first_chunk_ms IS NOT NULL THEN first_chunk_ms END) as avg_first_chunk_ms,
-                COUNT(CASE WHEN span_kind = 'TOOL' THEN 1 END) as tool_call_count,
-                SUM(CASE WHEN status = 'ERROR' AND span_kind = 'TOOL' THEN 1 ELSE 0 END) as tool_error_count,
-                AVG(CASE WHEN span_kind = 'TOOL' THEN duration_ms END) as tool_avg_latency_ms
+                AVG(CASE WHEN span_kind = 'LLM' AND first_chunk_ms IS NOT NULL THEN first_chunk_ms END) as avg_first_chunk_ms
             FROM spans
             WHERE {where_clause}
             GROUP BY bucket
@@ -873,11 +881,61 @@ class Storage:
             params
         ).fetchall()
 
+        # P0-3: Tool metrics via separate query with trace qualification
+        # TOOL spans have model=NULL, so we need trace qualification when model filter is active.
+        # Time filter is always applied. Model filter selects candidate traces.
+        tool_time_conditions = ["start_time >= ?", "start_time <= ?"]
+        tool_time_params: list = [time_start, time_end]
+
+        if model is not None:
+            # Tool spans in traces that have ≥1 span matching model filter
+            tool_where = f"""start_time >= ? AND start_time <= ? AND span_kind = 'TOOL'
+                AND trace_id IN (
+                    SELECT DISTINCT trace_id FROM spans s2
+                    WHERE s2.start_time >= ? AND s2.start_time <= ? AND s2.model = ?
+                )"""
+            tool_params = [time_start, time_end, time_start, time_end, model]
+        else:
+            tool_where = "start_time >= ? AND start_time <= ? AND span_kind = 'TOOL'"
+            tool_params = [time_start, time_end]
+
+        tool_rows = conn.execute(
+            f"""SELECT
+                CAST(start_time / {interval_seconds} AS INTEGER) * {interval_seconds} as bucket,
+                COUNT(*) as tool_call_count,
+                SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END) as tool_error_count,
+                AVG(duration_ms) as tool_avg_latency_ms
+            FROM spans
+            WHERE {tool_where}
+            GROUP BY bucket
+            ORDER BY bucket""",
+            tool_params
+        ).fetchall()
+
+        # Build tool metrics lookup by bucket
+        tool_by_bucket = {}
+        for tr in tool_rows:
+            tool_by_bucket[tr["bucket"]] = {
+                "tool_call_count": tr["tool_call_count"] or 0,
+                "tool_error_count": tr["tool_error_count"] or 0,
+                "tool_avg_latency_ms": tr["tool_avg_latency_ms"],
+            }
+
         # Compute trace_error_count separately per bucket (traces with any ERROR span)
         result = []
         for r in rows:
             d = dict(r)
             bucket = d["bucket"]
+            # Merge tool metrics
+            tool_data = tool_by_bucket.get(bucket, {
+                "tool_call_count": 0,
+                "tool_error_count": 0,
+                "tool_avg_latency_ms": None,
+            })
+            d["tool_call_count"] = tool_data["tool_call_count"]
+            d["tool_error_count"] = tool_data["tool_error_count"]
+            d["tool_avg_latency_ms"] = tool_data["tool_avg_latency_ms"]
+
             # Count distinct traces with ERROR status in this bucket
             err_row = conn.execute(
                 f"""SELECT COUNT(DISTINCT trace_id) as cnt
