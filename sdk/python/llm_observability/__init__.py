@@ -228,6 +228,47 @@ class Observability:
         return decorator
 
     @classmethod
+    def langchain_middleware(cls):
+        """Create a LangChainObservabilityMiddleware instance.
+
+        Convenience method that returns a middleware for use with
+        create_agent(middleware=[...]).
+
+        Must call Observability.init() first.
+        """
+        if not cls._initialized or cls._tracer is None:
+            raise RuntimeError("Observability.init() must be called before langchain_middleware()")
+        from .integrations.langchain.middleware import LangChainObservabilityMiddleware
+        return LangChainObservabilityMiddleware()
+
+    @classmethod
+    def instrument_langchain_agent(
+        cls,
+        agent,
+        name: str = "langchain.agent",
+        root_mode: str = "auto",
+        session_id=None,
+        user_id=None,
+        business_scene=None,
+    ):
+        """Wrap a LangChain agent with observability.
+
+        Convenience method that calls observe_agent() under the hood.
+        Must call Observability.init() first.
+        """
+        if not cls._initialized or cls._tracer is None:
+            raise RuntimeError("Observability.init() must be called before instrument_langchain_agent()")
+        from .integrations.langchain.agent_wrapper import observe_agent
+        return observe_agent(
+            agent,
+            name=name,
+            root_mode=root_mode,
+            session_id=session_id,
+            user_id=user_id,
+            business_scene=business_scene,
+        )
+
+    @classmethod
     def _instrument_openai(cls):
         """Patch OpenAI SDK for automatic LLM span creation.
 
