@@ -648,3 +648,331 @@ class TestP13SafeSerializeGlobalBudget:
 
         result = safe_serialize(deep)
         json.dumps(result)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 问题1: model + session/user 组合查询不产生 SQL 绑定错误
+# ═══════════════════════════════════════════════════════════════
+
+class TestModelSessionUserComboFilter:
+    """Verify model + session/user combined filters don't cause SQLite binding errors."""
+
+    def _insert_combo_data(self, storage):
+        """Insert two traces with different models and sessions."""
+        base = time.time()
+
+        # Trace A: model=gpt-4, session=S1, user=U1
+        storage.insert_span({
+            "trace_id": "combo-a", "span_id": "agent-a", "parent_span_id": None,
+            "span_kind": "AGENT", "span_name": "agent.run",
+            "start_time": base - 50, "end_time": base - 10,
+            "duration_ms": 40000, "status": "OK",
+            "session_id": "S1", "user_id": "U1",
+            "attributes": {}, "events": [], "payload": None, "request_metadata": None,
+        })
+        storage.insert_span({
+            "trace_id": "combo-a", "span_id": "llm-a", "parent_span_id": "agent-a",
+            "span_kind": "LLM", "span_name": "llm.completion",
+            "start_time": base - 40, "end_time": base - 39,
+            "duration_ms": 1000, "status": "OK",
+            "session_id": "S1", "user_id": "U1",
+            "attributes": {"gen_ai.request.model": "gpt-4"},
+            "events": [], "payload": None, "request_metadata": None,
+        })
+        storage.insert_span({
+            "trace_id": "combo-a", "span_id": "tool-a", "parent_span_id": "agent-a",
+            "span_kind": "TOOL", "span_name": "tool.search",
+            "start_time": base - 35, "end_time": base - 34,
+            "duration_ms": 1000, "status": "OK",
+            "attributes": {"tool.name": "search"}, "events": [],
+            "payload": None, "request_metadata": None,
+        })
+
+        # Trace B: model=claude, session=S2, user=U2
+        storage.insert_span({
+            "trace_id": "combo-b", "span_id": "agent-b", "parent_span_id": None,
+            "span_kind": "AGENT", "span_name": "agent.run",
+            "start_time": base - 50, "end_time": base - 10,
+            "duration_ms": 40000, "status": "OK",
+            "session_id": "S2", "user_id": "U2",
+            "attributes": {}, "events": [], "payload": None, "request_metadata": None,
+        })
+        storage.insert_span({
+            "trace_id": "combo-b", "span_id": "llm-b", "parent_span_id": "agent-b",
+            "span_kind": "LLM", "span_name": "llm.completion",
+            "start_time": base - 40, "end_time": base - 39,
+            "duration_ms": 1000, "status": "OK",
+            "session_id": "S2", "user_id": "U2",
+            "attributes": {"gen_ai.request.model": "claude"},
+            "events": [], "payload": None, "request_metadata": None,
+        })
+        storage.insert_span({
+            "trace_id": "combo-b", "span_id": "tool-b", "parent_span_id": "agent-b",
+            "span_kind": "TOOL", "span_name": "tool.fetch",
+            "start_time": base - 35, "end_time": base - 34,
+            "duration_ms": 1000, "status": "OK",
+            "attributes": {"tool.name": "fetch"}, "events": [],
+            "payload": None, "request_metadata": None,
+        })
+        return base
+
+    def test_model_and_session_filter_no_binding_error(self):
+        """model + session_id must not raise SQLite binding error."""
+        from storage.db import Storage
+        storage = Storage(db_path=":memory:")
+        self._insert_combo_data(storage)
+
+        # This should not raise "sqlite3.ProgrammingError: Incorrect number of bindings"
+        metrics = storage.get_metrics(
+            time_start=time.time() - 120,
+            time_end=time.time(),
+            model="gpt-4",
+            session_id="S1",
+        )
+        # Only Trace A (gpt-4 + S1) qualifies
+        assert metrics["tool_call_count"] == 1  # tool-a
+        assert metrics["llm_call_count"] == 1   # llm-a
+
+    def test_model_and_user_filter_no_binding_error(self):
+        """model + user_id must not raise SQLite binding error."""
+        from storage.db import Storage
+        storage = Storage(db_path=":memory:")
+        self._insert_combo_data(storage)
+
+        metrics = storage.get_metrics(
+            time_start=time.time() - 120,
+            time_end=time.time(),
+            model="gpt-4",
+            user_id="U1",
+        )
+        assert metrics["tool_call_count"] == 1
+        assert metrics["llm_call_count"] == 1
+
+    def test_model_session_user_filter_no_binding_error(self):
+        """model + session_id + user_id must not raise SQLite binding error."""
+        from storage.db import Storage
+        storage = Storage(db_path=":memory:")
+        self._insert_combo_data(storage)
+
+        metrics = storage.get_metrics(
+            time_start=time.time() - 120,
+            time_end=time.time(),
+            model="gpt-4",
+            session_id="S1",
+            user_id="U1",
+        )
+        assert metrics["tool_call_count"] == 1
+        assert metrics["llm_call_count"] == 1
+        assert metrics["trace_count"] == 1
+
+    def test_model_session_filter_excludes_other_session(self):
+        """model + session filter must exclude traces from other sessions."""
+        from storage.db import Storage
+        storage = Storage(db_path=":memory:")
+        self._insert_combo_data(storage)
+
+        # gpt-4 + S2 → no trace matches (gpt-4 is in S1, not S2)
+        metrics = storage.get_metrics(
+            time_start=time.time() - 120,
+            time_end=time.time(),
+            model="gpt-4",
+            session_id="S2",
+        )
+        assert metrics["tool_call_count"] == 0
+        assert metrics["llm_call_count"] == 0
+        assert metrics["trace_count"] == 0
+
+
+# ═══════════════════════════════════════════════════════════════
+# 问题2: TimeSeries Tool-only Bucket 辅助统计不混入不匹配模型的 Trace
+# ═══════════════════════════════════════════════════════════════
+
+class TestToolOnlyBucketModelFilterIntegrity:
+    """Verify Tool-only bucket auxiliary stats respect model filter."""
+
+    def _insert_cross_model_same_bucket(self, storage):
+        """Insert two traces with different models spanning same/different buckets.
+
+        Trace A (gpt-4): LLM in bucket 0, TOOL in bucket 1 (tool-only bucket for gpt-4)
+        Trace B (claude): LLM + 3 TOOLs + ERROR in bucket 1
+        """
+        base = 1000.0
+        interval = 60
+        bucket0 = (int(base / interval)) * interval  # 1000
+        bucket1 = bucket0 + interval                  # 1060
+
+        # Trace A: model=gpt-4
+        # LLM span in bucket 0 → qualifies Trace A as gpt-4 candidate
+        storage.insert_span({
+            "trace_id": "cross-a", "span_id": "llm-a", "parent_span_id": "agent-a",
+            "span_kind": "LLM", "span_name": "llm.completion",
+            "start_time": bucket0 + 3, "end_time": bucket0 + 4,
+            "duration_ms": 1000, "status": "OK",
+            "attributes": {"gen_ai.request.model": "gpt-4"},
+            "events": [], "payload": None, "request_metadata": None,
+        })
+        storage.insert_span({
+            "trace_id": "cross-a", "span_id": "agent-a", "parent_span_id": None,
+            "span_kind": "AGENT", "span_name": "agent.run",
+            "start_time": bucket0 + 1, "end_time": bucket1 + 50,
+            "duration_ms": (bucket1 + 50 - bucket0 - 1) * 1000, "status": "OK",
+            "attributes": {}, "events": [], "payload": None, "request_metadata": None,
+        })
+        # TOOL span in bucket 1 → this makes bucket 1 a "tool-only bucket" for gpt-4
+        storage.insert_span({
+            "trace_id": "cross-a", "span_id": "tool-a", "parent_span_id": "agent-a",
+            "span_kind": "TOOL", "span_name": "tool.search",
+            "start_time": bucket1 + 5, "end_time": bucket1 + 6,
+            "duration_ms": 1000, "status": "OK",
+            "attributes": {"tool.name": "search"}, "events": [],
+            "payload": None, "request_metadata": None,
+        })
+
+        # Trace B: model=claude, all spans in bucket 1
+        storage.insert_span({
+            "trace_id": "cross-b", "span_id": "agent-b", "parent_span_id": None,
+            "span_kind": "AGENT", "span_name": "agent.run",
+            "start_time": bucket1 + 2, "end_time": bucket1 + 50,
+            "duration_ms": 48000, "status": "OK",
+            "attributes": {}, "events": [], "payload": None, "request_metadata": None,
+        })
+        storage.insert_span({
+            "trace_id": "cross-b", "span_id": "llm-b", "parent_span_id": "agent-b",
+            "span_kind": "LLM", "span_name": "llm.completion",
+            "start_time": bucket1 + 3, "end_time": bucket1 + 4,
+            "duration_ms": 1000, "status": "OK",
+            "attributes": {"gen_ai.request.model": "claude"},
+            "events": [], "payload": None, "request_metadata": None,
+        })
+        storage.insert_span({
+            "trace_id": "cross-b", "span_id": "tool-b1", "parent_span_id": "agent-b",
+            "span_kind": "TOOL", "span_name": "tool.fetch",
+            "start_time": bucket1 + 7, "end_time": bucket1 + 8,
+            "duration_ms": 1000, "status": "OK",
+            "attributes": {"tool.name": "fetch"}, "events": [],
+            "payload": None, "request_metadata": None,
+        })
+        storage.insert_span({
+            "trace_id": "cross-b", "span_id": "tool-b2", "parent_span_id": "agent-b",
+            "span_kind": "TOOL", "span_name": "tool.db",
+            "start_time": bucket1 + 9, "end_time": bucket1 + 10,
+            "duration_ms": 1000, "status": "OK",
+            "attributes": {"tool.name": "db"}, "events": [],
+            "payload": None, "request_metadata": None,
+        })
+        # ERROR span in Trace B
+        storage.insert_span({
+            "trace_id": "cross-b", "span_id": "err-b", "parent_span_id": "agent-b",
+            "span_kind": "TOOL", "span_name": "tool.fail",
+            "start_time": bucket1 + 11, "end_time": bucket1 + 12,
+            "duration_ms": 1000, "status": "ERROR",
+            "attributes": {"tool.name": "fail"}, "events": [],
+            "payload": None, "request_metadata": None,
+        })
+        return bucket0, bucket1
+
+    def test_tool_only_bucket_excludes_unrelated_model_trace(self):
+        """Tool-only bucket's auxiliary stats must NOT count unrelated-model traces."""
+        from storage.db import Storage
+        storage = Storage(db_path=":memory:")
+        bucket0, bucket1 = self._insert_cross_model_same_bucket(storage)
+
+        # Query with model=gpt-4. Trace A (gpt-4) has LLM in bucket0, TOOL in bucket1.
+        # Trace B (claude) has all spans in bucket1. So bucket1 is a tool-only bucket
+        # for gpt-4 (no gpt-4 LLM in bucket1, but tool-a from Trace A is there).
+        ts = storage.get_time_series(
+            time_start=bucket0 - 1,
+            time_end=bucket1 + 120,
+            interval_seconds=60,
+            model="gpt-4",
+        )
+
+        bucket_data = next((b for b in ts if b["bucket"] == bucket1), None)
+        assert bucket_data is not None, "Tool-only bucket missing from result"
+
+        # tool_call_count must be 1 (only tool-a from Trace A)
+        assert bucket_data["tool_call_count"] == 1, (
+            f"Expected 1, got {bucket_data['tool_call_count']} — "
+            "unrelated model traces leaked into tool count"
+        )
+
+        # trace_count must be 1 (only Trace A), NOT 2
+        assert bucket_data["trace_count"] == 1, (
+            f"Expected 1, got {bucket_data['trace_count']} — "
+            "unrelated model traces leaked into trace_count"
+        )
+
+        # span_count must only count Trace A's spans in bucket1 (agent-a if it
+        # spans into bucket1 + tool-a = at most 2), NOT Trace B's 5 spans
+        assert bucket_data["span_count"] <= 2, (
+            f"Expected ≤2, got {bucket_data['span_count']} — "
+            "unrelated model traces leaked into span_count"
+        )
+
+        # trace_error_count must be 0 (Trace A has no ERROR), NOT 1
+        assert bucket_data["trace_error_count"] == 0, (
+            f"Expected 0, got {bucket_data['trace_error_count']} — "
+            "unrelated model traces leaked into trace_error_count"
+        )
+
+    def test_tool_only_bucket_span_count_respects_model_filter(self):
+        """Tool-only bucket span_count must only count candidate trace spans."""
+        from storage.db import Storage
+        storage = Storage(db_path=":memory:")
+        bucket0, bucket1 = self._insert_cross_model_same_bucket(storage)
+
+        ts = storage.get_time_series(
+            time_start=bucket0 - 1,
+            time_end=bucket1 + 120,
+            interval_seconds=60,
+            model="gpt-4",
+        )
+        bucket_data = next((b for b in ts if b["bucket"] == bucket1), None)
+        assert bucket_data is not None
+
+        # Trace A (gpt-4) in bucket1: only tool-a (TOOL). agent-a may also
+        # fall in bucket1 depending on start_time bucketing, so ≤2.
+        # Trace B should NOT be counted (model=claude, not gpt-4)
+        assert bucket_data["span_count"] <= 2, (
+            f"Expected ≤2, got {bucket_data['span_count']}"
+        )
+
+    def test_tool_only_bucket_trace_error_count_respects_model_filter(self):
+        """Tool-only bucket trace_error_count must only consider candidate traces."""
+        from storage.db import Storage
+        storage = Storage(db_path=":memory:")
+        bucket0, bucket1 = self._insert_cross_model_same_bucket(storage)
+
+        ts = storage.get_time_series(
+            time_start=bucket0 - 1,
+            time_end=bucket1 + 120,
+            interval_seconds=60,
+            model="gpt-4",
+        )
+        bucket_data = next((b for b in ts if b["bucket"] == bucket1), None)
+        assert bucket_data is not None
+
+        # Trace A (gpt-4) has NO ERROR spans → trace_error_count = 0
+        # Trace B (claude) has an ERROR span, but it's NOT a gpt-4 trace
+        assert bucket_data["trace_error_count"] == 0
+
+    def test_no_model_filter_includes_all_traces_in_bucket(self):
+        """Without model filter, all traces in the bucket are counted."""
+        from storage.db import Storage
+        storage = Storage(db_path=":memory:")
+        bucket0, bucket1 = self._insert_cross_model_same_bucket(storage)
+
+        ts = storage.get_time_series(
+            time_start=bucket0 - 1,
+            time_end=bucket1 + 120,
+            interval_seconds=60,
+        )
+        bucket_data = next((b for b in ts if b["bucket"] == bucket1), None)
+        assert bucket_data is not None
+
+        # Both traces have spans in bucket1: Trace A (agent-a possibly + tool-a)
+        # + Trace B (5 spans). At minimum Trace B's 5 spans.
+        assert bucket_data["span_count"] >= 5
+        assert bucket_data["trace_count"] == 2
+        assert bucket_data["trace_error_count"] == 1
+

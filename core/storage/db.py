@@ -763,9 +763,12 @@ class Storage:
                 SELECT DISTINCT trace_id FROM spans s2
                 WHERE {where_clause}
             ) AND span_kind = 'TOOL'"""
-            # P1-1: Re-apply time filters to the outer TOOL span query.
-            # model=? is NOT applied to TOOL spans (they have model=NULL),
-            # but time/session/user filters ARE applied to the outer span.
+            # P1-1 fix: Re-apply ONLY time filters to the outer TOOL span query.
+            # model=? is NOT applied to TOOL spans (they have model=NULL).
+            # session/user are trace-level filters already handled by the
+            # candidate trace subquery — do NOT re-append trace_filter_clause
+            # here, as that would duplicate the EXISTS() placeholders without
+            # corresponding parameters, causing a SQLite binding error.
             outer_tool_conditions = []
             outer_tool_params: list = []
             if time_start is not None:
@@ -774,9 +777,6 @@ class Storage:
             if time_end is not None:
                 outer_tool_conditions.append("start_time <= ?")
                 outer_tool_params.append(time_end)
-            if needs_trace_filter:
-                # session/user are trace-level filters — apply via EXISTS
-                outer_tool_conditions.append(trace_filter_clause)
             if outer_tool_conditions:
                 tool_where = f"({tool_where}) AND ({' AND '.join(outer_tool_conditions)})"
             tool_params = params + outer_tool_params
@@ -940,6 +940,11 @@ class Storage:
         # P0-2 fix: Merge main buckets AND tool-only buckets into a complete set.
         # A tool-only bucket (tool span exists but no matching-model LLM in same bucket)
         # must still appear in the result with complete contract fields.
+        #
+        # 问题2 fix: When model filter is active, ALL auxiliary queries for
+        # tool-only buckets (trace_count, span_count, trace_error_count) must
+        # be restricted to candidate traces (traces with ≥1 span matching model).
+        # Otherwise unrelated-model traces in the same bucket pollute the stats.
         result = []
 
         # Build main lookup by bucket
@@ -960,6 +965,18 @@ class Storage:
             "tokens": 0,
         }
 
+        # 问题2: Pre-compute candidate trace IDs when model filter is active.
+        # This avoids per-bucket subqueries and ensures all auxiliary stats
+        # are consistently filtered.
+        candidate_trace_ids = None
+        if model is not None:
+            candidate_rows = conn.execute(
+                """SELECT DISTINCT trace_id FROM spans
+                   WHERE start_time >= ? AND start_time <= ? AND model = ?""",
+                [time_start, time_end, model]
+            ).fetchall()
+            candidate_trace_ids = [r["trace_id"] for r in candidate_rows]
+
         all_buckets = sorted(set(main_by_bucket.keys()) | set(tool_by_bucket.keys()))
 
         for bucket in all_buckets:
@@ -976,35 +993,93 @@ class Storage:
             d["tool_error_count"] = tool_data["tool_error_count"]
             d["tool_avg_latency_ms"] = tool_data["tool_avg_latency_ms"]
 
-            # Compute trace_error_count for this bucket (traces with any ERROR span)
-            # P0-2: For tool-only buckets, we need a separate query since main
-            # didn't cover this bucket.
-            err_row = conn.execute(
-                f"""SELECT COUNT(DISTINCT trace_id) as cnt
-                    FROM spans
-                    WHERE start_time >= ? AND start_time <= ?
-                      AND status = 'ERROR'
-                      AND CAST(start_time / {interval_seconds} AS INTEGER) * {interval_seconds} = ?""",
-                [time_start, time_end, bucket]
-            ).fetchone()
-            d["trace_error_count"] = err_row["cnt"] if err_row else 0
-
-            # P0-2: For tool-only buckets, trace_count/span_count from main are 0.
-            # But if there ARE spans in this bucket (e.g. TOOL spans), we should
-            # reflect them. Re-query span_count and trace_count for this bucket
-            # when main didn't cover it.
             if bucket not in main_by_bucket:
-                count_row = conn.execute(
-                    f"""SELECT
-                        COUNT(DISTINCT trace_id) as trace_count,
-                        COUNT(*) as span_count
-                    FROM spans
-                    WHERE start_time >= ? AND start_time <= ?
-                      AND CAST(start_time / {interval_seconds} AS INTEGER) * {interval_seconds} = ?""",
-                    [time_start, time_end, bucket]
-                ).fetchone()
-                d["trace_count"] = count_row["trace_count"] if count_row else 0
-                d["span_count"] = count_row["span_count"] if count_row else 0
+                # Tool-only bucket: auxiliary stats must respect model filter
+                if candidate_trace_ids is not None:
+                    # 问题2: Restrict auxiliary queries to candidate traces only
+                    if not candidate_trace_ids:
+                        # No candidate traces at all → all zeros
+                        d["trace_count"] = 0
+                        d["span_count"] = 0
+                        d["trace_error_count"] = 0
+                    else:
+                        placeholders = ",".join("?" * len(candidate_trace_ids))
+                        count_row = conn.execute(
+                            f"""SELECT
+                                COUNT(DISTINCT trace_id) as trace_count,
+                                COUNT(*) as span_count
+                            FROM spans
+                            WHERE start_time >= ? AND start_time <= ?
+                              AND CAST(start_time / {interval_seconds} AS INTEGER) * {interval_seconds} = ?
+                              AND trace_id IN ({placeholders})""",
+                            [time_start, time_end, bucket] + candidate_trace_ids
+                        ).fetchone()
+                        d["trace_count"] = count_row["trace_count"] if count_row else 0
+                        d["span_count"] = count_row["span_count"] if count_row else 0
+
+                        err_row = conn.execute(
+                            f"""SELECT COUNT(DISTINCT trace_id) as cnt
+                                FROM spans
+                                WHERE start_time >= ? AND start_time <= ?
+                                  AND status = 'ERROR'
+                                  AND CAST(start_time / {interval_seconds} AS INTEGER) * {interval_seconds} = ?
+                                  AND trace_id IN ({placeholders})""",
+                            [time_start, time_end, bucket] + candidate_trace_ids
+                        ).fetchone()
+                        d["trace_error_count"] = err_row["cnt"] if err_row else 0
+                else:
+                    # No model filter → count all spans in this bucket
+                    count_row = conn.execute(
+                        f"""SELECT
+                            COUNT(DISTINCT trace_id) as trace_count,
+                            COUNT(*) as span_count
+                        FROM spans
+                        WHERE start_time >= ? AND start_time <= ?
+                          AND CAST(start_time / {interval_seconds} AS INTEGER) * {interval_seconds} = ?""",
+                        [time_start, time_end, bucket]
+                    ).fetchone()
+                    d["trace_count"] = count_row["trace_count"] if count_row else 0
+                    d["span_count"] = count_row["span_count"] if count_row else 0
+
+                    err_row = conn.execute(
+                        f"""SELECT COUNT(DISTINCT trace_id) as cnt
+                            FROM spans
+                            WHERE start_time >= ? AND start_time <= ?
+                              AND status = 'ERROR'
+                              AND CAST(start_time / {interval_seconds} AS INTEGER) * {interval_seconds} = ?""",
+                        [time_start, time_end, bucket]
+                    ).fetchone()
+                    d["trace_error_count"] = err_row["cnt"] if err_row else 0
+            else:
+                # Main bucket: compute trace_error_count with model filter
+                # The main query already has model filter, but trace_error_count
+                # needs a separate query. For main buckets, the main query's
+                # trace_count is already correct. Just compute trace_error_count.
+                if candidate_trace_ids is not None:
+                    if not candidate_trace_ids:
+                        d["trace_error_count"] = 0
+                    else:
+                        placeholders = ",".join("?" * len(candidate_trace_ids))
+                        err_row = conn.execute(
+                            f"""SELECT COUNT(DISTINCT trace_id) as cnt
+                                FROM spans
+                                WHERE start_time >= ? AND start_time <= ?
+                                  AND status = 'ERROR'
+                                  AND CAST(start_time / {interval_seconds} AS INTEGER) * {interval_seconds} = ?
+                                  AND trace_id IN ({placeholders})""",
+                            [time_start, time_end, bucket] + candidate_trace_ids
+                        ).fetchone()
+                        d["trace_error_count"] = err_row["cnt"] if err_row else 0
+                else:
+                    err_row = conn.execute(
+                        f"""SELECT COUNT(DISTINCT trace_id) as cnt
+                            FROM spans
+                            WHERE start_time >= ? AND start_time <= ?
+                              AND status = 'ERROR'
+                              AND CAST(start_time / {interval_seconds} AS INTEGER) * {interval_seconds} = ?""",
+                        [time_start, time_end, bucket]
+                    ).fetchone()
+                    d["trace_error_count"] = err_row["cnt"] if err_row else 0
 
             result.append(d)
 
