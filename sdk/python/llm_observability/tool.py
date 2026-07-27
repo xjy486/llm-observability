@@ -30,9 +30,56 @@ RESERVED_TOOL_KEYS = frozenset({
 MAX_ATTRIBUTE_SIZE_BYTES = 4 * 1024  # 4 KiB per attribute
 MAX_EVENT_ATTRIBUTES_SIZE_BYTES = 16 * 1024  # 16 KiB per event attributes
 
+# P0-1: Max length for normalized keys and event names
+MAX_KEY_LENGTH = 128
+MAX_EVENT_NAME_LENGTH = 128
+
 
 # P1-2: Sentinel to distinguish "output never set" from "output is None"
 _OUTPUT_UNSET = object()
+
+
+def normalize_attribute_key(key: Any) -> str:
+    """P0-1: Normalize an attribute/event key to a safe bounded string.
+
+    Handles non-string keys (int, None, etc.) without raising AttributeError.
+    Truncates to MAX_KEY_LENGTH and masks sensitive patterns.
+    """
+    if key is None:
+        return "<empty-key>"
+    try:
+        value = str(key)
+    except Exception:
+        return "<invalid-key>"
+
+    if not value:
+        return "<empty-key>"
+
+    if len(value) > MAX_KEY_LENGTH:
+        value = value[:MAX_KEY_LENGTH]
+
+    return value
+
+
+def normalize_event_name(name: Any) -> str:
+    """P0-1: Normalize an event name to a safe bounded string.
+
+    Handles non-string names and truncates to MAX_EVENT_NAME_LENGTH.
+    """
+    if name is None:
+        return "<empty-event-name>"
+    try:
+        value = str(name)
+    except Exception:
+        return "<invalid-event-name>"
+
+    if not value:
+        return "<empty-event-name>"
+
+    if len(value) > MAX_EVENT_NAME_LENGTH:
+        value = value[:MAX_EVENT_NAME_LENGTH]
+
+    return value
 
 
 # ── P1-6: safe_serialize with complexity protection ──
@@ -41,8 +88,41 @@ SAFE_SERIALIZE_MAX_DEPTH = 8
 SAFE_SERIALIZE_MAX_ITEMS = 1000
 SAFE_SERIALIZE_MAX_STRING_CHARS = 32768
 
+# P1-3: Global complexity budget
+SAFE_SERIALIZE_GLOBAL_NODE_BUDGET = 5000
+SAFE_SERIALIZE_GLOBAL_CHAR_BUDGET = 65536
 
-def safe_serialize(value: Any, _depth: int = 0, _seen: Optional[set] = None) -> Any:
+
+@dataclasses.dataclass
+class SerializationBudget:
+    """P1-3: Global budget for a single safe_serialize invocation.
+
+    Tracks remaining nodes and characters across the entire serialization
+    tree, preventing adversarial inputs from causing excessive processing.
+    """
+    remaining_nodes: int = SAFE_SERIALIZE_GLOBAL_NODE_BUDGET
+    remaining_chars: int = SAFE_SERIALIZE_GLOBAL_CHAR_BUDGET
+
+    def consume_node(self) -> bool:
+        """Consume one node. Returns False if budget exhausted."""
+        if self.remaining_nodes <= 0:
+            return False
+        self.remaining_nodes -= 1
+        return True
+
+    def consume_chars(self, n: int) -> bool:
+        """Consume n characters. Returns False if budget exhausted."""
+        if self.remaining_chars <= 0:
+            return False
+        self.remaining_chars -= n
+        return True
+
+    @property
+    def exhausted(self) -> bool:
+        return self.remaining_nodes <= 0 or self.remaining_chars <= 0
+
+
+def safe_serialize(value: Any, _depth: int = 0, _seen: Optional[set] = None, budget: Optional["SerializationBudget"] = None) -> Any:
     """Safely serialize any Python object to a JSON-compatible representation.
 
     P1-6: Includes protection against:
@@ -50,13 +130,27 @@ def safe_serialize(value: Any, _depth: int = 0, _seen: Optional[set] = None) -> 
     - Excessive nesting depth (max_depth)
     - Excessive element count (max_items)
     - Excessively long strings (max_string_chars)
+
+    P1-3: Global complexity budget prevents adversarial inputs from
+    causing excessive processing across the entire serialization tree.
     """
     if _seen is None:
         _seen = set()
 
+    # P1-3: Initialize global budget if not provided
+    if budget is None:
+        budget = SerializationBudget()
+
+    # P1-3: Check global node budget
+    if not budget.consume_node():
+        return {"_truncated": True, "_reason": "global_budget"}
+
     if value is None or isinstance(value, (str, int, float, bool)):
         if isinstance(value, str) and len(value) > SAFE_SERIALIZE_MAX_STRING_CHARS:
+            budget.consume_chars(SAFE_SERIALIZE_MAX_STRING_CHARS)
             return value[:SAFE_SERIALIZE_MAX_STRING_CHARS] + "...[truncated]"
+        if isinstance(value, str):
+            budget.consume_chars(len(value))
         return value
 
     if isinstance(value, (bytes, bytearray)):
@@ -72,6 +166,10 @@ def safe_serialize(value: Any, _depth: int = 0, _seen: Optional[set] = None) -> 
     if _depth >= SAFE_SERIALIZE_MAX_DEPTH:
         return {"_truncated": True, "_reason": "max_depth"}
 
+    # P1-3: Check global budget after depth/circular checks
+    if budget.exhausted:
+        return {"_truncated": True, "_reason": "global_budget"}
+
     try:
         if isinstance(value, dict):
             result = {}
@@ -81,7 +179,12 @@ def safe_serialize(value: Any, _depth: int = 0, _seen: Optional[set] = None) -> 
                     result["_truncated"] = True
                     result["_reason"] = "max_items"
                     break
-                result[str(k)] = safe_serialize(v, _depth + 1, _seen)
+                # P1-3: Check budget per item
+                if budget.exhausted:
+                    result["_truncated"] = True
+                    result["_reason"] = "global_budget"
+                    break
+                result[str(k)] = safe_serialize(v, _depth + 1, _seen, budget)
                 count += 1
             return result
 
@@ -89,13 +192,24 @@ def safe_serialize(value: Any, _depth: int = 0, _seen: Optional[set] = None) -> 
             if len(value) > SAFE_SERIALIZE_MAX_ITEMS:
                 truncated = list(value[:SAFE_SERIALIZE_MAX_ITEMS])
                 return [
-                    safe_serialize(item, _depth + 1, _seen) for item in truncated
+                    safe_serialize(item, _depth + 1, _seen, budget) for item in truncated
                 ] + [{"_truncated": True, "_reason": "max_items"}]
-            return [safe_serialize(item, _depth + 1, _seen) for item in value]
+            return [safe_serialize(item, _depth + 1, _seen, budget) for item in value]
 
         if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            # P1-3 fix: Do NOT use dataclasses.asdict() which recursively copies
+            # the entire dataclass BEFORE entering our budget-controlled recursion.
+            # Instead, iterate fields manually so each value goes through budget checks.
             try:
-                return safe_serialize(dataclasses.asdict(value), _depth + 1, _seen)
+                result = {}
+                for field in dataclasses.fields(value):
+                    if budget.exhausted:
+                        result["_truncated"] = True
+                        result["_reason"] = "global_budget"
+                        break
+                    field_value = getattr(value, field.name)
+                    result[field.name] = safe_serialize(field_value, _depth + 1, _seen, budget)
+                return result
             except Exception:
                 type_name = type(value).__name__
                 try:
@@ -105,8 +219,12 @@ def safe_serialize(value: Any, _depth: int = 0, _seen: Optional[set] = None) -> 
                 return {"_type": type_name, "_repr": safe_repr}
 
         if hasattr(value, "model_dump") and callable(value.model_dump):
+            # P1-3: model_dump() can generate a large object before our budget
+            # kicks in. We still call it (most models are small), but the result
+            # is immediately subject to budget-controlled recursion.
             try:
-                return safe_serialize(value.model_dump(), _depth + 1, _seen)
+                dumped = value.model_dump()
+                return safe_serialize(dumped, _depth + 1, _seen, budget)
             except Exception:
                 pass
 
@@ -165,17 +283,21 @@ def _sanitize_user_value(value: Any) -> Any:
         return "<unserializable>"
 
 
-def _sanitize_attribute_pair(key: str, value: Any) -> Any:
-    """P0-2: Sanitize a single attribute key-value pair.
+def _sanitize_attribute_pair(key: Any, value: Any) -> tuple:
+    """P0-1/P0-2: Sanitize a single attribute key-value pair.
 
-    If the key itself is a sensitive key, the value is fully redacted.
+    Returns (normalized_key, sanitized_value).
+
+    The key is normalized to a string (handles int/None/etc.).
+    If the key is a sensitive key, the value is fully redacted.
     Otherwise, the value is sanitized and pattern-masked.
     """
     from .utils.masking import SENSITIVE_KEYS
-    kl = key.lower()
+    normalized_key = normalize_attribute_key(key)
+    kl = normalized_key.lower()
     if kl in SENSITIVE_KEYS:
-        return "***REDACTED***"
-    return _sanitize_user_value(value)
+        return normalized_key, "***REDACTED***"
+    return normalized_key, _sanitize_user_value(value)
 
 
 def _apply_size_limit_to_value(value: Any, max_bytes: int) -> Any:
@@ -201,29 +323,34 @@ class ToolHandle:
         # P1-2: Use sentinel — even None is a valid output
         self._span._tool_output = value
 
-    def set_attribute(self, key: str, value: Any):
-        # P0-2: Protect canonical keys
-        if key in RESERVED_TOOL_KEYS:
-            logger.warning("Cannot override reserved attribute '%s' — ignored", key)
+    def set_attribute(self, key: Any, value: Any):
+        # P0-1: Normalize key first (handles int/None/etc.)
+        normalized_key = normalize_attribute_key(key)
+        # P0-2: Protect canonical keys (check against normalized key)
+        if normalized_key in RESERVED_TOOL_KEYS:
+            logger.warning("Cannot override reserved attribute '%s' — ignored", normalized_key)
             return
-        # P0-2: Sanitize + mask + size-guard the value (with key context)
-        sanitized = _sanitize_attribute_pair(key, value)
+        # P0-1/P0-2: Sanitize + mask + size-guard the value (with key context)
+        _, sanitized = _sanitize_attribute_pair(key, value)
         sanitized = _apply_size_limit_to_value(sanitized, MAX_ATTRIBUTE_SIZE_BYTES)
-        self._span.set_attribute(key, sanitized)
+        self._span.set_attribute(normalized_key, sanitized)
 
-    def add_event(self, name: str, attributes: dict = None):
+    def add_event(self, name: Any, attributes: dict = None):
+        # P0-1: Normalize event name
+        normalized_name = normalize_event_name(name)
         # P0-2: Sanitize event attributes
         clean_attrs = {}
         if attributes:
             for k, v in attributes.items():
-                if k in RESERVED_TOOL_KEYS:
-                    logger.warning("Cannot use reserved key '%s' in event — ignored", k)
+                normalized_k = normalize_attribute_key(k)
+                if normalized_k in RESERVED_TOOL_KEYS:
+                    logger.warning("Cannot use reserved key '%s' in event — ignored", normalized_k)
                     continue
-                sanitized = _sanitize_attribute_pair(k, v)
-                clean_attrs[k] = sanitized
+                _, sanitized = _sanitize_attribute_pair(k, v)
+                clean_attrs[normalized_k] = sanitized
             # Size-guard the entire event attributes
             clean_attrs = _apply_size_limit_to_value(clean_attrs, MAX_EVENT_ATTRIBUTES_SIZE_BYTES) if isinstance(clean_attrs, dict) else clean_attrs
-        self._span.add_event(name, attributes=clean_attrs)
+        self._span.add_event(normalized_name, attributes=clean_attrs)
 
     def set_error(self, error_type: str, error_message: str):
         self._span.set_error(error_type, error_message)
@@ -265,17 +392,13 @@ class ToolContextManager:
 
         self._sampled = current.sampled
 
+        # P0-1 fix: Deferred context activation.
+        # Perform ALL initialization (span creation, attribute sanitization,
+        # input payload processing) BEFORE set_context(). Only activate the
+        # TOOL context once everything is ready. If any step fails, the parent
+        # context remains untouched — no leak.
         span_id = generate_span_id()
-        ctx = SpanContext(
-            trace_id=current.trace_id,
-            span_id=span_id,
-            parent_span_id=current.span_id,
-            span_kind=SpanKind.TOOL,
-            sampled=current.sampled,
-        )
-        self._token = set_context(ctx)
-
-        self._span = Span(
+        span = Span(
             trace_id=current.trace_id,
             span_id=span_id,
             parent_span_id=current.span_id,
@@ -283,31 +406,67 @@ class ToolContextManager:
             span_kind=SpanKind.TOOL,
         )
 
-        self._span.set_attribute("tool.name", self._name)
+        span.set_attribute("tool.name", self._name)
         if self._tool_type:
-            self._span.set_attribute("tool.type", self._tool_type)
+            span.set_attribute("tool.type", self._tool_type)
         if self._call_id:
-            self._span.set_attribute("tool.call_id", self._call_id)
+            span.set_attribute("tool.call_id", self._call_id)
 
-        # P0-2: Sanitize user-provided extra attributes (protect canonical keys)
+        # P0-1/P0-2: Sanitize user-provided extra attributes (protect canonical keys)
+        # Use normalized keys; bad keys won't crash here.
         for k, v in self._extra_attributes.items():
-            if k in RESERVED_TOOL_KEYS:
-                logger.warning("Cannot override reserved attribute '%s' — ignored", k)
+            normalized_k = normalize_attribute_key(k)
+            if normalized_k in RESERVED_TOOL_KEYS:
+                logger.warning("Cannot override reserved attribute '%s' — ignored", normalized_k)
                 continue
-            sanitized = _sanitize_attribute_pair(k, v)
+            _, sanitized = _sanitize_attribute_pair(k, v)
             sanitized = _apply_size_limit_to_value(sanitized, MAX_ATTRIBUTE_SIZE_BYTES)
-            self._span.set_attribute(k, sanitized)
+            span.set_attribute(normalized_k, sanitized)
 
-        # P0-2: Process input BEFORE span.start() so duration is clean (P1-4)
+        # Attach span to self early so __exit__ / cleanup can access it
+        self._span = span
+
+        # Process input BEFORE span.start() so duration is clean (P1-4)
         # P1-1: Skip payload processing if unsampled
         if self._sampled:
             self._process_input()
 
-        self._span.start()
-        self._handle = ToolHandle(self._span)
+        span.start()
+
+        # P0-1 fix: Activate TOOL context ONLY after all initialization succeeds.
+        # If we reach this point, the span is fully initialized and ready for
+        # business code. If set_context() or anything below fails, we must
+        # reset the context to avoid leaking the TOOL context.
+        ctx = SpanContext(
+            trace_id=current.trace_id,
+            span_id=span_id,
+            parent_span_id=current.span_id,
+            span_kind=SpanKind.TOOL,
+            sampled=current.sampled,
+        )
+
+        token = None
+        try:
+            token = set_context(ctx)
+            self._token = token
+        except Exception:
+            # set_context failed — end the span and don't leak anything
+            try:
+                span.end()
+            except Exception:
+                pass
+            raise
+
+        self._handle = ToolHandle(span)
         return self._handle
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._span is None:
+            # __enter__ failed before span was created; nothing to clean up
+            if self._token is not None:
+                reset_context(self._token)
+            return False
+
         if exc_type is not None:
             self._span.set_error(
                 error_type=exc_type.__name__,

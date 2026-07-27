@@ -751,19 +751,35 @@ class Storage:
         p95_first_chunk = self._percentile(first_chunks, 95) if first_chunks else None
 
         # ── Tool-level metrics (Phase 2.2) ──
-        # P0-3 fix: model filter is a TRACE qualification filter, not a span-level filter.
-        # A TOOL span has model=NULL, so applying model=? directly to TOOL spans yields 0.
-        # Correct approach: find candidate trace_ids (traces with ≥1 LLM span matching model),
-        # then aggregate ALL TOOL spans of those candidate traces.
+        # P0-3/P1-1 fix: model filter is a TRACE qualification filter.
+        # A TOOL span has model=NULL, so applying model=? directly yields 0.
+        # P1-1: The TOOL span itself MUST still satisfy the time window.
+        # Model only qualifies which traces are candidates; time filtering
+        # is applied to the TOOL span independently.
         if model is not None:
-            # Build candidate trace subquery: traces that have a matching LLM span
-            # Combine with existing where_clause for time/session/user filters
+            # Candidate traces: traces with ≥1 LLM span matching model (+ session/user if any)
+            # The candidate subquery uses the full where_clause (time+model+trace filters)
             tool_where = f"""trace_id IN (
                 SELECT DISTINCT trace_id FROM spans s2
                 WHERE {where_clause}
             ) AND span_kind = 'TOOL'"""
-            # where_clause appears once in the subquery, so one copy of params
-            tool_params = params
+            # P1-1: Re-apply time filters to the outer TOOL span query.
+            # model=? is NOT applied to TOOL spans (they have model=NULL),
+            # but time/session/user filters ARE applied to the outer span.
+            outer_tool_conditions = []
+            outer_tool_params: list = []
+            if time_start is not None:
+                outer_tool_conditions.append("start_time >= ?")
+                outer_tool_params.append(time_start)
+            if time_end is not None:
+                outer_tool_conditions.append("start_time <= ?")
+                outer_tool_params.append(time_end)
+            if needs_trace_filter:
+                # session/user are trace-level filters — apply via EXISTS
+                outer_tool_conditions.append(trace_filter_clause)
+            if outer_tool_conditions:
+                tool_where = f"({tool_where}) AND ({' AND '.join(outer_tool_conditions)})"
+            tool_params = params + outer_tool_params
         else:
             tool_where = f"({where_clause}) AND span_kind = 'TOOL'"
             tool_params = params
@@ -921,31 +937,75 @@ class Storage:
                 "tool_avg_latency_ms": tr["tool_avg_latency_ms"],
             }
 
-        # Compute trace_error_count separately per bucket (traces with any ERROR span)
+        # P0-2 fix: Merge main buckets AND tool-only buckets into a complete set.
+        # A tool-only bucket (tool span exists but no matching-model LLM in same bucket)
+        # must still appear in the result with complete contract fields.
         result = []
+
+        # Build main lookup by bucket
+        main_by_bucket = {}
         for r in rows:
-            d = dict(r)
-            bucket = d["bucket"]
-            # Merge tool metrics
+            main_by_bucket[r["bucket"]] = dict(r)
+
+        # Default for a bucket with no main (LLM/trace) data
+        DEFAULT_MAIN = {
+            "trace_count": 0,
+            "trace_error_count": 0,
+            "span_count": 0,
+            "llm_call_count": 0,
+            "llm_error_count": 0,
+            "llm_avg_latency_ms": None,
+            "avg_ttft_ms": None,
+            "avg_first_chunk_ms": None,
+            "tokens": 0,
+        }
+
+        all_buckets = sorted(set(main_by_bucket.keys()) | set(tool_by_bucket.keys()))
+
+        for bucket in all_buckets:
+            main = main_by_bucket.get(bucket, dict(DEFAULT_MAIN))
+            main["bucket"] = bucket
             tool_data = tool_by_bucket.get(bucket, {
                 "tool_call_count": 0,
                 "tool_error_count": 0,
                 "tool_avg_latency_ms": None,
             })
+
+            d = dict(main)
             d["tool_call_count"] = tool_data["tool_call_count"]
             d["tool_error_count"] = tool_data["tool_error_count"]
             d["tool_avg_latency_ms"] = tool_data["tool_avg_latency_ms"]
 
-            # Count distinct traces with ERROR status in this bucket
+            # Compute trace_error_count for this bucket (traces with any ERROR span)
+            # P0-2: For tool-only buckets, we need a separate query since main
+            # didn't cover this bucket.
             err_row = conn.execute(
                 f"""SELECT COUNT(DISTINCT trace_id) as cnt
                     FROM spans
-                    WHERE {where_clause}
+                    WHERE start_time >= ? AND start_time <= ?
                       AND status = 'ERROR'
                       AND CAST(start_time / {interval_seconds} AS INTEGER) * {interval_seconds} = ?""",
-                params + [bucket]
+                [time_start, time_end, bucket]
             ).fetchone()
             d["trace_error_count"] = err_row["cnt"] if err_row else 0
+
+            # P0-2: For tool-only buckets, trace_count/span_count from main are 0.
+            # But if there ARE spans in this bucket (e.g. TOOL spans), we should
+            # reflect them. Re-query span_count and trace_count for this bucket
+            # when main didn't cover it.
+            if bucket not in main_by_bucket:
+                count_row = conn.execute(
+                    f"""SELECT
+                        COUNT(DISTINCT trace_id) as trace_count,
+                        COUNT(*) as span_count
+                    FROM spans
+                    WHERE start_time >= ? AND start_time <= ?
+                      AND CAST(start_time / {interval_seconds} AS INTEGER) * {interval_seconds} = ?""",
+                    [time_start, time_end, bucket]
+                ).fetchone()
+                d["trace_count"] = count_row["trace_count"] if count_row else 0
+                d["span_count"] = count_row["span_count"] if count_row else 0
+
             result.append(d)
 
         return result
