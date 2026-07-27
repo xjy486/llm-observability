@@ -38,9 +38,10 @@ class OpenAIInstrumentor(BaseInstrumentor):
         super().__init__()
         self._tracer = None
         self._original_create = None
+        self._original_async_create = None
 
     def instrument(self, tracer=None, **kwargs):
-        """Patch OpenAI chat.completions.create.
+        """Patch OpenAI chat.completions.create (sync + async).
 
         Args:
             tracer: The Tracer instance to use for span creation.
@@ -55,39 +56,49 @@ class OpenAIInstrumentor(BaseInstrumentor):
             return
 
         self._tracer = tracer
-        target = openai.resources.chat.completions.Completions
-        self._original_create = target.create
+        sync_target = openai.resources.chat.completions.Completions
+        async_target = openai.resources.chat.completions.AsyncCompletions
+        self._original_create = sync_target.create
+        self._original_async_create = async_target.create
 
         # Use a closure that captures self for instance-level state access
         instrumentor = self
 
-        def _patched(self_inner, *args, **kwargs):
-            return instrumentor._do_patch(self_inner, *args, **kwargs)
+        def _patched_sync(self_inner, *args, **kwargs):
+            return instrumentor._do_patch_sync(self_inner, *args, **kwargs)
 
-        target.create = _patched
+        def _patched_async(self_inner, *args, **kwargs):
+            return instrumentor._do_patch_async(self_inner, *args, **kwargs)
+
+        sync_target.create = _patched_sync
+        async_target.create = _patched_async
         self._patched = True
-        logger.info("OpenAI instrumentation installed")
+        logger.info("OpenAI instrumentation installed (sync + async)")
 
     def uninstrument(self):
-        """Restore original OpenAI create."""
+        """Restore original OpenAI create (sync + async)."""
         if not self._patched:
             return
 
         try:
             import openai
-            target = openai.resources.chat.completions.Completions
+            sync_target = openai.resources.chat.completions.Completions
+            async_target = openai.resources.chat.completions.AsyncCompletions
             if self._original_create is not None:
-                target.create = self._original_create
+                sync_target.create = self._original_create
+            if self._original_async_create is not None:
+                async_target.create = self._original_async_create
         except ImportError:
             pass
 
         self._tracer = None
         self._original_create = None
+        self._original_async_create = None
         self._patched = False
-        logger.info("OpenAI instrumentation removed")
+        logger.info("OpenAI instrumentation removed (sync + async)")
 
-    def _do_patch(self, self_inner, *args, **kwargs):
-        """Patched version of chat.completions.create.
+    def _do_patch_sync(self, self_inner, *args, **kwargs):
+        """Patched sync chat.completions.create.
 
         Creates an LLM span, injects headers, calls original, records result.
         P1-4: Dedup — if logical_llm_span_active is True, skips span creation
@@ -245,6 +256,109 @@ class OpenAIInstrumentor(BaseInstrumentor):
             except Exception as e:
                 logger.error("Failed to report LLM span: %s", e)
 
+    async def _do_patch_async(self, self_inner, *args, **kwargs):
+        """Patched async chat.completions.create — same semantics as sync.
+
+        P0-1: Async path with identical dedup, header injection, span lifecycle.
+        P0-2: Sampling inherited from parent; report gated on sampled.
+        """
+        if self._tracer is None or self._original_async_create is None:
+            return await self._original_async_create(self_inner, *args, **kwargs)
+
+        current_ctx = get_current_context()
+
+        # If no active context at all, call original (no trace)
+        if current_ctx is None:
+            return await self._original_async_create(self_inner, *args, **kwargs)
+
+        stream = kwargs.get("stream", False)
+
+        # P1-4: Dedup — skip span creation but still propagate context
+        if current_ctx.logical_llm_span_active:
+            headers = kwargs.pop("extra_headers", None) or {}
+            inject = inject_headers(current_ctx, is_logical_llm=True)
+            headers.update(inject)
+            kwargs["extra_headers"] = headers
+            return await self._original_async_create(self_inner, *args, **kwargs)
+
+        # Create LLM span
+        span_id = generate_span_id()
+        llm_ctx = SpanContext(
+            trace_id=current_ctx.trace_id,
+            span_id=span_id,
+            parent_span_id=current_ctx.span_id,
+            span_kind=SpanKind.LLM,
+            sampled=current_ctx.sampled,
+            logical_llm_span_active=True,
+        )
+        token = set_context(llm_ctx)
+
+        span = Span(
+            trace_id=current_ctx.trace_id,
+            span_id=span_id,
+            parent_span_id=current_ctx.span_id,
+            span_name="llm.completion",
+            span_kind=SpanKind.LLM,
+        )
+
+        model = kwargs.get("model", "unknown")
+        messages = kwargs.get("messages", [])
+
+        span.set_attribute("gen_ai.request.model", model)
+        span.set_attribute("gen_ai.operation.name", "chat")
+        span.set_attribute("llm.stream", stream)
+
+        if self._tracer.config.payload_strategy != "off":
+            from ..utils.masking import mask_payload
+            span.set_attribute(
+                "llm.input.messages",
+                mask_payload(messages, self._tracer.config.payload_strategy),
+            )
+
+        span.start()
+
+        headers = kwargs.pop("extra_headers", None) or {}
+        inject = inject_headers(llm_ctx, is_logical_llm=True)
+        headers.update(inject)
+        kwargs["extra_headers"] = headers
+
+        try:
+            response = await self._original_async_create(self_inner, *args, **kwargs)
+        except Exception as e:
+            span.set_error(error_type=type(e).__name__, error_message=str(e))
+            self._finalize_span(span, token, sampled=llm_ctx.sampled)
+            raise
+
+        # P0-1: Restore parent context immediately
+        reset_context(token)
+
+        if stream:
+            return AsyncObservedStream(
+                response,
+                span,
+                self._tracer,
+                sampled=llm_ctx.sampled,
+            )
+
+        # Non-streaming: process and finalize immediately
+        span.set_status("OK")
+        self._extract_response_metadata(span, response)
+
+        if self._tracer.config.payload_strategy != "off" and response:
+            from ..utils.masking import mask_payload
+            try:
+                resp_dict = response.model_dump() if hasattr(response, "model_dump") else None
+                if resp_dict:
+                    span.set_attribute(
+                        "llm.output",
+                        mask_payload(resp_dict, self._tracer.config.payload_strategy),
+                    )
+            except Exception:
+                pass
+
+        self._finalize_span_no_reset(span, sampled=llm_ctx.sampled)
+        return response
+
 
 class ObservedStream:
     """Wrapper for OpenAI streaming responses.
@@ -395,3 +509,107 @@ class ObservedStream:
                 self._finalize()
             except Exception:
                 pass
+
+
+class AsyncObservedStream:
+    """Wrapper for OpenAI async streaming responses.
+
+    P0-1: ContextVar lifetime is decoupled from Span lifetime.
+    The ContextVar is restored by the caller (_do_patch_async) immediately
+    after original_create() returns. AsyncObservedStream only manages the
+    Span lifecycle (start/end/report), NOT the context.
+
+    P0-2: Reporting is gated on the sampled flag.
+
+    The span is finalized when:
+    - The async iterator is exhausted (normal completion)
+    - aclose() is called
+    - An exception occurs during iteration
+    - __aexit__ context exit
+    """
+
+    def __init__(self, stream, span: Span, tracer, sampled: bool = True):
+        self._stream = stream
+        self._span = span
+        self._tracer = tracer
+        self._sampled = sampled
+        self._finalized = False
+        self._collected_content = []
+
+    def _finalize(self, error: Optional[Exception] = None):
+        """Finalize the span — end, report. Does NOT reset context (P0-1)."""
+        if self._finalized:
+            return
+        self._finalized = True
+
+        if error is not None:
+            self._span.set_error(
+                error_type=type(error).__name__,
+                error_message=str(error),
+            )
+        else:
+            self._span.set_status("OK")
+
+        self._span.end()
+
+        if self._sampled:
+            try:
+                self._tracer.reporter.report(self._span.to_record())
+            except Exception as e:
+                logger.error("Failed to report async LLM span: %s", e)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            chunk = await self._stream.__anext__()
+            try:
+                if hasattr(chunk, "choices") and chunk.choices:
+                    delta = chunk.choices[0].delta if hasattr(chunk.choices[0], "delta") else None
+                    if delta and hasattr(delta, "content") and delta.content:
+                        self._collected_content.append(delta.content)
+                if hasattr(chunk, "usage") and chunk.usage:
+                    self._span.set_attribute("gen_ai.usage.input_tokens", chunk.usage.prompt_tokens)
+                    self._span.set_attribute("gen_ai.usage.output_tokens", chunk.usage.completion_tokens)
+                    self._span.set_attribute("gen_ai.usage.total_tokens", chunk.usage.total_tokens)
+            except Exception:
+                pass
+            return chunk
+        except StopAsyncIteration:
+            self._finalize()
+            raise
+        except Exception as e:
+            self._finalize(error=e)
+            raise
+
+    async def aclose(self):
+        """Close the async stream and finalize the span."""
+        try:
+            if hasattr(self._stream, "aclose"):
+                await self._stream.aclose()
+            elif hasattr(self._stream, "close"):
+                self._stream.close()
+        except Exception:
+            pass
+        self._finalize()
+
+    async def __aenter__(self):
+        if hasattr(self._stream, "__aenter__"):
+            await self._stream.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        try:
+            if hasattr(self._stream, "__aexit__"):
+                await self._stream.__aexit__(exc_type, exc_val, exc_tb)
+            elif hasattr(self._stream, "close"):
+                self._stream.close()
+        except Exception:
+            pass
+        finally:
+            self._finalize(error=exc_val if exc_type else None)
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
