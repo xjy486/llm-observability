@@ -269,6 +269,18 @@ class Observability:
         )
 
     @classmethod
+    def observe_runnable(cls, runnable, name="runnable", root_mode="auto"):
+        """Wrap a LangChain Runnable with observability (Phase 2.4).
+
+        Convenience method that calls observe_runnable() under the hood.
+        Must call Observability.init() first.
+        """
+        if not cls._initialized or cls._tracer is None:
+            raise RuntimeError("Observability.init() must be called before observe_runnable()")
+        from .integrations.langchain.runnable_wrapper import observe_runnable
+        return observe_runnable(runnable, name=name, root_mode=root_mode)
+
+    @classmethod
     def _instrument_openai(cls):
         """Patch OpenAI SDK for automatic LLM span creation.
 
