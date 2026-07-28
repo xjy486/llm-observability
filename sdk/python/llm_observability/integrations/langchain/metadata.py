@@ -103,6 +103,9 @@ def extract_config_metadata(config: Any) -> dict:
 
     Maps: thread_id, run_name, tags, metadata.
     Applies size limits per spec §26.
+
+    DEPRECATED: Use sanitize_langchain_config_metadata for all attribute-setting.
+    Kept for backward compatibility with existing tests.
     """
     if not config or not isinstance(config, dict):
         return {}
@@ -138,6 +141,70 @@ def extract_config_metadata(config: Any) -> dict:
             result["langchain.metadata"] = metadata
     except Exception as e:
         logger.debug("Config metadata extraction failed: %s", e)
+    return result
+
+
+def sanitize_langchain_config_metadata(config: Any, payload_strategy: str = "masked") -> dict:
+    """Sanitize all LangChain config metadata through serialize→mask→size-guard.
+
+    P0-3: Replaces extract_config_metadata for all attribute-setting purposes.
+    Pipeline: safe_serialize → mask_payload → apply_size_guard.
+
+    Guarantees:
+    - Sensitive keys (api_key, authorization, etc.) are redacted.
+    - Sensitive text patterns (sk-xxx, token=xxx) are masked.
+    - Custom objects are JSON-safe (no serialization errors).
+    - Total metadata size is bounded to MAX_METADATA_BYTES.
+
+    Args:
+        config: LangChain RunnableConfig dict.
+        payload_strategy: One of 'off', 'metadata_only', 'masked', 'full'.
+
+    Returns:
+        Dict of span attributes (langchain.thread_id, langchain.run_name,
+        langchain.tags, langchain.metadata) — all JSON-serializable.
+    """
+    if not config or not isinstance(config, dict):
+        return {}
+
+    from ...tool import safe_serialize, apply_size_guard
+    from ...utils.masking import mask_payload, _mask_string_patterns
+
+    result = {}
+    try:
+        # thread_id
+        configurable = config.get("configurable", {})
+        if configurable:
+            thread_id = configurable.get("thread_id")
+            if thread_id:
+                tid = str(thread_id)[:MAX_THREAD_ID_LENGTH]
+                result["langchain.thread_id"] = tid
+
+        # run_name
+        run_name = config.get("run_name")
+        if run_name:
+            result["langchain.run_name"] = str(run_name)[:MAX_RUN_NAME_LENGTH]
+
+        # tags — mask sensitive patterns in each tag
+        tags = config.get("tags")
+        if tags and isinstance(tags, list):
+            trimmed = tags[:MAX_TAGS]
+            sanitized_tags = []
+            for t in trimmed:
+                ts = str(t)[:MAX_TAG_LENGTH]
+                ts = _mask_string_patterns(ts)
+                sanitized_tags.append(ts)
+            result["langchain.tags"] = sanitized_tags
+
+        # metadata — serialize → mask → size guard
+        metadata = config.get("metadata")
+        if metadata:
+            serialized = safe_serialize(metadata)
+            masked = mask_payload(serialized, payload_strategy)
+            guarded, truncated, orig_size = apply_size_guard(masked, max_bytes=MAX_METADATA_BYTES)
+            result["langchain.metadata"] = guarded
+    except Exception as e:
+        logger.debug("Config metadata sanitization failed: %s", e)
     return result
 
 

@@ -11,7 +11,7 @@ from typing import Any, Optional, Callable, Union
 
 from ...context import get_current_context, set_context, reset_context, SpanContext
 from ...spans import SpanKind
-from .metadata import extract_config_metadata
+from .metadata import sanitize_langchain_config_metadata
 
 logger = logging.getLogger("llm_obs.integrations.langchain.agent_wrapper")
 
@@ -138,15 +138,19 @@ class _AgentScope:
         if self._trace_cm._span is not None:
             self._trace_cm._span.span_name = f"agent.{self._name}"
 
-        # Add config metadata to the span
+        # Add config metadata to the span (P0-3: sanitized)
         if self._config:
             try:
-                attrs = extract_config_metadata(self._config)
+                from llm_observability import Observability
+                strategy = "masked"
+                if Observability._tracer and Observability._tracer.config:
+                    strategy = Observability._tracer.config.payload_strategy
+                attrs = sanitize_langchain_config_metadata(self._config, strategy)
                 span = self._trace_cm._span
                 for k, v in attrs.items():
                     span.set_attribute(k, v)
             except Exception as e:
-                logger.debug("Config metadata extraction failed: %s", e)
+                logger.debug("Config metadata sanitization failed: %s", e)
 
         return self
 
