@@ -79,7 +79,15 @@ class TraceContextManager:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is not None:
+        # P1-5: GeneratorExit and CancelledError are control flow from
+        # stream/astream close, not business errors.
+        import asyncio as _asyncio
+        is_control_flow = (
+            exc_type is GeneratorExit
+            or (hasattr(_asyncio, 'CancelledError') and exc_type is _asyncio.CancelledError)
+        )
+
+        if exc_type is not None and not is_control_flow:
             self._span.set_error(
                 error_type=exc_type.__name__,
                 error_message=str(exc_val),

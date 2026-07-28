@@ -194,6 +194,13 @@ class _AgentScope:
         if self._trace_cm._span is not None:
             self._trace_cm._span.span_name = f"agent.{self._name}"
 
+            # P1-6: Add AGENT framework metadata
+            from .compat import LANGCHAIN_VERSION
+            self._trace_cm._span.set_attribute("framework.name", "langchain")
+            self._trace_cm._span.set_attribute("framework.version", LANGCHAIN_VERSION)
+            self._trace_cm._span.set_attribute("langchain.component", "agent")
+            self._trace_cm._span.set_attribute("langchain.agent.name", self._name)
+
         # Add config metadata to the span (P0-3: sanitized)
         if self._config:
             try:
