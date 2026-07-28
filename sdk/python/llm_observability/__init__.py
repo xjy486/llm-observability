@@ -313,6 +313,15 @@ class Observability:
             cls._reporter = None
             cls._config = None
             cls._initialized = False
+
+            # Reset context var to prevent cross-test/cross-invocation leakage
+            try:
+                from .context import _context_var
+                if _context_var.get() is not None:
+                    _context_var.set(None)
+            except Exception:
+                pass
+
             logger.info("Observability SDK shutdown complete")
 
     @classmethod

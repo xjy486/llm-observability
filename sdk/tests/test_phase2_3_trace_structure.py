@@ -13,6 +13,10 @@ from llm_observability.integrations.langchain.agent_wrapper import observe_agent
 def init_sdk():
     if Observability._initialized:
         Observability.shutdown()
+    # Ensure clean context state (avoid cross-test context leakage)
+    from llm_observability.context import _context_var
+    if _context_var.get() is not None:
+        _context_var.set(None)
     Observability.init(app_name="stream-test", endpoint="http://localhost:99999")
     yield Observability._tracer
     Observability.shutdown()
@@ -22,6 +26,10 @@ def test_stream_explicit_close_finalizes_agent(init_sdk):
     """Sync stream: gen.close() finalizes AGENT span and restores context."""
     tracer = init_sdk
     captured = []
+
+    # Verify tracer is valid and replace reporter
+    assert tracer is not None
+    assert tracer.reporter is not None
     orig_report = tracer.reporter.report
     tracer.reporter.report = lambda r: captured.append(r)
 
@@ -33,16 +41,17 @@ def test_stream_explicit_close_finalizes_agent(init_sdk):
     fake_agent.stream = fake_stream
 
     observed = observe_agent(fake_agent, name="stream-close-test")
+
     gen = observed.stream({"messages": []})
     first = next(gen)
     assert first == "chunk1"
+
     gen.close()
 
     tracer.reporter.report = orig_report
     agent_spans = [r for r in captured if r["span_kind"] == "AGENT"]
-    assert len(agent_spans) == 1
-    assert agent_spans[0]["status"] in ("OK", "UNSET")  # not ERROR
-    # Context restored
+    assert len(agent_spans) == 1, f"expected 1 AGENT span, got {len(agent_spans)} (total: {len(captured)})"
+    assert agent_spans[0]["status"] in ("OK", "UNSET")
     assert get_current_context() is None
 
 

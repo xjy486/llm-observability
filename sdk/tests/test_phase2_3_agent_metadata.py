@@ -13,6 +13,10 @@ from llm_observability.integrations.langchain.agent_wrapper import ObservedLangC
 def init_sdk():
     if Observability._initialized:
         Observability.shutdown()
+    # Ensure clean context state (avoid cross-test context leakage)
+    from llm_observability.context import _context_var
+    if _context_var.get() is not None:
+        _context_var.set(None)
     Observability.init(app_name="agent-meta-test", endpoint="http://localhost:99999")
     yield Observability._tracer
     Observability.shutdown()

@@ -198,9 +198,7 @@ def test_phase2_1_and_2_2_combined_unchanged(init_sdk):
 
 def test_core_sdk_imports_without_langchain_calls():
     """Importing llm_observability must not require any langchain usage."""
-    import importlib
     import llm_observability
-    importlib.reload(llm_observability)
     assert hasattr(llm_observability, "Observability")
     assert hasattr(llm_observability.Observability, "trace")
     assert hasattr(llm_observability.Observability, "tool")
