@@ -147,25 +147,27 @@ class LogicalLLMSpan:
         if self._span is None:
             return False
 
-        if exc_type is not None:
-            self._span.set_error(
-                error_type=exc_type.__name__,
-                error_message=str(exc_val),
-            )
-        else:
-            if self._span.status != "ERROR":
-                self._span.set_status("OK")
+        try:
+            if exc_type is not None:
+                self._span.set_error(
+                    error_type=exc_type.__name__,
+                    error_message=str(exc_val),
+                )
+            else:
+                if self._span.status != "ERROR":
+                    self._span.set_status("OK")
 
-        self._span.end()
+            self._span.end()
 
-        if self._sampled and self._tracer:
-            try:
-                self._tracer.reporter.report(self._span.to_record())
-            except Exception as e:
-                logger.error("Failed to report LLM span: %s", e)
-
-        if self._token is not None:
-            reset_context(self._token)
+            if self._sampled and self._tracer:
+                try:
+                    self._tracer.reporter.report(self._span.to_record())
+                except Exception as e:
+                    logger.error("Failed to report LLM span: %s", e)
+        finally:
+            # P0-2: Context MUST be restored even if span/reporter fails
+            if self._token is not None:
+                reset_context(self._token)
         return False
 
     async def __aenter__(self):
