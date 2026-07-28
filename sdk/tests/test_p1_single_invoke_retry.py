@@ -197,17 +197,21 @@ def test_single_invoke_tool_retry_produces_attempt_spans(init_sdk):
     # 1 AGENT span
     assert len(agent_spans) == 1, f"Expected 1 AGENT span, got {len(agent_spans)}"
 
-    # At least 2 TOOL spans (1 per retry attempt) if tool was retried
-    if tool_call_count[0] >= 2:
-        assert len(tool_spans) >= 2, (
-            f"Expected >= 2 TOOL spans when tool retried, got {len(tool_spans)}"
-        )
-        statuses = [s["status"] for s in tool_spans]
-        assert "ERROR" in statuses, f"Expected at least 1 ERROR TOOL span, got {statuses}"
+    # Tool MUST have retried exactly once (1 failure + 1 success = 2 calls)
+    assert tool_call_count[0] == 2, (
+        f"Expected exactly 2 tool calls (1 fail + 1 retry), got {tool_call_count[0]}"
+    )
 
-        # Unique span_ids
-        span_ids = [s["span_id"] for s in tool_spans]
-        assert len(span_ids) == len(set(span_ids)), f"TOOL span_ids must be unique: {span_ids}"
+    # Exactly 2 TOOL spans (1 per retry attempt)
+    assert len(tool_spans) == 2, f"Expected exactly 2 TOOL spans, got {len(tool_spans)}"
+
+    statuses = [s["status"] for s in tool_spans]
+    assert statuses.count("ERROR") == 1, f"Expected exactly 1 ERROR TOOL span, got {statuses}"
+    assert statuses.count("OK") == 1, f"Expected exactly 1 OK TOOL span, got {statuses}"
+
+    # Unique span_ids
+    span_ids = [s["span_id"] for s in tool_spans]
+    assert len(span_ids) == len(set(span_ids)), f"TOOL span_ids must be unique: {span_ids}"
 
     # Same trace_id
     trace_ids = set([s["trace_id"] for s in agent_spans] + [s["trace_id"] for s in tool_spans])

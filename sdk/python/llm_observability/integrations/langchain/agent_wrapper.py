@@ -90,6 +90,10 @@ def _sanitize_identity_value(value: Any, max_length: int = 256) -> Optional[str]
 
     Used for: session_id, user_id, business_scene, thread_id auto-mapping,
     callable return values, and config.metadata.* extraction.
+
+    Fail-closed: if masking itself fails, return '<redacted>' instead of
+    the raw value to prevent sensitive data from leaking through the
+    fallback path.
     """
     if value is None:
         return None
@@ -99,10 +103,8 @@ def _sanitize_identity_value(value: Any, max_length: int = 256) -> Optional[str]
         text = _mask_string_patterns(text)
         return text[:max_length]
     except Exception:
-        try:
-            return str(value)[:max_length]
-        except Exception:
-            return None
+        # P1: Fail-closed — never return the raw value if masking failed.
+        return "<redacted>"
 
 
 def _resolve_session_id(session_id, input, config):

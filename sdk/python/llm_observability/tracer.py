@@ -106,28 +106,31 @@ class TraceContextManager:
                     or (hasattr(_asyncio, 'CancelledError') and exc_type is _asyncio.CancelledError)
                 )
 
+        # Remaining Blocker: AGENT Root must be fully fail-open.
+        # Instrumentation errors (span.end, set_error, to_record, report)
+        # must be logged but NEVER propagated to business code.
+        # This ensures:
+        #   - Business success + telemetry failure → business result preserved
+        #   - Business failure + telemetry failure → original exception preserved
         try:
-            if exc_type is not None and not is_control_flow:
-                self._span.set_error(
-                    error_type=exc_type.__name__,
-                    error_message=_safe_error_message(exc_val),
-                )
-            else:
-                self._span.set_status("OK")
+            try:
+                if exc_type is not None and not is_control_flow:
+                    self._span.set_error(
+                        error_type=exc_type.__name__,
+                        error_message=_safe_error_message(exc_val),
+                    )
+                else:
+                    self._span.set_status("OK")
 
-            self._span.end()
+                self._span.end()
 
-            # P1-2: Only report if sampled
-            if self._sampled:
-                try:
+                # P1-2: Only report if sampled
+                if self._sampled:
                     self._tracer.reporter.report(self._span.to_record())
-                except Exception as e:
-                    logger.error("Failed to report span: %s", e)
+            except Exception:
+                logger.exception("AGENT instrumentation finalization failed")
         finally:
             # Blocker 2: Context MUST be restored even if any step above throws.
-            # Without this, a str(exc_val) or span.end() failure would leave
-            # the AGENT context active, causing subsequent spans to attach
-            # to a stale AGENT parent.
             if self._token is not None:
                 reset_context(self._token)
         return False  # do not suppress exceptions
