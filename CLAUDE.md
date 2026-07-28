@@ -30,6 +30,7 @@
 - All API endpoints return JSON
 
 ## Key Commands
+- Python env: `uv venv .venv && uv pip install -r core/requirements.txt -r proxy/requirements.txt` (or `pip install -r ...` in an active venv); activate with `source .venv/bin/activate`. Run services with the `.venv` interpreter (e.g. `.venv/bin/python`, `.venv/bin/uvicorn`).
 - Proxy: `cd proxy && python main.py` (port 8082, env: UPSTREAM_URL, OBSERVABILITY_ENDPOINT, PAYLOAD_STRATEGY, GATEWAY_NAME, MASK_KEYS)
 - Core: `cd core && uvicorn api.main:app --port 8001` (env: DB_PATH)
 - UI: `cd ui && npm run dev` (port 3000)
@@ -40,33 +41,17 @@
 - Payload: request, response, request_metadata (stored separately, masked per strategy)
 - db.get_trace_summaries() returns {"traces": [...], "total": int} dict
 
-## Current Status — Foundation Fix Phase 2 complete
-- Phase 1 + Phase 2 (Foundation Fix) complete — all P0/P1 second-round fixes applied
-- API contract aligned: Backend response fields match Frontend TypeScript types
-- Timing semantics: `duration_ms`, `first_chunk_ms`, `ttft_ms` (NULL for non-streaming); `ttfc_ms` removed
-- Trace filters: status/duration at trace level, model at span level (EXISTS subquery, returns complete traces)
-- SQLite schema migration: ALTER TABLE + metadata version table, old DBs auto-upgrade
-- TimeSeries metrics consistent with Summary (trace_error_count, llm_error_count, llm_avg_latency_ms)
-- MASK_KEYS env var merged with defaults (never overrides base security keys)
-- StreamingAccumulator supports `capture_payload=False` for memory-efficient mode
-- Tests: contract tests + filter semantics tests pass
-- Pushed to https://github.com/xjy486/llm-observability
+## Current Status
+- Active development: **Phase 2.4** — generic runnable/callback instrumentation (spec: docs/llm-observability-phase2.4-generic-runnable-callback-development-spec.md).
+- Phase 2.1 (SDK & Agent Trace) is **COMPLETE / FROZEN**. Latest suite: 156 tests pass (SDK + proxy/core).
+- Repo: https://github.com/xjy486/llm-observability
 
-## Current Status — Phase 2.1 (Application SDK & Agent Trace) complete
-- SDK Core: Config, ContextVar, Span, SpanContext — complete
-- Manual Trace API: Observability.init() + Observability.trace() — complete
-- OpenAI Instrumentation: chat.completions patch with LLM span + dedup — complete
-- Trace Context Propagation: W3C traceparent + ownership marker — complete
-- Proxy Span Ownership: GATEWAY detection from X-LLM-OBS-Span-Role header — complete
-- UI GATEWAY support: teal tag, waterfall color, detail fields — complete
-- E2E Tests: context propagation, dedup, fail-open, multi-LLM — complete (31 SDK tests + 65 proxy/core tests all pass)
-
-## Current Status — Phase 2.1 Final Closeout (P0/P1) COMPLETE / FROZEN
-- P0-1: Streaming ContextVar decoupled from Span lifetime — ContextVar restored immediately after create(), ObservedStream only manages Span lifecycle
-- P0-2: Sampling inherited across full trace — SDK inherits from SpanContext.sampled, Proxy inherits from traceparent flags; sampled=False → no AGENT/LLM/GATEWAY reported
-- P1-1: Reporter shutdown drains full queue — stop() loops _flush() until queue empty or shutdown_timeout; dropped_count tracks overflow
-- P1-2: No-SDK trace metadata fallback — COALESCE(MAX(AGENT metadata), MAX(any span metadata)) in get_trace_summaries
-- P1-3: Session/User metrics trace-level filter — get_metrics uses EXISTS subquery to find candidate trace_ids, then aggregates ALL spans of those traces
-- P1-4: Unified masking key set — shared privacy_constants.py (SENSITIVE_KEYS + SENSITIVE_REGEX_PATTERNS) imported by both SDK masking.py and Proxy config.py
-- Tests: 156 tests pass (28 final closeout + 128 existing)
-- Phase 2.1 is now COMPLETE / FROZEN — next: Phase 2.2 Tool Span
+## Phase History (detailed specs in docs/)
+| Phase | Spec / Closeout doc (glob) | Status |
+|-------|----------------------------|--------|
+| Foundation Fix (P1+P2) | docs/llm-observability-{fix,second-round-fix}-requirements.md | done |
+| 2.1 SDK & Agent Trace | docs/application-sdk-agent-trace-development-spec.md, docs/llm-observability-phase2.1-*.md | COMPLETE / FROZEN |
+| 2.2 Tool Span | docs/llm-observability-phase2.2-*.md | done |
+| 2.3 LangChain Auto-Instr | docs/llm-observability-phase2.3-*.md | done |
+| 2.4 Runnable Callback | docs/llm-observability-phase2.4-generic-runnable-callback-development-spec.md | active |
+- PRD: docs/LLM_Agent_Observability_PRD_v0.1.md
