@@ -18,6 +18,18 @@ from .utils.ids import generate_trace_id, generate_span_id
 logger = logging.getLogger("llm_obs.tracer")
 
 
+def _safe_error_message(exc: BaseException) -> str:
+    """Blocker 2: Safely extract error message without raising.
+
+    str(exc) can itself raise (e.g. __str__ throws). This wrapper
+    ensures instrumentation never replaces the original business exception.
+    """
+    try:
+        return str(exc)
+    except Exception:
+        return "<error message unavailable>"
+
+
 class TraceContextManager:
     """Context manager for a trace / AGENT span.
 
@@ -94,24 +106,30 @@ class TraceContextManager:
                     or (hasattr(_asyncio, 'CancelledError') and exc_type is _asyncio.CancelledError)
                 )
 
-        if exc_type is not None and not is_control_flow:
-            self._span.set_error(
-                error_type=exc_type.__name__,
-                error_message=str(exc_val),
-            )
-        else:
-            self._span.set_status("OK")
+        try:
+            if exc_type is not None and not is_control_flow:
+                self._span.set_error(
+                    error_type=exc_type.__name__,
+                    error_message=_safe_error_message(exc_val),
+                )
+            else:
+                self._span.set_status("OK")
 
-        self._span.end()
+            self._span.end()
 
-        # P1-2: Only report if sampled
-        if self._sampled:
-            try:
-                self._tracer.reporter.report(self._span.to_record())
-            except Exception as e:
-                logger.error("Failed to report span: %s", e)
-
-        reset_context(self._token)
+            # P1-2: Only report if sampled
+            if self._sampled:
+                try:
+                    self._tracer.reporter.report(self._span.to_record())
+                except Exception as e:
+                    logger.error("Failed to report span: %s", e)
+        finally:
+            # Blocker 2: Context MUST be restored even if any step above throws.
+            # Without this, a str(exc_val) or span.end() failure would leave
+            # the AGENT context active, causing subsequent spans to attach
+            # to a stale AGENT parent.
+            if self._token is not None:
+                reset_context(self._token)
         return False  # do not suppress exceptions
 
 

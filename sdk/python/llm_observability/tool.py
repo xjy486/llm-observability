@@ -18,6 +18,18 @@ logger = logging.getLogger("llm_obs.tool")
 
 DEFAULT_MAX_PAYLOAD_BYTES = 32 * 1024
 
+
+def _safe_tool_error_message(exc: BaseException) -> str:
+    """Blocker 2 / P1: Safely extract error message without raising.
+
+    str(exc) can itself raise. This ensures instrumentation never
+    replaces the original business exception or leaks context.
+    """
+    try:
+        return str(exc)
+    except Exception:
+        return "<error message unavailable>"
+
 # P0-2: Canonical tool.* keys that users cannot override via attributes/events.
 RESERVED_TOOL_KEYS = frozenset({
     "tool.name", "tool.type", "tool.call_id",
@@ -467,25 +479,37 @@ class ToolContextManager:
                 reset_context(self._token)
             return False
 
-        # Blocker 2: Use unified is_control_flow_exception for interrupt detection
-        is_interrupt = False
+        # P1: Split control flow vs HITL interrupt detection.
+        # All control flow (GeneratorExit, CancelledError, GraphInterrupt)
+        # → do NOT set ERROR.
+        # Only GraphInterrupt/NodeInterrupt (HITL)
+        # → set langchain.interrupted=true.
+        is_control_flow = False
+        is_hitl_interrupt = False
         if exc_type is not None:
             try:
-                from .integrations.langchain.compat import is_control_flow_exception
-                is_interrupt = is_control_flow_exception(exc_val)
+                from .integrations.langchain.compat import (
+                    is_control_flow_exception,
+                    is_langgraph_interrupt,
+                )
+                is_control_flow = is_control_flow_exception(exc_val)
+                is_hitl_interrupt = is_langgraph_interrupt(exc_val)
             except ImportError:
                 pass
 
         try:
             if exc_type is not None:
-                if is_interrupt:
-                    self._span.set_attribute("langchain.interrupted", True)
-                    self._span.set_attribute("langchain.interrupt.type", type(exc_val).__name__)
-                    # Do NOT set ERROR — interrupt is not a failure
+                if is_control_flow:
+                    # Control flow (cancel, generator exit, interrupt) — no ERROR
+                    if is_hitl_interrupt:
+                        # Only GraphInterrupt/NodeInterrupt sets interrupted flag
+                        self._span.set_attribute("langchain.interrupted", True)
+                        self._span.set_attribute("langchain.interrupt.type", type(exc_val).__name__)
+                    # GeneratorExit / CancelledError: no interrupt flag, no ERROR
                 else:
                     self._span.set_error(
                         error_type=exc_type.__name__,
-                        error_message=str(exc_val),
+                        error_message=_safe_tool_error_message(exc_val),
                     )
             else:
                 if self._span.status != "ERROR":

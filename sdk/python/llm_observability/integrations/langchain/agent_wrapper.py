@@ -81,49 +81,82 @@ def _resolve_value(value: Any, input: Any = None, config: Any = None) -> Any:
     return None
 
 
+def _sanitize_identity_value(value: Any, max_length: int = 256) -> Optional[str]:
+    """Blocker 1: Unified identity field sanitization.
+
+    Applies _mask_string_patterns before truncation so sensitive text
+    patterns (Bearer xxx, sk-xxx, token=xxx) are redacted in ALL identity
+    fields, not just span attributes.
+
+    Used for: session_id, user_id, business_scene, thread_id auto-mapping,
+    callable return values, and config.metadata.* extraction.
+    """
+    if value is None:
+        return None
+    try:
+        from ...utils.masking import _mask_string_patterns
+        text = str(value)
+        text = _mask_string_patterns(text)
+        return text[:max_length]
+    except Exception:
+        try:
+            return str(value)[:max_length]
+        except Exception:
+            return None
+
+
 def _resolve_session_id(session_id, input, config):
     """P1-1: session_id resolution order:
     explicit > callable(input,config) > thread_id from config.configurable > None.
+
+    Blocker 1: All resolved values pass through _sanitize_identity_value.
     """
     if session_id is not None:
-        return _resolve_value(session_id, input, config)
+        resolved = _resolve_value(session_id, input, config)
+        return _sanitize_identity_value(resolved)
     if config and isinstance(config, dict):
         configurable = config.get("configurable", {})
         if configurable:
             tid = configurable.get("thread_id")
             if tid:
-                return str(tid)[:256]
+                return _sanitize_identity_value(tid, max_length=256)
     return None
 
 
 def _resolve_user_id(user_id, input, config):
     """P1-1: user_id resolution order:
     explicit > callable(input,config) > config.metadata.user_id > config.metadata.user > None.
+
+    Blocker 1: All resolved values pass through _sanitize_identity_value.
     """
     if user_id is not None:
-        return _resolve_value(user_id, input, config)
+        resolved = _resolve_value(user_id, input, config)
+        return _sanitize_identity_value(resolved)
     if config and isinstance(config, dict):
         metadata = config.get("metadata", {})
         if metadata and isinstance(metadata, dict):
             for key in ("user_id", "user"):
                 val = metadata.get(key)
                 if val:
-                    return str(val)
+                    return _sanitize_identity_value(val)
     return None
 
 
 def _resolve_business_scene(business_scene, input, config):
     """P1-1: business_scene resolution order:
     explicit > callable(input,config) > config.metadata.business_scene > None.
+
+    Blocker 1: All resolved values pass through _sanitize_identity_value.
     """
     if business_scene is not None:
-        return _resolve_value(business_scene, input, config)
+        resolved = _resolve_value(business_scene, input, config)
+        return _sanitize_identity_value(resolved)
     if config and isinstance(config, dict):
         metadata = config.get("metadata", {})
         if metadata and isinstance(metadata, dict):
             val = metadata.get("business_scene")
             if val:
-                return str(val)
+                return _sanitize_identity_value(val)
     return None
 
 
