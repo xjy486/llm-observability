@@ -116,3 +116,42 @@ def is_control_flow_exception(exc: BaseException) -> bool:
     if isinstance(exc, _asyncio.CancelledError):
         return True
     return is_langgraph_interrupt(exc)
+
+
+# ─── Phase 2.4: Callback handler / Runnable imports ───
+
+try:
+    from langchain_core.callbacks import BaseCallbackHandler
+    _CALLBACKS_AVAILABLE = True
+except ImportError:
+    BaseCallbackHandler = None
+    _CALLBACKS_AVAILABLE = False
+
+try:
+    from langchain_core.language_models import BaseChatModel, BaseLLM
+except ImportError:
+    BaseChatModel = None
+    BaseLLM = None
+
+try:
+    from langchain_core.retrievers import BaseRetriever
+except ImportError:
+    BaseRetriever = None
+
+try:
+    from langchain_core.runnables import (
+        Runnable,
+        RunnableSequence,
+        RunnableParallel,
+        RunnableLambda,
+    )
+except ImportError:
+    Runnable = None
+    RunnableSequence = None
+    RunnableParallel = None
+    RunnableLambda = None
+
+
+def is_callbacks_available() -> bool:
+    """Check if LangChain callback infrastructure is available."""
+    return _CALLBACKS_AVAILABLE
