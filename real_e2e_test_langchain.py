@@ -431,6 +431,112 @@ async def run_e2e_tests(svc: ServiceManager):
         check("Simple trace LLM==GATEWAY (no duplicate)", len(llm3) == len(gw3), f"llm={len(llm3)}, gw={len(gw3)}")
 
     # ═════════════════════════════════════════════════════════
+    # Scenario 4: Async invoke — AGENT → LLM → GATEWAY
+    # ═════════════════════════════════════════════════════════
+    print("\n" + "=" * 70)
+    print("Scenario 4: Async LangChain Agent (ainvoke)")
+    print("=" * 70)
+
+    agent4 = create_agent(
+        model=chat_model,
+        tools=[calculator],
+        middleware=[LangChainObservabilityMiddleware()],
+    )
+    observed4 = observe_agent(
+        agent4,
+        name="async-agent",
+        session_id="langchain-e2e-4",
+        user_id="langchain-e2e-user-4",
+    )
+
+    result4 = await observed4.ainvoke({
+        "messages": [HumanMessage(content="What is 3+4? Use the calculator tool.")],
+    })
+    check("Async agent completed", result4 is not None)
+
+    print("  ⏳ Waiting for async flush (10s)...")
+    await asyncio.sleep(10)
+
+    traces_resp4 = http_get_json(f"{svc.core_url}/api/v1/traces?durationMinutes=5&limit=30")
+    traces4 = traces_resp4.get("traces", [])
+    trace4 = next((t for t in traces4 if t.get("session_id") == "langchain-e2e-4"), None)
+    check("Async trace found", trace4 is not None)
+
+    if trace4:
+        detail4 = http_get_json(f"{svc.core_url}/api/v1/traces/{trace4['trace_id']}")
+        spans4 = detail4.get("spans", [])
+        kinds4 = {s["span_kind"] for s in spans4}
+        check("Async has AGENT+LLM+GATEWAY", {"AGENT", "LLM", "GATEWAY"}.issubset(kinds4), f"kinds={kinds4}")
+        llm4 = [s for s in spans4 if s["span_kind"] == "LLM"]
+        gw4 = [s for s in spans4 if s["span_kind"] == "GATEWAY"]
+        check("Async LLM==GATEWAY (no dup)", len(llm4) == len(gw4), f"llm={len(llm4)}, gw={len(gw4)}")
+
+    # ═════════════════════════════════════════════════════════
+    # Scenario 5: Nested TOOL → LLM → GATEWAY
+    # ═════════════════════════════════════════════════════════
+    print("\n" + "=" * 70)
+    print("Scenario 5: Nested TOOL → LLM → GATEWAY")
+    print("=" * 70)
+
+    nested_model = ChatOpenAI(
+        model=AGNES_MODEL,
+        api_key=AGNES_API_KEY,
+        base_url=svc.proxy_url + "/v1",
+        max_tokens=50,
+        temperature=0,
+    )
+
+    @tool
+    def retrieval_tool(query: str) -> str:
+        """Retrieve information by asking the model."""
+        return nested_model.invoke([HumanMessage(content=query)]).content
+
+    agent5 = create_agent(
+        model=chat_model,
+        tools=[retrieval_tool],
+        middleware=[LangChainObservabilityMiddleware()],
+    )
+    observed5 = observe_agent(
+        agent5,
+        name="nested-agent",
+        session_id="langchain-e2e-5",
+        user_id="langchain-e2e-user-5",
+    )
+
+    result5 = observed5.invoke({
+        "messages": [HumanMessage(content="Use the retrieval_tool to find out what color the sky is.")],
+    })
+    check("Nested agent completed", result5 is not None)
+
+    print("  ⏳ Waiting for async flush (10s)...")
+    await asyncio.sleep(10)
+
+    traces_resp5 = http_get_json(f"{svc.core_url}/api/v1/traces?durationMinutes=5&limit=30")
+    traces5 = traces_resp5.get("traces", [])
+    trace5 = next((t for t in traces5 if t.get("session_id") == "langchain-e2e-5"), None)
+    check("Nested trace found", trace5 is not None)
+
+    if trace5:
+        detail5 = http_get_json(f"{svc.core_url}/api/v1/traces/{trace5['trace_id']}")
+        spans5 = detail5.get("spans", [])
+        agent5_spans = [s for s in spans5 if s["span_kind"] == "AGENT"]
+        tool5_spans = [s for s in spans5 if s["span_kind"] == "TOOL"]
+        llm5_spans = [s for s in spans5 if s["span_kind"] == "LLM"]
+        gw5_spans = [s for s in spans5 if s["span_kind"] == "GATEWAY"]
+        check("Nested has AGENT", len(agent5_spans) >= 1, f"count={len(agent5_spans)}")
+        check("Nested has TOOL", len(tool5_spans) >= 1, f"count={len(tool5_spans)}")
+        check(
+            "Nested has LLM under TOOL",
+            any(l["parent_span_id"] == t["span_id"] for t in tool5_spans for l in llm5_spans),
+            "no LLM child of TOOL",
+        )
+        check(
+            "Nested has GATEWAY under LLM",
+            any(g["parent_span_id"] == l["span_id"] for l in llm5_spans for g in gw5_spans),
+            "no GATEWAY child of LLM",
+        )
+
+    # ═════════════════════════════════════════════════════════
     # Shutdown
     # ═════════════════════════════════════════════════════════
     print("\n🧹 Shutting down SDK...")
@@ -449,7 +555,7 @@ def main():
     print("=" * 70)
     print("Phase 2.3 Real E2E: LangChain Agent → Proxy → Core → Agnes 2.0 Flash")
     print("=" * 70)
-    print(f"  API Key: {AGNES_API_KEY[:10]}...{AGNES_API_KEY[-4:]}")
+    print(f"  API Key: {'configured' if AGNES_API_KEY else 'missing'}")
     print(f"  Model:   {AGNES_MODEL}")
     print(f"  Base URL: {AGNES_BASE_URL}")
 
