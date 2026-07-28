@@ -50,3 +50,6 @@ logs/
 *.db
 *.sqlite3
 sdk/python/llm_observability/llm-observability-phase2.2-closeout-fix-requirements.md
+
+# Local dev docs (not shared / not committed)
+/STARTUP.md
