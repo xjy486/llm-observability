@@ -62,14 +62,69 @@ def observe_agent(
     )
 
 
-def _resolve_value(value: Any) -> Any:
-    """Resolve a string-or-callable value."""
-    if callable(value):
+def _resolve_value(value: Any, input: Any = None, config: Any = None) -> Any:
+    """Resolve a string-or-callable value.
+
+    P1-1: Callable can accept (input, config), (config), or ().
+    Falls back gracefully through argument signatures.
+    Fail-open: returns None on callable exception.
+    """
+    if not callable(value):
+        return value
+    for args in ((input, config), (config,), ()):
         try:
-            return value()
+            return value(*args)
+        except TypeError:
+            continue
         except Exception:
             return None
-    return value
+    return None
+
+
+def _resolve_session_id(session_id, input, config):
+    """P1-1: session_id resolution order:
+    explicit > callable(input,config) > thread_id from config.configurable > None.
+    """
+    if session_id is not None:
+        return _resolve_value(session_id, input, config)
+    if config and isinstance(config, dict):
+        configurable = config.get("configurable", {})
+        if configurable:
+            tid = configurable.get("thread_id")
+            if tid:
+                return str(tid)[:256]
+    return None
+
+
+def _resolve_user_id(user_id, input, config):
+    """P1-1: user_id resolution order:
+    explicit > callable(input,config) > config.metadata.user_id > config.metadata.user > None.
+    """
+    if user_id is not None:
+        return _resolve_value(user_id, input, config)
+    if config and isinstance(config, dict):
+        metadata = config.get("metadata", {})
+        if metadata and isinstance(metadata, dict):
+            for key in ("user_id", "user"):
+                val = metadata.get(key)
+                if val:
+                    return str(val)
+    return None
+
+
+def _resolve_business_scene(business_scene, input, config):
+    """P1-1: business_scene resolution order:
+    explicit > callable(input,config) > config.metadata.business_scene > None.
+    """
+    if business_scene is not None:
+        return _resolve_value(business_scene, input, config)
+    if config and isinstance(config, dict):
+        metadata = config.get("metadata", {})
+        if metadata and isinstance(metadata, dict):
+            val = metadata.get("business_scene")
+            if val:
+                return str(val)
+    return None
 
 
 class _AgentScope:
@@ -80,13 +135,14 @@ class _AgentScope:
     In 'require_existing' mode: uses existing context, errors if none.
     """
 
-    def __init__(self, name, root_mode, session_id, user_id, business_scene, config=None):
+    def __init__(self, name, root_mode, session_id, user_id, business_scene, config=None, input=None):
         self._name = name
         self._root_mode = root_mode
         self._session_id = session_id
         self._user_id = user_id
         self._business_scene = business_scene
         self._config = config
+        self._input = input
         self._trace_cm = None
         self._created_trace = False
         self._token = None
@@ -125,9 +181,9 @@ class _AgentScope:
         # Create new trace
         self._trace_cm = Observability.trace(
             name=self._name,
-            session_id=_resolve_value(self._session_id),
-            user_id=_resolve_value(self._user_id),
-            business_scene=_resolve_value(self._business_scene),
+            session_id=_resolve_session_id(self._session_id, self._input, self._config),
+            user_id=_resolve_user_id(self._user_id, self._input, self._config),
+            business_scene=_resolve_business_scene(self._business_scene, self._input, self._config),
         )
         self._trace_cm.__enter__()
         self._created_trace = True
@@ -188,7 +244,7 @@ class ObservedLangChainAgent:
         with _AgentScope(
             self._name, self._root_mode,
             self._session_id, self._user_id, self._business_scene,
-            config=config,
+            config=config, input=input,
         ):
             return self._agent.invoke(input, config=config, **kwargs)
 
@@ -197,7 +253,7 @@ class ObservedLangChainAgent:
         with _AgentScope(
             self._name, self._root_mode,
             self._session_id, self._user_id, self._business_scene,
-            config=config,
+            config=config, input=input,
         ):
             return await self._agent.ainvoke(input, config=config, **kwargs)
 
@@ -211,7 +267,7 @@ class ObservedLangChainAgent:
             with _AgentScope(
                 self._name, self._root_mode,
                 self._session_id, self._user_id, self._business_scene,
-                config=config,
+                config=config, input=input,
             ):
                 try:
                     yield from self._agent.stream(input, config=config, **kwargs)
@@ -230,7 +286,7 @@ class ObservedLangChainAgent:
         with _AgentScope(
             self._name, self._root_mode,
             self._session_id, self._user_id, self._business_scene,
-            config=config,
+            config=config, input=input,
         ):
             try:
                 async for item in self._agent.astream(input, config=config, **kwargs):
