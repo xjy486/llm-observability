@@ -70,3 +70,28 @@ except ImportError:
 def is_langchain_available() -> bool:
     """Check if LangChain is installed and importable."""
     return _LANGCHAIN_AVAILABLE
+
+
+def is_langgraph_interrupt(exc: BaseException) -> bool:
+    """P1-2: Check if exception is a LangGraph interrupt (human-in-the-loop), not an error.
+
+    GraphInterrupt and NodeInterrupt are control-flow signals, not errors.
+    They should not be recorded as span errors.
+    """
+    if exc is None:
+        return False
+    # Check GraphInterrupt (langgraph.errors)
+    if GraphInterrupt is not None and isinstance(exc, GraphInterrupt):
+        return True
+    # Check NodeInterrupt (langgraph.pregel)
+    try:
+        from langgraph.pregel import NodeInterrupt
+        if isinstance(exc, NodeInterrupt):
+            return True
+    except ImportError:
+        pass
+    # Fallback: check by class name (for compatibility edge cases)
+    exc_class_name = type(exc).__name__
+    if exc_class_name in ("GraphInterrupt", "NodeInterrupt"):
+        return True
+    return False

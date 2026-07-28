@@ -149,10 +149,17 @@ class LogicalLLMSpan:
 
         try:
             if exc_type is not None:
-                self._span.set_error(
-                    error_type=exc_type.__name__,
-                    error_message=str(exc_val),
-                )
+                # P1-2: GraphInterrupt is human-in-the-loop control flow, not an error
+                from .compat import is_langgraph_interrupt
+                if is_langgraph_interrupt(exc_val):
+                    self._span.set_attribute("langchain.interrupted", True)
+                    self._span.set_attribute("langchain.interrupt.type", type(exc_val).__name__)
+                    # Do NOT set ERROR — interrupt is not a failure
+                else:
+                    self._span.set_error(
+                        error_type=exc_type.__name__,
+                        error_message=str(exc_val),
+                    )
             else:
                 if self._span.status != "ERROR":
                     self._span.set_status("OK")

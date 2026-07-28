@@ -467,11 +467,25 @@ class ToolContextManager:
                 reset_context(self._token)
             return False
 
+        # P1-2: Check for LangGraph interrupt (human-in-the-loop control flow)
+        is_interrupt = False
         if exc_type is not None:
-            self._span.set_error(
-                error_type=exc_type.__name__,
-                error_message=str(exc_val),
-            )
+            try:
+                from .integrations.langchain.compat import is_langgraph_interrupt
+                is_interrupt = is_langgraph_interrupt(exc_val)
+            except ImportError:
+                pass
+
+        if exc_type is not None:
+            if is_interrupt:
+                self._span.set_attribute("langchain.interrupted", True)
+                self._span.set_attribute("langchain.interrupt.type", type(exc_val).__name__)
+                # Do NOT set ERROR — interrupt is not a failure
+            else:
+                self._span.set_error(
+                    error_type=exc_type.__name__,
+                    error_message=str(exc_val),
+                )
         else:
             if self._span.status != "ERROR":
                 self._span.set_status("OK")
