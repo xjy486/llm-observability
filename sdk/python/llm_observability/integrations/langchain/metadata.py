@@ -172,18 +172,19 @@ def sanitize_langchain_config_metadata(config: Any, payload_strategy: str = "mas
 
     result = {}
     try:
-        # thread_id
+        # thread_id — mask sensitive patterns before truncation
         configurable = config.get("configurable", {})
         if configurable:
             thread_id = configurable.get("thread_id")
             if thread_id:
-                tid = str(thread_id)[:MAX_THREAD_ID_LENGTH]
+                tid = _mask_string_patterns(str(thread_id))[:MAX_THREAD_ID_LENGTH]
                 result["langchain.thread_id"] = tid
 
-        # run_name
+        # run_name — mask sensitive patterns before truncation
         run_name = config.get("run_name")
         if run_name:
-            result["langchain.run_name"] = str(run_name)[:MAX_RUN_NAME_LENGTH]
+            rn = _mask_string_patterns(str(run_name))[:MAX_RUN_NAME_LENGTH]
+            result["langchain.run_name"] = rn
 
         # tags — mask sensitive patterns in each tag
         tags = config.get("tags")

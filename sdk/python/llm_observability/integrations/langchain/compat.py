@@ -5,6 +5,7 @@ remain clean.  When LangChain is not installed, calling
 ``ensure_langchain_available()`` raises a clear ImportError with install
 instructions.
 """
+import asyncio as _asyncio
 import logging
 
 logger = logging.getLogger("llm_obs.integrations.langchain.compat")
@@ -95,3 +96,23 @@ def is_langgraph_interrupt(exc: BaseException) -> bool:
     if exc_class_name in ("GraphInterrupt", "NodeInterrupt"):
         return True
     return False
+
+
+def is_control_flow_exception(exc: BaseException) -> bool:
+    """Check if exception is control flow (not a business error).
+
+    Blocker 2: Unifies control-flow detection across TraceContextManager,
+    LogicalLLMSpan, and ToolContextManager.
+
+    Control flow exceptions:
+    - GeneratorExit: stream/astream close
+    - asyncio.CancelledError: async cancellation
+    - GraphInterrupt / NodeInterrupt: LangGraph human-in-the-loop
+    """
+    if exc is None:
+        return False
+    if isinstance(exc, GeneratorExit):
+        return True
+    if isinstance(exc, _asyncio.CancelledError):
+        return True
+    return is_langgraph_interrupt(exc)

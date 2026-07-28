@@ -79,13 +79,20 @@ class TraceContextManager:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        # P1-5: GeneratorExit and CancelledError are control flow from
-        # stream/astream close, not business errors.
-        import asyncio as _asyncio
-        is_control_flow = (
-            exc_type is GeneratorExit
-            or (hasattr(_asyncio, 'CancelledError') and exc_type is _asyncio.CancelledError)
-        )
+        # Blocker 2: Use unified is_control_flow_exception to also handle
+        # GraphInterrupt (human-in-the-loop) at AGENT root level.
+        is_control_flow = False
+        if exc_type is not None:
+            try:
+                from .integrations.langchain.compat import is_control_flow_exception
+                is_control_flow = is_control_flow_exception(exc_val)
+            except ImportError:
+                # Fallback: only GeneratorExit + CancelledError
+                import asyncio as _asyncio
+                is_control_flow = (
+                    exc_type is GeneratorExit
+                    or (hasattr(_asyncio, 'CancelledError') and exc_type is _asyncio.CancelledError)
+                )
 
         if exc_type is not None and not is_control_flow:
             self._span.set_error(

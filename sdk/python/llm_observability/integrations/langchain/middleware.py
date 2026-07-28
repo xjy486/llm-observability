@@ -43,8 +43,10 @@ def run_with_observation(scope_factory: Callable, handler: Callable):
         try:
             if handle and hasattr(handle, "set_response"):
                 handle.set_response(result)
+            elif handle and hasattr(handle, "set_output"):
+                handle.set_output(result)
         except Exception:
-            logger.exception("Response capture failed")
+            logger.exception("Result capture failed")
         return result
     except BaseException as exc:
         business_error = exc
@@ -76,8 +78,10 @@ async def run_with_observation_async(scope_factory: Callable, handler: Callable)
         try:
             if handle and hasattr(handle, "set_response"):
                 handle.set_response(result)
+            elif handle and hasattr(handle, "set_output"):
+                handle.set_output(result)
         except Exception:
-            logger.exception("Response capture failed")
+            logger.exception("Result capture failed")
         return result
     except BaseException as exc:
         business_error = exc

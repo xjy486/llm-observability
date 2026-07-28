@@ -537,6 +537,59 @@ async def run_e2e_tests(svc: ServiceManager):
         )
 
     # ═════════════════════════════════════════════════════════
+    # Scenario 6: Async Streaming Agent (astream) — full async chain
+    # ═════════════════════════════════════════════════════════
+    print("\n" + "=" * 70)
+    print("Scenario 6: Async Streaming LangChain Agent (astream)")
+    print("=" * 70)
+
+    agent6 = create_agent(
+        model=chat_model,
+        tools=[calculator],
+        middleware=[LangChainObservabilityMiddleware()],
+    )
+    observed6 = observe_agent(
+        agent6,
+        name="astream-agent",
+        session_id="langchain-e2e-6",
+        user_id="langchain-e2e-user-6",
+    )
+
+    astream_chunk_count = 0
+    async for chunk in observed6.astream({
+        "messages": [HumanMessage(content="What is 8+3? Use the calculator tool.")],
+    }):
+        astream_chunk_count += 1
+
+    check("astream produced chunks", astream_chunk_count > 0, f"chunks={astream_chunk_count}")
+
+    print("  ⏳ Waiting for async flush (10s)...")
+    await asyncio.sleep(10)
+
+    traces_resp6 = http_get_json(f"{svc.core_url}/api/v1/traces?durationMinutes=5&limit=30")
+    traces6 = traces_resp6.get("traces", [])
+    trace6 = next((t for t in traces6 if t.get("session_id") == "langchain-e2e-6"), None)
+    check("astream trace found", trace6 is not None, f"sessions={[t.get('session_id') for t in traces6]}")
+
+    if trace6:
+        check("astream trace status OK", trace6.get("status") == "OK", f"status={trace6.get('status')}")
+        detail6 = http_get_json(f"{svc.core_url}/api/v1/traces/{trace6['trace_id']}")
+        spans6 = detail6.get("spans", [])
+        agent6_spans = [s for s in spans6 if s["span_kind"] == "AGENT"]
+        llm6_spans = [s for s in spans6 if s["span_kind"] == "LLM"]
+        gw6_spans = [s for s in spans6 if s["span_kind"] == "GATEWAY"]
+        check("astream has exactly 1 AGENT span", len(agent6_spans) == 1, f"count={len(agent6_spans)}")
+        check("astream AGENT status OK", agent6_spans[0].get("status") == "OK", f"status={agent6_spans[0].get('status')}")
+        check("astream AGENT duration > 0 (covers full iteration)", agent6_spans[0].get("duration_ms", 0) > 0, f"duration={agent6_spans[0].get('duration_ms')}")
+        check("astream has LLM spans", len(llm6_spans) >= 1, f"count={len(llm6_spans)}")
+        check("astream has GATEWAY spans", len(gw6_spans) >= 1, f"count={len(gw6_spans)}")
+        check("astream LLM==GATEWAY (no dup)", len(llm6_spans) == len(gw6_spans), f"llm={len(llm6_spans)}, gw={len(gw6_spans)}")
+        # GATEWAY parent must be LLM
+        for gw in gw6_spans:
+            gw_parent_is_llm = any(gw["parent_span_id"] == l["span_id"] for l in llm6_spans)
+            check(f"astream GATEWAY {gw['span_id'][:8]} parent is LLM", gw_parent_is_llm, f"parent={gw['parent_span_id'][:8]}")
+
+    # ═════════════════════════════════════════════════════════
     # Shutdown
     # ═════════════════════════════════════════════════════════
     print("\n🧹 Shutting down SDK...")

@@ -467,47 +467,53 @@ class ToolContextManager:
                 reset_context(self._token)
             return False
 
-        # P1-2: Check for LangGraph interrupt (human-in-the-loop control flow)
+        # Blocker 2: Use unified is_control_flow_exception for interrupt detection
         is_interrupt = False
         if exc_type is not None:
             try:
-                from .integrations.langchain.compat import is_langgraph_interrupt
-                is_interrupt = is_langgraph_interrupt(exc_val)
+                from .integrations.langchain.compat import is_control_flow_exception
+                is_interrupt = is_control_flow_exception(exc_val)
             except ImportError:
                 pass
 
-        if exc_type is not None:
-            if is_interrupt:
-                self._span.set_attribute("langchain.interrupted", True)
-                self._span.set_attribute("langchain.interrupt.type", type(exc_val).__name__)
-                # Do NOT set ERROR — interrupt is not a failure
+        try:
+            if exc_type is not None:
+                if is_interrupt:
+                    self._span.set_attribute("langchain.interrupted", True)
+                    self._span.set_attribute("langchain.interrupt.type", type(exc_val).__name__)
+                    # Do NOT set ERROR — interrupt is not a failure
+                else:
+                    self._span.set_error(
+                        error_type=exc_type.__name__,
+                        error_message=str(exc_val),
+                    )
             else:
-                self._span.set_error(
-                    error_type=exc_type.__name__,
-                    error_message=str(exc_val),
-                )
-        else:
-            if self._span.status != "ERROR":
-                self._span.set_status("OK")
+                if self._span.status != "ERROR":
+                    self._span.set_status("OK")
 
-        # P1-4: End the span BEFORE processing output telemetry,
-        # so duration_ms only measures business execution time.
-        self._span.end()
+            # P1-4: End the span BEFORE processing output telemetry,
+            # so duration_ms only measures business execution time.
+            self._span.end()
 
-        # P1-1: Skip payload processing if unsampled
-        # P1-4: Output processing happens AFTER span.end()
-        if self._sampled:
-            self._process_output()
-            self._set_request_metadata()
+            # P1-1: Skip payload processing if unsampled
+            # P1-4: Output processing happens AFTER span.end()
+            if self._sampled:
+                self._process_output()
+                self._set_request_metadata()
 
-        current = get_current_context()
-        if current and current.sampled:
-            try:
-                self._tracer.reporter.report(self._span.to_record())
-            except Exception as e:
-                logger.error("Failed to report TOOL span: %s", e)
-
-        reset_context(self._token)
+            current = get_current_context()
+            if current and current.sampled:
+                try:
+                    self._tracer.reporter.report(self._span.to_record())
+                except Exception as e:
+                    logger.error("Failed to report TOOL span: %s", e)
+        finally:
+            # P1: Context MUST be restored even if any step above throws.
+            # Without this, a str(exc_val) or reporter failure would leave
+            # the TOOL context active, causing subsequent spans to attach
+            # to a stale TOOL parent.
+            if self._token is not None:
+                reset_context(self._token)
         return False
 
     def _process_input(self):
