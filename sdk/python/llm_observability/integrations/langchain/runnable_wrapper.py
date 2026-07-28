@@ -211,6 +211,13 @@ class _RunnableScope:
         except Exception as e:
             logger.debug("Root output capture failed: %s", e)
 
+    def bind_handler(self, handler: LangChainObservabilityCallbackHandler):
+        """Register the root span with the callback handler so chain events
+        can be recorded on the AGENT span."""
+        if self._root_span is not None:
+            handler._root_span = self._root_span
+            handler._register_span(self._root_span.span_id, self._root_span)
+
     @property
     def root_span(self):
         return self._root_span
@@ -248,6 +255,7 @@ class ObservedLangChainRunnable:
 
         scope = _RunnableScope(self._name, self._root_mode, config=prepared_config, input=input)
         with scope:
+            scope.bind_handler(handler)
             try:
                 result = self._runnable.invoke(input, config=prepared_config, **kwargs)
                 scope.set_root_output(result)
@@ -262,6 +270,7 @@ class ObservedLangChainRunnable:
 
         scope = _RunnableScope(self._name, self._root_mode, config=prepared_config, input=input)
         with scope:
+            scope.bind_handler(handler)
             try:
                 result = await self._runnable.ainvoke(input, config=prepared_config, **kwargs)
                 scope.set_root_output(result)
@@ -277,6 +286,7 @@ class ObservedLangChainRunnable:
         def _generator():
             scope = _RunnableScope(self._name, self._root_mode, config=prepared_config, input=input)
             with scope:
+                scope.bind_handler(handler)
                 collected = []
                 try:
                     for item in self._runnable.stream(input, config=prepared_config, **kwargs):
@@ -298,6 +308,7 @@ class ObservedLangChainRunnable:
 
         scope = _RunnableScope(self._name, self._root_mode, config=prepared_config, input=input)
         with scope:
+            scope.bind_handler(handler)
             collected = []
             try:
                 async for item in self._runnable.astream(input, config=prepared_config, **kwargs):

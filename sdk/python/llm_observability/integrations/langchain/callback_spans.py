@@ -320,7 +320,10 @@ class CallbackLLMSpan:
                     logger.error("Failed to report callback LLM span: %s", e)
         finally:
             if self._token is not None:
-                reset_context(self._token)
+                try:
+                    reset_context(self._token)
+                except Exception:
+                    pass
         return False
 
     async def __aenter__(self):

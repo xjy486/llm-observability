@@ -679,7 +679,10 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
 
                     # Close LLM spans
                     if state.token is not None:
-                        reset_context(state.token)
+                        try:
+                            reset_context(state.token)
+                        except Exception:
+                            pass
                     if span:
                         span.end()
                         from llm_observability import Observability
@@ -828,9 +831,15 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
 
             span.end()
 
-            # Reset context
+            # Reset context — may fail in async mode if the token was created
+            # in a different contextvars.Context (e.g. asyncio task boundary).
+            # This is safe to ignore; the parent context will be restored when
+            # the trace scope exits.
             if state.token is not None:
-                reset_context(state.token)
+                try:
+                    reset_context(state.token)
+                except Exception:
+                    pass
 
             from llm_observability import Observability
             tracer = Observability._tracer
