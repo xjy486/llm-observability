@@ -1,6 +1,6 @@
 # ============================================================
 # Multi-stage Dockerfile for LLM Observability Platform
-# Builds: Core (FastAPI) + Proxy (Python) + UI (React/Vite)
+# Builds: Core (FastAPI) + Proxy (Python) + UI (React/Vite) + SDK
 # ============================================================
 
 # ─── Stage 1: UI Build ───────────────────────────────────────
@@ -17,7 +17,21 @@ RUN npm run build
 # ─── Stage 2: Python Dependencies ────────────────────────────
 FROM python:3.11-slim AS python-deps
 
-RUN pip install --no-cache-dir \
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /tmp/deps
+
+# Copy SDK pyproject and install SDK + dependencies
+COPY sdk/python/pyproject.toml ./
+COPY sdk/python/llm_observability ./llm_observability
+RUN pip install --no-cache-dir . && pip install --no-cache-dir \
     fastapi>=0.104.0 \
     uvicorn>=0.24.0 \
     pydantic>=2.5.0 \
@@ -32,6 +46,11 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# Install runtime system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
 # Create non-root user
 RUN groupadd --gid 1001 appuser && \
     useradd --uid 1001 --gid appuser --shell /bin/bash --create-home appuser
@@ -44,6 +63,7 @@ COPY --from=python-deps /usr/local/bin/uvicorn /usr/local/bin/uvicorn
 COPY core/ ./core/
 COPY proxy/ ./proxy/
 COPY common/ ./common/
+COPY sdk/python/ ./sdk/python/
 
 # Copy built UI from builder stage
 COPY --from=ui-builder /app/ui/dist ./ui/dist

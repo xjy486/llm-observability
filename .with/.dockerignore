@@ -1,64 +1,34 @@
-# Version control
 .git
 .gitignore
-
-# Python cache
+node_modules
+vendor
+venv
 __pycache__
 *.pyc
 *.pyo
-*.pyd
-.Python
-*.egg-info
-dist/
-build/
-*.egg
-
-# Node
-node_modules
-ui/node_modules
-
-# Build artifacts
-ui/dist
-
-# IDE
+dist
+build
 .vscode
 .idea
 *.swp
-
-# OS
 .DS_Store
 Thumbs.db
-
-# Test files
-tests/
-.pytest_cache
-sdk/tests/
-
-# Logs
+logs
 *.log
-logs/
-
-# Documentation
-docs/
-*.md
-!README.md
-
-# Environment
+test
+tests
+**/*.test.js
+**/*.spec.js
+README.md
+docs
+.github
+.gitlab-ci.yml
 .env
 .env.local
 *.env
-
-# Data
-*.db
-*.sqlite3
-
-# Misc
 coverage
 .cache
 tmp
 temp
-e2e_test_fixes.py
-inject_demo_data.py
-real_e2e_test.py
-CLAUDE.md
-.with/
+.pytest_cache
+.knot
