@@ -37,7 +37,7 @@ import urllib.request
 import urllib.error
 
 # ─── Path Setup ──────────────────────────────────────────────
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "sdk" / "python"))
 sys.path.insert(0, str(ROOT / "proxy"))
 sys.path.insert(0, str(ROOT / "core"))

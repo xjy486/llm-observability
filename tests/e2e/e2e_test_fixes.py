@@ -4,8 +4,9 @@ E2E test for second-round P0/P1 fixes.
 Tests against a fresh SQLite DB with real span records.
 """
 import sys, os, json, time, tempfile
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "core"))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "proxy"))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "core"))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "proxy"))
 
 from storage.db import Storage
 from config import ProxyConfig
