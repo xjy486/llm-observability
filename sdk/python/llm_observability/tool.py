@@ -328,8 +328,9 @@ def _apply_size_limit_to_value(value: Any, max_bytes: int) -> Any:
 class ToolHandle:
     """Handle returned by Observability.tool() context manager."""
 
-    def __init__(self, span: Span):
+    def __init__(self, span: Span, tracer=None):
         self._span = span
+        self._tracer = tracer
 
     def set_output(self, value: Any):
         # P1-2: Use sentinel — even None is a valid output
@@ -344,7 +345,7 @@ class ToolHandle:
             return
         # P0-1/P0-2: Sanitize + mask + size-guard the value (with key context)
         _, sanitized = _sanitize_attribute_pair(key, value)
-        sanitized = _apply_size_limit_to_value(sanitized, MAX_ATTRIBUTE_SIZE_BYTES)
+        sanitized = _apply_size_limit_to_value(sanitized, self._tracer.config.max_attribute_bytes)
         self._span.set_attribute(normalized_key, sanitized)
 
     def add_event(self, name: Any, attributes: dict = None):
@@ -432,7 +433,7 @@ class ToolContextManager:
                 logger.warning("Cannot override reserved attribute '%s' — ignored", normalized_k)
                 continue
             _, sanitized = _sanitize_attribute_pair(k, v)
-            sanitized = _apply_size_limit_to_value(sanitized, MAX_ATTRIBUTE_SIZE_BYTES)
+            sanitized = _apply_size_limit_to_value(sanitized, self._tracer.config.max_attribute_bytes)
             span.set_attribute(normalized_k, sanitized)
 
         # Attach span to self early so __exit__ / cleanup can access it
@@ -476,14 +477,19 @@ class ToolContextManager:
             token = set_context(ctx)
             self._token = token
         except Exception:
-            # set_context failed — end the span and don't leak anything
+            # P0-2: set_context failed after sink registered — clean up sink + best-effort end
+            try:
+                from .span_registry import unregister_span_event_sink
+                unregister_span_event_sink(span.trace_id, span.span_id)
+            except Exception:
+                pass
             try:
                 span.end()
             except Exception:
                 pass
             raise
 
-        self._handle = ToolHandle(span)
+        self._handle = ToolHandle(span, tracer=self._tracer)
         return self._handle
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -512,60 +518,61 @@ class ToolContextManager:
                 pass
 
         try:
-            if exc_type is not None:
-                if is_control_flow:
-                    # Control flow (cancel, generator exit, interrupt) — no ERROR
-                    if is_hitl_interrupt:
-                        # Only GraphInterrupt/NodeInterrupt sets interrupted flag
-                        self._span.set_attribute("langchain.interrupted", True)
-                        self._span.set_attribute("langchain.interrupt.type", type(exc_val).__name__)
-                    # GeneratorExit / CancelledError: no interrupt flag, no ERROR
+            try:
+                # P0-2: ALL telemetry steps wrapped so business result/exception
+                # is never altered by a telemetry failure.
+                if exc_type is not None:
+                    if is_control_flow:
+                        # Control flow (cancel, generator exit, interrupt) — no ERROR
+                        if is_hitl_interrupt:
+                            # Only GraphInterrupt/NodeInterrupt sets interrupted flag
+                            self._span.set_attribute("langchain.interrupted", True)
+                            self._span.set_attribute("langchain.interrupt.type", type(exc_val).__name__)
+                        # GeneratorExit / CancelledError: no interrupt flag, no ERROR
+                    else:
+                        self._span.set_error(
+                            error_type=exc_type.__name__,
+                            error_message=_safe_tool_error_message(exc_val),
+                        )
                 else:
-                    self._span.set_error(
-                        error_type=exc_type.__name__,
-                        error_message=_safe_tool_error_message(exc_val),
-                    )
-            else:
-                if self._span.status != "ERROR":
-                    self._span.set_status("OK")
+                    if self._span.status != "ERROR":
+                        self._span.set_status("OK")
 
-            # P1-4: End the span BEFORE processing output telemetry,
-            # so duration_ms only measures business execution time.
-            self._span.end()
+                # P1-4: End the span BEFORE processing output telemetry,
+                # so duration_ms only measures business execution time.
+                self._span.end()
 
-            # P1-1: Skip payload processing if unsampled
-            # P1-4: Output processing happens AFTER span.end()
-            # P0-7: output processing must not prevent reporting on failure
-            if self._sampled:
-                try:
-                    self._process_output()
-                except Exception:
-                    logger.debug("TOOL output processing failed", exc_info=True)
-                try:
-                    self._set_request_metadata()
-                except Exception:
-                    logger.debug("TOOL request_metadata failed", exc_info=True)
+                if self._sampled:
+                    try:
+                        self._process_output()
+                    except Exception:
+                        logger.debug("TOOL output processing failed", exc_info=True)
+                    try:
+                        self._set_request_metadata()
+                    except Exception:
+                        logger.debug("TOOL request_metadata failed", exc_info=True)
 
-            # P0-2: use captured sampled decision (context may differ after reset)
-            if self._sampled:
-                try:
-                    self._tracer.reporter.report(self._span.to_record())
-                except Exception as e:
-                    logger.error("Failed to report TOOL span: %s", e)
+                if self._sampled:
+                    try:
+                        self._tracer.reporter.report(self._span.to_record())
+                    except Exception as e:
+                        logger.error("Failed to report TOOL span: %s", e)
+            except Exception:
+                logger.exception("TOOL telemetry finalization failed")
         finally:
-            # P1: Context MUST be restored even if any step above throws.
-            # Without this, a str(exc_val) or reporter failure would leave
-            # the TOOL context active, causing subsequent spans to attach
-            # to a stale TOOL parent.
-            # P0-6: unregister event sink
+            # P0-6: unregister event sink (fail-open)
             if self._span is not None:
                 try:
                     from .span_registry import unregister_span_event_sink
                     unregister_span_event_sink(self._span.trace_id, self._span.span_id)
                 except Exception:
-                    pass
+                    logger.debug("TOOL event sink unregister failed", exc_info=True)
+            # P0-2: reset_context itself must be fail-open
             if self._token is not None:
-                reset_context(self._token)
+                try:
+                    reset_context(self._token)
+                except Exception:
+                    logger.exception("TOOL context reset failed")
         return False
 
     def _process_input(self):
@@ -577,7 +584,9 @@ class ToolContextManager:
             serialized = safe_serialize(self._input)
             masked = mask_payload(serialized, strategy)
             # P1-3: apply_size_guard now returns original_size_bytes
-            guarded, truncated, original_size_bytes = apply_size_guard(masked)
+            guarded, truncated, original_size_bytes = apply_size_guard(
+                masked, max_bytes=self._tracer.config.max_payload_bytes
+            )
 
             self._span.set_attribute("tool.input.type", type(self._input).__name__)
             # P1-3: size_bytes = original serialized size (after masking, before truncation)
@@ -604,7 +613,9 @@ class ToolContextManager:
             serialized = safe_serialize(output)
             masked = mask_payload(serialized, strategy)
             # P1-3: apply_size_guard now returns original_size_bytes
-            guarded, truncated, original_size_bytes = apply_size_guard(masked)
+            guarded, truncated, original_size_bytes = apply_size_guard(
+                masked, max_bytes=self._tracer.config.max_payload_bytes
+            )
 
             self._span.set_attribute("tool.output.type", type(output).__name__)
             # P1-3: size_bytes = original serialized size

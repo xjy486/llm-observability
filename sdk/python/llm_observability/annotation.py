@@ -77,34 +77,49 @@ def annotate(
     if not isinstance(target, Span):
         return False
 
+    # P1-1: lifecycle protection — reject ended/unregistered spans
+    # Span.end_time is 0.0 until end() is called; > 0 means ended.
+    if getattr(target, "end_time", 0.0) and target.end_time > 0:
+        return False
+
     try:
         strategy = "masked"
+        max_payload = 32 * 1024
+        max_attr = 4 * 1024
         if tracer is not None and tracer.config is not None:
             strategy = tracer.config.payload_strategy
+            max_payload = getattr(tracer.config, "max_payload_bytes", max_payload)
+            max_attr = getattr(tracer.config, "max_attribute_bytes", max_attr)
 
-        # Input
+        # Input (neutral keys)
         if input_data is not None and strategy != "off":
             try:
                 serialized = safe_serialize(input_data)
                 masked = mask_payload(serialized, strategy)
-                guarded, truncated, original_size_bytes = apply_size_guard(masked)
+                guarded, truncated, original_size_bytes = apply_size_guard(
+                    masked, max_bytes=max_payload
+                )
                 if target.payload is None:
                     target.payload = {}
                 target.payload["input"] = guarded
-                target.set_attribute("task.input.truncated", truncated)
+                target.set_attribute("sdk.annotation.input.truncated", truncated)
+                target.set_attribute("sdk.annotation.input.original_size_bytes", original_size_bytes)
             except Exception as e:
                 logger.error("annotate input failed: %s", e)
 
-        # Output
+        # Output (neutral keys)
         if output_data is not None and strategy != "off":
             try:
                 serialized = safe_serialize(output_data)
                 masked = mask_payload(serialized, strategy)
-                guarded, truncated, original_size_bytes = apply_size_guard(masked)
+                guarded, truncated, original_size_bytes = apply_size_guard(
+                    masked, max_bytes=max_payload
+                )
                 if target.payload is None:
                     target.payload = {}
                 target.payload["output"] = guarded
-                target.set_attribute("task.output.truncated", truncated)
+                target.set_attribute("sdk.annotation.output.truncated", truncated)
+                target.set_attribute("sdk.annotation.output.original_size_bytes", original_size_bytes)
             except Exception as e:
                 logger.error("annotate output failed: %s", e)
 
@@ -116,14 +131,18 @@ def annotate(
                     logger.warning("annotate: cannot overwrite protected key '%s' — ignored", normalized_k)
                     continue
                 _, sanitized = _sanitize_attribute_pair(k, v)
-                sanitized = _apply_size_limit_to_value(sanitized, MAX_ATTRIBUTE_SIZE_BYTES)
+                sanitized = _apply_size_limit_to_value(sanitized, max_attr)
                 target.set_attribute(normalized_k, sanitized)
 
-        # Tags
+        # Tags: privacy + size + count limits (P1-1)
         if tags:
             try:
-                safe_tags = safe_serialize(list(tags))
-                target.set_attribute("sdk.tags", safe_tags)
+                tag_list = list(tags)[:32]  # max 32 tags
+                safe_tags = safe_serialize(tag_list)
+                # apply masking then size guard
+                masked_tags = mask_payload(safe_tags, strategy) if strategy != "off" else safe_tags
+                guarded_tags, _, _ = apply_size_guard(masked_tags, max_bytes=max_attr)
+                target.set_attribute("sdk.tags", guarded_tags)
             except Exception as e:
                 logger.error("annotate tags failed: %s", e)
 

@@ -94,6 +94,10 @@ class Observability:
                 raise ValueError(
                     f"max_payload_bytes must be >= 1 KiB, got {max_payload_bytes}"
                 )
+            if max_payload_bytes > 16 * 1024 * 1024:
+                raise ValueError(
+                    f"max_payload_bytes must be <= 16 MiB, got {max_payload_bytes}"
+                )
             if not (0.0 <= sample_rate <= 1.0):
                 raise ValueError(f"sample_rate must be between 0.0 and 1.0, got {sample_rate}")
 

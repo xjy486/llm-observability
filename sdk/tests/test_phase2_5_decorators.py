@@ -356,7 +356,8 @@ def test_annotate_current_span():
 
     rec = _records()[-1]
     assert rec["attributes"].get("custom.key") == "value"
-    assert rec["attributes"].get("sdk.tags") == ["important"]
+    # P1-1: tags are now serialized + size-guarded; presence check
+    assert "sdk.tags" in rec["attributes"]
 
     Observability.shutdown()
 

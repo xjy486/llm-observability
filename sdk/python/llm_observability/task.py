@@ -39,8 +39,9 @@ RESERVED_TASK_KEYS = frozenset({
 class TaskHandle:
     """Handle returned by the TASK span context manager."""
 
-    def __init__(self, span: Span):
+    def __init__(self, span: Span, tracer=None):
         self._span = span
+        self._tracer = tracer
 
     def set_output(self, value: Any):
         self._span._task_output = value
@@ -51,7 +52,9 @@ class TaskHandle:
             logger.warning("Cannot override reserved attribute '%s' — ignored", normalized_key)
             return
         _, sanitized = _sanitize_attribute_pair(key, value)
-        sanitized = _apply_size_limit_to_value(sanitized, MAX_ATTRIBUTE_SIZE_BYTES)
+        sanitized = _apply_size_limit_to_value(
+            sanitized, self._tracer.config.max_attribute_bytes if self._tracer else MAX_ATTRIBUTE_SIZE_BYTES
+        )
         self._span.set_attribute(normalized_key, sanitized)
 
     def add_event(self, name: Any, attributes: dict = None):
@@ -136,7 +139,7 @@ class TaskContextManager:
                 logger.warning("Cannot override reserved attribute '%s' — ignored", normalized_k)
                 continue
             _, sanitized = _sanitize_attribute_pair(k, v)
-            sanitized = _apply_size_limit_to_value(sanitized, MAX_ATTRIBUTE_SIZE_BYTES)
+            sanitized = _apply_size_limit_to_value(sanitized, self._tracer.config.max_attribute_bytes)
             span.set_attribute(normalized_k, sanitized)
 
         self._span = span
@@ -173,13 +176,19 @@ class TaskContextManager:
             token = set_context(ctx)
             self._token = token
         except Exception:
+            # P0-2: set_context failed after sink registered — clean up sink + best-effort end
+            try:
+                from .span_registry import unregister_span_event_sink
+                unregister_span_event_sink(span.trace_id, span.span_id)
+            except Exception:
+                pass
             try:
                 span.end()
             except Exception:
                 pass
             raise
 
-        self._handle = TaskHandle(span)
+        self._handle = TaskHandle(span, tracer=self._tracer)
         return self._handle
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -201,46 +210,53 @@ class TaskContextManager:
                 )
 
         try:
-            if exc_type is not None:
-                if is_control_flow:
-                    pass  # no ERROR for control flow
+            try:
+                # P0-2: ALL telemetry steps wrapped so business result/exception
+                # is never altered by a telemetry failure.
+                if exc_type is not None:
+                    if is_control_flow:
+                        pass  # no ERROR for control flow
+                    else:
+                        self._span.set_error(
+                            error_type=exc_type.__name__,
+                            error_message=_safe_tool_error_message(exc_val),
+                        )
                 else:
-                    self._span.set_error(
-                        error_type=exc_type.__name__,
-                        error_message=_safe_tool_error_message(exc_val),
-                    )
-            else:
-                if self._span.status != "ERROR":
-                    self._span.set_status("OK")
+                    if self._span.status != "ERROR":
+                        self._span.set_status("OK")
 
-            self._span.end()
+                self._span.end()
 
-            if self._sampled:
-                # P0-7: output processing must not prevent reporting on failure
-                try:
-                    self._process_output()
-                except Exception:
-                    logger.debug("TASK output processing failed", exc_info=True)
-                try:
-                    self._set_request_metadata()
-                except Exception:
-                    logger.debug("TASK request_metadata failed", exc_info=True)
+                if self._sampled:
+                    try:
+                        self._process_output()
+                    except Exception:
+                        logger.debug("TASK output processing failed", exc_info=True)
+                    try:
+                        self._set_request_metadata()
+                    except Exception:
+                        logger.debug("TASK request_metadata failed", exc_info=True)
 
-            # Use the captured sampled decision (context may differ after reset)
-            if self._sampled:
-                try:
-                    self._tracer.reporter.report(self._span.to_record())
-                except Exception as e:
-                    logger.error("Failed to report TASK span: %s", e)
+                if self._sampled:
+                    try:
+                        self._tracer.reporter.report(self._span.to_record())
+                    except Exception as e:
+                        logger.error("Failed to report TASK span: %s", e)
+            except Exception:
+                logger.exception("TASK telemetry finalization failed")
         finally:
-            # P0-6: unregister event sink
+            # P0-6: unregister event sink (fail-open)
             try:
                 from .span_registry import unregister_span_event_sink
                 unregister_span_event_sink(self._span.trace_id, self._span.span_id)
             except Exception:
-                pass
+                logger.debug("TASK event sink unregister failed", exc_info=True)
+            # P0-2: reset_context itself must be fail-open
             if self._token is not None:
-                reset_context(self._token)
+                try:
+                    reset_context(self._token)
+                except Exception:
+                    logger.exception("TASK context reset failed")
         return False
 
     async def __aenter__(self) -> TaskHandle:
@@ -256,7 +272,9 @@ class TaskContextManager:
         try:
             serialized = safe_serialize(self._input)
             masked = mask_payload(serialized, strategy)
-            guarded, truncated, original_size_bytes = apply_size_guard(masked)
+            guarded, truncated, original_size_bytes = apply_size_guard(
+                masked, max_bytes=self._tracer.config.max_payload_bytes
+            )
             self._span.set_attribute("task.input.type", type(self._input).__name__)
             self._span.set_attribute("task.input.size_bytes", original_size_bytes)
             self._span.set_attribute("task.input.truncated", truncated)
@@ -276,7 +294,9 @@ class TaskContextManager:
         try:
             serialized = safe_serialize(output)
             masked = mask_payload(serialized, strategy)
-            guarded, truncated, original_size_bytes = apply_size_guard(masked)
+            guarded, truncated, original_size_bytes = apply_size_guard(
+                masked, max_bytes=self._tracer.config.max_payload_bytes
+            )
             self._span.set_attribute("task.output.type", type(output).__name__)
             self._span.set_attribute("task.output.size_bytes", original_size_bytes)
             self._span.set_attribute("task.output.truncated", truncated)

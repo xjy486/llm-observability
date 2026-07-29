@@ -1,24 +1,25 @@
-"""LangChain Auto-Instrumentation — Phase 2.5 (P0-1 refactor).
+"""LangChain Auto-Instrumentation — Phase 2.5 final closeout (P0-1).
 
-Patches the ``Runnable`` base class methods (invoke/ainvoke/stream/astream)
-to inject a fresh callback handler per invocation. This approach:
+Reliable auto-instrumentation via a per-invocation ContextVar state model
+layered on top of Runnable base-class patching. This fixes:
 
-- Is independent of LangChain import order (methods are looked up at call
-  time on the class, not via a bound ``from ... import`` reference).
-- Creates a NEW ``LangChainObservabilityCallbackHandler`` + Auto-Root state
-  per root invocation (per-invocation isolation — no cross-request state).
-- Does NOT modify the user's CallbackManager, does NOT replace user
-  callbacks (we MERGE our handler alongside theirs), does NOT patch any
-  Runnable INSTANCE (only the base class methods, reversibly).
-- Auto-creates an AGENT root trace on the outermost invocation when no
-  active trace exists.
+- Import-order independence (methods resolved at call time on the class).
+- Per-invocation isolation: fresh handler/registry/state per root invocation;
+  nested calls reuse the root's state (no duplicate AGENT).
+- Non-destructive user Config (deep copy before mutating callbacks).
+- User callback preservation (list / CallbackManager / AsyncCallbackManager).
+- Hard dedup vs observe_runnable / observe_agent / middleware / OpenAI.
 
-Dedup (spec §5): the callback LLM span sets logical_llm_span_active=True so
-the OpenAI instrumentor skips a second LLM span (only GATEWAY remains).
+The ContextVar holds `AutoInvocationState(handler, root_trace_cm, depth)`.
+Root call (no active trace, depth 0): create state. Nested (depth>0 or active
+trace): reuse, depth++. Exit root: close runs, end AGENT, clear ContextVar.
 """
+import copy
 import functools
 import logging
 import threading
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .base import BaseInstrumentor
@@ -26,6 +27,19 @@ from .base import BaseInstrumentor
 logger = logging.getLogger("llm_obs.instrumentation.langchain")
 
 _PATCHED_METHODS = ("invoke", "ainvoke", "stream", "astream")
+
+
+@dataclass
+class AutoInvocationState:
+    """Per-root-invocation state held in a ContextVar."""
+    handler: Any = None
+    root_trace_cm: Any = None
+    depth: int = 0
+
+
+_AUTO_STATE: ContextVar[Optional[AutoInvocationState]] = ContextVar(
+    "llm_obs_langchain_auto_state", default=None
+)
 
 
 class LangChainInstrumentor(BaseInstrumentor):
@@ -71,7 +85,7 @@ class LangChainInstrumentor(BaseInstrumentor):
             @functools.wraps(original)
             def wrapper(self_runnable, *args, **kwargs):
                 return instrumentor._run_with_auto_root(
-                    original, self_runnable, args, kwargs, is_async=False, is_stream=False,
+                    original, self_runnable, args, kwargs,
                 )
             return wrapper
 
@@ -79,7 +93,7 @@ class LangChainInstrumentor(BaseInstrumentor):
             @functools.wraps(original)
             async def awrapper(self_runnable, *args, **kwargs):
                 return await instrumentor._run_with_auto_root(
-                    original, self_runnable, args, kwargs, is_async=True, is_stream=False,
+                    original, self_runnable, args, kwargs,
                 )
             return awrapper
 
@@ -102,7 +116,46 @@ class LangChainInstrumentor(BaseInstrumentor):
 
         return original
 
-    # ── Auto-root + callback injection ──
+    # ── Per-invocation state management ──
+
+    def _enter_invocation(self):
+        """Enter an invocation. Returns (state, is_root, token).
+
+        Root invocation (no active trace, no existing state): creates a fresh
+        handler + AGENT root, sets the ContextVar. Nested: reuses state,
+        increments depth.
+        """
+        from ..context import get_current_context
+        existing = _AUTO_STATE.get()
+        if existing is not None:
+            existing.depth += 1
+            return existing, False, None
+
+        if get_current_context() is not None:
+            # A trace already exists (e.g., user @agent) — don't auto-create root
+            state = AutoInvocationState(handler=self._build_callback_handler(), depth=1)
+            token = _AUTO_STATE.set(state)
+            return state, False, token
+
+        # Root invocation: create handler + AGENT root
+        handler = self._build_callback_handler()
+        root_cm, _ = self._maybe_open_root()
+        state = AutoInvocationState(handler=handler, root_trace_cm=root_cm, depth=1)
+        token = _AUTO_STATE.set(state)
+        return state, True, token
+
+    def _exit_invocation(self, state, is_root, token, exc_val=None):
+        """Exit an invocation. Closes root on root exit, clears ContextVar."""
+        if state is None:
+            return
+        state.depth -= 1
+        if is_root or state.depth <= 0:
+            # Root exit: close open runs, end AGENT, clear ContextVar
+            self._close_root(state.root_trace_cm, exc_val)
+            if token is not None:
+                _AUTO_STATE.reset(token)
+            else:
+                _AUTO_STATE.set(None)
 
     def _build_callback_handler(self):
         """Create a FRESH callback handler per invocation (P0-1 isolation)."""
@@ -116,13 +169,10 @@ class LangChainInstrumentor(BaseInstrumentor):
             return None
 
     def _maybe_open_root(self):
-        """Open an AGENT root trace if no active trace exists.
-
-        Returns (trace_cm, span) or (None, None).
-        """
+        """Open an AGENT root trace if no active trace exists."""
         from ..context import get_current_context
         if get_current_context() is not None:
-            return None, None  # a trace already exists — don't auto-create
+            return None, None
         try:
             from llm_observability import Observability
             if Observability._tracer is None or not Observability._initialized:
@@ -146,39 +196,46 @@ class LangChainInstrumentor(BaseInstrumentor):
         except Exception:
             logger.debug("auto-root trace close failed", exc_info=True)
 
-    def _merge_callback(self, kwargs, handler):
-        """Merge our callback handler into the invocation config (non-destructive)."""
-        if handler is None:
-            return kwargs
+    def _copy_config(self, kwargs):
+        """Non-destructive Config copy (P0-1): never mutate user Config."""
         config = kwargs.get("config")
         if config is None:
-            config = {}
-            kwargs["config"] = config
-        # Don't mutate a frozen/mapping the user passed — copy to a dict
-        if not isinstance(config, dict):
+            return kwargs, {}
+        try:
+            config_copy = copy.deepcopy(config)
+        except Exception:
+            # Fallback: shallow dict copy
             try:
-                config = dict(config)
-                kwargs["config"] = config
+                config_copy = dict(config) if isinstance(config, dict) else {}
             except Exception:
-                return kwargs
-        existing = config.get("callbacks")
-        if existing is None:
-            config["callbacks"] = [handler]
-        elif isinstance(existing, list):
-            # Don't add duplicates of our handler type
-            if not any(isinstance(c, type(handler)) for c in existing):
-                config["callbacks"] = existing + [handler]
-        else:
-            # User passed a CallbackManager — do NOT modify it; wrap in a list
-            # alongside so user callbacks are preserved.
-            config["callbacks"] = [existing, handler]
-        return kwargs
+                config_copy = {}
+        new_kwargs = {**kwargs, "config": config_copy}
+        return new_kwargs, config_copy
 
-    def _run_with_auto_root(self, original, self_runnable, args, kwargs, is_async, is_stream):
-        """Run a non-streaming invocation with auto-root + callback injection."""
-        handler = self._build_callback_handler()
-        trace_cm, _ = self._maybe_open_root()
-        kwargs = self._merge_callback(kwargs, handler)
+    def _merge_callback(self, config_copy, handler):
+        """Merge our callback handler into the COPIED config (non-destructive).
+
+        Preserves user callbacks: None / list / CallbackManager / AsyncCallbackManager.
+        """
+        if handler is None:
+            return
+        if not isinstance(config_copy, dict):
+            return
+        existing = config_copy.get("callbacks")
+        if existing is None:
+            config_copy["callbacks"] = [handler]
+        elif isinstance(existing, list):
+            if not any(isinstance(c, type(handler)) for c in existing):
+                config_copy["callbacks"] = existing + [handler]
+        else:
+            # CallbackManager / AsyncCallbackManager — wrap alongside (don't replace)
+            config_copy["callbacks"] = [existing, handler]
+
+    def _run_with_auto_root(self, original, self_runnable, args, kwargs):
+        """Run a non-streaming invocation with per-invocation state."""
+        state, is_root, token = self._enter_invocation()
+        kwargs, config_copy = self._copy_config(kwargs)
+        self._merge_callback(config_copy, state.handler if state else None)
         exc_val = None
         try:
             return original(self_runnable, *args, **kwargs)
@@ -186,16 +243,13 @@ class LangChainInstrumentor(BaseInstrumentor):
             exc_val = e
             raise
         finally:
-            self._close_root(trace_cm, exc_val)
+            self._exit_invocation(state, is_root, token, exc_val)
 
     def _stream_sync_with_auto_root(self, original, self_runnable, args, kwargs):
-        """Run a sync streaming invocation with auto-root + callback injection.
-
-        The root trace stays open for the full duration of the generator.
-        """
-        handler = self._build_callback_handler()
-        trace_cm, _ = self._maybe_open_root()
-        kwargs = self._merge_callback(kwargs, handler)
+        """Run a sync streaming invocation with per-invocation state."""
+        state, is_root, token = self._enter_invocation()
+        kwargs, config_copy = self._copy_config(kwargs)
+        self._merge_callback(config_copy, state.handler if state else None)
         exc_val = None
         try:
             for item in original(self_runnable, *args, **kwargs):
@@ -204,16 +258,13 @@ class LangChainInstrumentor(BaseInstrumentor):
             exc_val = e
             raise
         finally:
-            self._close_root(trace_cm, exc_val)
+            self._exit_invocation(state, is_root, token, exc_val)
 
     async def _stream_async_with_auto_root(self, original, self_runnable, args, kwargs):
-        """Run an async streaming invocation with auto-root + callback injection.
-
-        The root trace stays open for the full duration of the generator.
-        """
-        handler = self._build_callback_handler()
-        trace_cm, _ = self._maybe_open_root()
-        kwargs = self._merge_callback(kwargs, handler)
+        """Run an async streaming invocation with per-invocation state."""
+        state, is_root, token = self._enter_invocation()
+        kwargs, config_copy = self._copy_config(kwargs)
+        self._merge_callback(config_copy, state.handler if state else None)
         exc_val = None
         try:
             async for item in original(self_runnable, *args, **kwargs):
@@ -222,7 +273,7 @@ class LangChainInstrumentor(BaseInstrumentor):
             exc_val = e
             raise
         finally:
-            self._close_root(trace_cm, exc_val)
+            self._exit_invocation(state, is_root, token, exc_val)
 
     def uninstrument(self):
         """Restore original Runnable methods (full recovery on shutdown)."""
@@ -239,4 +290,6 @@ class LangChainInstrumentor(BaseInstrumentor):
             self._runnable_cls = None
             self._tracer = None
             self._patched = False
+        # Clear any lingering invocation state
+        _AUTO_STATE.set(None)
         logger.info("LangChain auto-instrumentation removed (Runnable restored)")

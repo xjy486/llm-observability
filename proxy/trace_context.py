@@ -115,37 +115,62 @@ def resolve_trace_context(headers: dict) -> TraceContext:
     return create_trace_context()
 
 
+def _proxy_decode_baggage_value(value: str) -> str:
+    """Percent-decode a W3C baggage value (shared contract with SDK)."""
+    try:
+        from urllib.parse import unquote
+        return unquote(str(value))
+    except Exception:
+        return str(value)
+
+
+def _proxy_parse_association_baggage(header: str) -> dict:
+    """Parse a W3C baggage header (shared contract with SDK association_propagation).
+
+    Returns canonical field -> value with compat-header key mapping to proxy meta keys.
+    """
+    result: dict[str, str] = {}
+    if not header:
+        return result
+    try:
+        for pair in str(header).split(","):
+            pair = pair.strip()
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                k = k.strip()
+                v = _proxy_decode_baggage_value(v.strip())
+                if k == "user":
+                    result["user_id"] = v
+                elif k == "session_id":
+                    result["session_id"] = v
+                elif k == "message_id":
+                    result["message_id"] = v
+                elif k == "business_scenario":
+                    result["business_scene"] = v
+                elif k == "app_name":
+                    result["app_name"] = v
+    except Exception:
+        pass
+    return result
+
+
 def extract_metadata_headers(headers: dict) -> dict:
     """Extract session_id, user_id, and other metadata from custom headers.
 
-    Phase 2.5 (P0-5): also parses the W3C `baggage` header for Association
-    Properties (user/session_id/message_id/business_scenario) so the Gateway
-    span inherits them. Compat headers (X-*) take precedence over baggage.
+    Phase 2.5 (P0-4): parses the W3C `baggage` header (percent-decoded) for
+    Association Properties using the shared contract with the SDK's
+    association_propagation module. Compat headers (X-*) take precedence
+    over baggage.
     """
     meta = {}
-    # First, parse baggage (lowest priority — compat headers override below)
+    # Parse baggage first (lowest priority — compat headers override below)
     baggage = None
     for k, v in headers.items():
         if k.lower() == "baggage":
             baggage = v
             break
     if baggage:
-        try:
-            for pair in str(baggage).split(","):
-                if "=" in pair:
-                    bk, bv = pair.split("=", 1)
-                    bk = bk.strip()
-                    bv = bv.strip()
-                    if bk == "user" and "user_id" not in meta:
-                        meta["user_id"] = bv
-                    elif bk == "session_id" and "session_id" not in meta:
-                        meta["session_id"] = bv
-                    elif bk == "message_id" and "message_id" not in meta:
-                        meta["message_id"] = bv
-                    elif bk == "business_scenario" and "business_scene" not in meta:
-                        meta["business_scene"] = bv
-        except Exception:
-            pass
+        meta.update(_proxy_parse_association_baggage(baggage))
 
     for k, v in headers.items():
         kl = k.lower()

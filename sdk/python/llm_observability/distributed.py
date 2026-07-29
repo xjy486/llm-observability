@@ -38,16 +38,9 @@ logger = logging.getLogger("llm_obs.distributed")
 
 
 def _encode_baggage_value(value: str) -> str:
-    """W3C baggage percent-encoding for a value.
-
-    Encodes commas, equals, spaces, and non-token characters so the baggage
-    header remains parseable. Control characters are also encoded.
-    """
-    if value is None:
-        return ""
-    # quote with safe='' encodes everything except alphanumerics and _.-~
-    # We also encode ',' and '=' (reserved baggage delimiters).
-    return quote(str(value), safe="")
+    """W3C baggage percent-encoding for a value (delegates to unified module)."""
+    from .association_propagation import encode_baggage_value
+    return encode_baggage_value(value)
 
 
 def inject_carrier(carrier: Optional[dict] = None) -> dict:
@@ -188,39 +181,18 @@ def extract_carrier(carrier: dict) -> Optional[ExtractedContext]:
     if extracted is None:
         return None
 
-    # Parse association from baggage + compat headers
+    # Parse association from baggage + compat headers (unified contract)
+    from .association_propagation import (
+        parse_association_baggage, extract_compat_headers, merge_remote_association,
+    )
     assoc: dict[str, str] = {}
 
     baggage = lower_items.get("baggage") or items.get("baggage")
     if isinstance(baggage, (list, tuple)) and baggage:
         baggage = baggage[0]
-    if baggage:
-        try:
-            for pair in str(baggage).split(","):
-                pair = pair.strip()
-                if "=" in pair:
-                    k, v = pair.split("=", 1)
-                    k = k.strip()
-                    v = unquote(v.strip())  # P1-5: decode percent-encoded baggage
-                    canonical = ALIASES.get(k, k)
-                    if canonical in ("user", "session_id", "message_id", "business_scenario", "app_name"):
-                        assoc[canonical] = _sanitize_value(v)
-        except Exception:
-            pass
 
-    # Compat headers (override baggage if present)
-    compat_map = {
-        "x-user-id": "user",
-        "x-session-id": "session_id",
-        "x-business-scene": "business_scenario",
-        "x-app-name": "app_name",
-    }
-    for header, canonical in compat_map.items():
-        val = lower_items.get(header)
-        if isinstance(val, (list, tuple)) and val:
-            val = val[0]
-        if val:
-            assoc[canonical] = _sanitize_value(val)
+    compat = extract_compat_headers(items)
+    assoc = merge_remote_association(baggage, compat)
 
     return ExtractedContext(
         trace_id=extracted.trace_id,

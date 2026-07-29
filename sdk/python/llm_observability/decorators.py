@@ -143,7 +143,7 @@ def agent(
     user_id: Optional[str] = None,
     message_id: Optional[str] = None,
     business_scenario: Optional[str] = None,
-    fail_open: bool = True,
+    fail_open: Optional[bool] = None,
 ):
     """Decorator that creates an AGENT root span.
 
@@ -194,7 +194,9 @@ def _capture_decorator_input(span, func, args, kwargs, tracer):
         from .tool import safe_serialize, mask_payload, apply_size_guard
         serialized = safe_serialize(bound)
         masked = mask_payload(serialized, strategy)
-        guarded, truncated, _ = apply_size_guard(masked)
+        guarded, truncated, _ = apply_size_guard(
+            masked, max_bytes=getattr(tracer.config, "max_payload_bytes", 32 * 1024)
+        )
         if span.payload is None:
             span.payload = {}
         span.payload["input"] = guarded
@@ -212,7 +214,9 @@ def _capture_decorator_output(span, result, tracer):
         from .tool import safe_serialize, mask_payload, apply_size_guard
         serialized = safe_serialize(result)
         masked = mask_payload(serialized, strategy)
-        guarded, truncated, _ = apply_size_guard(masked)
+        guarded, truncated, _ = apply_size_guard(
+            masked, max_bytes=getattr(tracer.config, "max_payload_bytes", 32 * 1024)
+        )
         if span.payload is None:
             span.payload = {}
         span.payload["output"] = guarded
@@ -224,7 +228,9 @@ def _capture_decorator_output(span, result, tracer):
 def _stream_sync(gen, span, tracer):
     """P0-8: yield from a sync generator while bounded-accumulating for output."""
     from .integrations.langchain.stream_accumulator import BoundedStreamAccumulator
-    acc = BoundedStreamAccumulator()
+    acc = BoundedStreamAccumulator(
+        max_bytes=getattr(tracer.config, "max_payload_bytes", 32 * 1024)
+    )
     for item in gen:
         acc.append(item)
         yield item
@@ -234,7 +240,9 @@ def _stream_sync(gen, span, tracer):
 async def _stream_async(agen, span, tracer):
     """P0-8: yield from an async generator while bounded-accumulating for output."""
     from .integrations.langchain.stream_accumulator import BoundedStreamAccumulator
-    acc = BoundedStreamAccumulator()
+    acc = BoundedStreamAccumulator(
+        max_bytes=getattr(tracer.config, "max_payload_bytes", 32 * 1024)
+    )
     async for item in agen:
         acc.append(item)
         yield item
@@ -242,9 +250,14 @@ async def _stream_async(agen, span, tracer):
 
 
 def _create_agent_span(func_name, nested_mode, explicit, fail_open):
-    """Create (or reuse) the AGENT root span. Returns (span, token, tracer, reused)."""
+    """Create (or reuse) the AGENT root span.
+
+    Returns (span, token, tracer, reused, assoc_token).
+    P0-3: when explicit association params are present, a temporary Association
+    Context is established so child spans inherit them.
+    """
     if not _check_initialized(fail_open):
-        return None, None, None, False
+        return None, None, None, False, None
     tracer = _get_tracer()
     current = get_current_context()
 
@@ -255,7 +268,7 @@ def _create_agent_span(func_name, nested_mode, explicit, fail_open):
                 "@agent: an active trace already exists. Use nested_mode='reuse' to reuse it."
             )
         # reuse mode: don't create a new span, just return None to signal reuse
-        return None, None, tracer, True
+        return None, None, tracer, True, None
 
     trace_id = generate_trace_id()
     span_id = generate_span_id()
@@ -291,18 +304,48 @@ def _create_agent_span(func_name, nested_mode, explicit, fail_open):
     except Exception:
         pass
 
+    # P0-3: establish a temporary Association Context from explicit params so
+    # child spans (TASK/TOOL/LLM/GATEWAY) inherit them via the context priority.
+    # Only set non-None values so the merge inherits the rest from the context.
+    assoc_token = None
+    if explicit:
+        assoc_props = {}
+        if explicit.get("user_id") is not None:
+            assoc_props["user"] = explicit.get("user_id")
+        if explicit.get("session_id") is not None:
+            assoc_props["session_id"] = explicit.get("session_id")
+        if explicit.get("message_id") is not None:
+            assoc_props["message_id"] = explicit.get("message_id")
+        if explicit.get("business_scenario") is not None:
+            assoc_props["business_scenario"] = explicit.get("business_scenario")
+        if assoc_props:
+            try:
+                from .association import set_association_properties
+                assoc_token = set_association_properties(assoc_props)
+            except Exception:
+                assoc_token = None
+
     # Update context sampled flag
     # Note: SpanContext is frozen-ish; we set sampled on the span record instead
-    return span, token, tracer, False
+    return span, token, tracer, False, assoc_token
 
 
-def _finalize_agent_span(span, token, tracer, reused, exc_type, exc_val, exc_tb):
-    """Finalize the AGENT span and restore context."""
+def _finalize_agent_span(span, token, tracer, reused, assoc_token, exc_type, exc_val, exc_tb):
+    """Finalize the AGENT span and restore context + association."""
     if reused:
         return
     if span is None:
         if token is not None:
-            reset_context(token)
+            try:
+                reset_context(token)
+            except Exception:
+                logger.exception("AGENT context reset failed")
+        if assoc_token is not None:
+            try:
+                from .association import reset_association_properties
+                reset_association_properties(assoc_token)
+            except Exception:
+                pass
         return
     try:
         try:
@@ -326,14 +369,24 @@ def _finalize_agent_span(span, token, tracer, reused, exc_type, exc_val, exc_tb)
             unregister_span_event_sink(span.trace_id, span.span_id)
         except Exception:
             pass
+        # P0-3: restore association context (fail-open)
+        if assoc_token is not None:
+            try:
+                from .association import reset_association_properties
+                reset_association_properties(assoc_token)
+            except Exception:
+                pass
         if token is not None:
-            reset_context(token)
+            try:
+                reset_context(token)
+            except Exception:
+                logger.exception("AGENT context reset failed")
 
 
 def _run_agent_sync(func, args, kwargs, name, nested_mode, explicit, fail_open):
     import sys as _sys
     func_name = name or func.__name__
-    span, token, tracer, reused = _create_agent_span(func_name, nested_mode, explicit, fail_open)
+    span, token, tracer, reused, assoc_token = _create_agent_span(func_name, nested_mode, explicit, fail_open)
     if span is None and token is None and not reused:
         # SDK not init + fail_open — run business only
         return func(*args, **kwargs)
@@ -358,13 +411,13 @@ def _run_agent_sync(func, args, kwargs, name, nested_mode, explicit, fail_open):
     except BaseException:
         raise
     finally:
-        _finalize_agent_span(span, token, tracer, reused, *_sys.exc_info())
+        _finalize_agent_span(span, token, tracer, reused, assoc_token, *_sys.exc_info())
 
 
 async def _run_agent_async(func, args, kwargs, name, nested_mode, explicit, fail_open):
     import sys as _sys
     func_name = name or func.__name__
-    span, token, tracer, reused = _create_agent_span(func_name, nested_mode, explicit, fail_open)
+    span, token, tracer, reused, assoc_token = _create_agent_span(func_name, nested_mode, explicit, fail_open)
     if span is None and token is None and not reused:
         return await func(*args, **kwargs)
     if reused:
@@ -386,13 +439,13 @@ async def _run_agent_async(func, args, kwargs, name, nested_mode, explicit, fail
     except BaseException:
         raise
     finally:
-        _finalize_agent_span(span, token, tracer, reused, *_sys.exc_info())
+        _finalize_agent_span(span, token, tracer, reused, assoc_token, *_sys.exc_info())
 
 
 def _run_agent_sync_gen(func, args, kwargs, name, nested_mode, explicit, fail_open):
     import sys as _sys
     func_name = name or func.__name__
-    span, token, tracer, reused = _create_agent_span(func_name, nested_mode, explicit, fail_open)
+    span, token, tracer, reused, assoc_token = _create_agent_span(func_name, nested_mode, explicit, fail_open)
     if span is None and token is None and not reused:
         yield from func(*args, **kwargs)
         return
@@ -406,13 +459,13 @@ def _run_agent_sync_gen(func, args, kwargs, name, nested_mode, explicit, fail_op
     except BaseException:
         raise
     finally:
-        _finalize_agent_span(span, token, tracer, reused, *_sys.exc_info())
+        _finalize_agent_span(span, token, tracer, reused, assoc_token, *_sys.exc_info())
 
 
 async def _run_agent_async_gen(func, args, kwargs, name, nested_mode, explicit, fail_open):
     import sys as _sys
     func_name = name or func.__name__
-    span, token, tracer, reused = _create_agent_span(func_name, nested_mode, explicit, fail_open)
+    span, token, tracer, reused, assoc_token = _create_agent_span(func_name, nested_mode, explicit, fail_open)
     if span is None and token is None and not reused:
         async for item in func(*args, **kwargs):
             yield item
@@ -429,7 +482,7 @@ async def _run_agent_async_gen(func, args, kwargs, name, nested_mode, explicit, 
     except BaseException:
         raise
     finally:
-        _finalize_agent_span(span, token, tracer, reused, *_sys.exc_info())
+        _finalize_agent_span(span, token, tracer, reused, assoc_token, *_sys.exc_info())
 
 
 def sys_exc_info():
@@ -439,7 +492,7 @@ def sys_exc_info():
 
 # ── TASK decorator (@chain / @task) ──
 
-def _task_decorator(task_type: str, name: Optional[str] = None, fail_open: bool = True, **extra):
+def _task_decorator(task_type: str, name: Optional[str] = None, fail_open: Optional[bool] = None, **extra):
     """Shared factory for @chain and @task."""
     def decorator(func):
         if _is_async(func):
@@ -469,7 +522,7 @@ def _task_decorator(task_type: str, name: Optional[str] = None, fail_open: bool 
     return decorator
 
 
-def chain(name: Optional[str] = None, fail_open: bool = True, **kwargs):
+def chain(name: Optional[str] = None, fail_open: Optional[bool] = None, **kwargs):
     """Decorator that creates a TASK span with task.type=chain.
 
     Requires an active trace. Without one, behaves per fail_open (no auto AGENT).
@@ -477,7 +530,7 @@ def chain(name: Optional[str] = None, fail_open: bool = True, **kwargs):
     return _task_decorator("chain", name=name, fail_open=fail_open, **kwargs)
 
 
-def task(name: Optional[str] = None, fail_open: bool = True, **kwargs):
+def task(name: Optional[str] = None, fail_open: Optional[bool] = None, **kwargs):
     """Decorator that creates a TASK span with task.type=task."""
     return _task_decorator("task", name=name, fail_open=fail_open, **kwargs)
 
@@ -544,7 +597,9 @@ def _run_task_sync_gen(func, args, kwargs, task_type, name, fail_open, extra):
     ) as handle:
         # P0-8: true streaming — yield as items arrive, bounded-accumulate for output
         from .integrations.langchain.stream_accumulator import BoundedStreamAccumulator
-        acc = BoundedStreamAccumulator()
+        acc = BoundedStreamAccumulator(
+            max_bytes=getattr(tracer.config, "max_payload_bytes", 32 * 1024)
+        )
         for item in func(*args, **kwargs):
             acc.append(item)
             yield item
@@ -581,7 +636,7 @@ async def _run_task_async_gen(func, args, kwargs, task_type, name, fail_open, ex
 
 # ── TOOL decorator (reuses Phase 2.2) ──
 
-def tool(name: Optional[str] = None, tool_type: Optional[str] = None, fail_open: bool = True, **kwargs):
+def tool(name: Optional[str] = None, tool_type: Optional[str] = None, fail_open: Optional[bool] = None, **kwargs):
     """Decorator that creates a TOOL span. Reuses Phase 2.2 ToolRuntime."""
     def decorator(func):
         if _is_async(func):
@@ -691,7 +746,7 @@ async def _run_tool_async_gen(func, args, kwargs, name, tool_type, fail_open):
 
 # ── LLM decorator ──
 
-def llm(name: Optional[str] = None, model: Optional[str] = None, fail_open: bool = True, **kwargs):
+def llm(name: Optional[str] = None, model: Optional[str] = None, fail_open: Optional[bool] = None, **kwargs):
     """Decorator that creates a logical LLM span.
 
     Sets logical_llm_span_active=True so the OpenAI instrumentor does NOT
