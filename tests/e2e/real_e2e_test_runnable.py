@@ -186,6 +186,7 @@ def run_e2e_tests(svc: ServiceManager):
     from langchain_core.messages import HumanMessage
     from langchain_core.prompts import ChatPromptTemplate
     from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.runnables import RunnableLambda
     from langchain_openai import ChatOpenAI
     from llm_observability import Observability
     from llm_observability.integrations.langchain.runnable_wrapper import observe_runnable
@@ -369,9 +370,15 @@ def run_e2e_tests(svc: ServiceManager):
         """Count words in text."""
         return len(text.split())
 
-    # Build a simple chain that calls the model
+    # Execute the Tool as a real nested Runnable before calling the model.
+    tool_step = RunnableLambda(
+        lambda _input, config: {
+            "count": word_counter.invoke("one two three", config=config),
+        }
+    )
     chain5 = (
-        ChatPromptTemplate.from_messages([("human", "What is 3*7? Reply with just the number.")])
+        tool_step
+        | ChatPromptTemplate.from_messages([("human", "A tool counted {count} words. Reply with just that number.")])
         | chat_model
         | StrOutputParser()
     )
@@ -387,15 +394,64 @@ def run_e2e_tests(svc: ServiceManager):
         agent5 = [s for s in spans5 if s["span_kind"] == "AGENT"]
         llm5 = [s for s in spans5 if s["span_kind"] == "LLM"]
         gw5 = [s for s in spans5 if s["span_kind"] == "GATEWAY"]
+        tool5 = [
+            s for s in spans5
+            if s["span_kind"] == "TOOL"
+            and s.get("attributes", {}).get("langchain.component") == "tool"
+        ]
         check("Tool-runnable has AGENT", len(agent5) >= 1, f"count={len(agent5)}")
+        check("Tool-runnable has TOOL", len(tool5) == 1, f"count={len(tool5)}")
+        if tool5:
+            tool_attrs = tool5[0].get("attributes", {})
+            tool_payload = tool5[0].get("payload", {})
+            check("TOOL input is recorded", tool_attrs.get("tool.input.type") is not None, f"attrs={tool_attrs}")
+            check("TOOL output is recorded", "output" in tool_payload, f"payload={tool_payload}")
         check("Tool-runnable has LLM", len(llm5) >= 1, f"count={len(llm5)}")
         check("Tool-runnable LLM==GATEWAY (no dup)", len(llm5) == len(gw5), f"llm={len(llm5)}, gw={len(gw5)}")
+        if tool5 and llm5:
+            check("TOOL and LLM share trace", tool5[0]["trace_id"] == llm5[0]["trace_id"])
+            check("LLM is not nested under TOOL", llm5[0]["parent_span_id"] != tool5[0]["span_id"])
 
     # ═════════════════════════════════════════════════════════
-    # Scenario 6: Privacy — API key must not leak in spans
+    # Scenario 6: Async streaming with early close
     # ═════════════════════════════════════════════════════════
     print("\n" + "=" * 70)
-    print("Scenario 6: Privacy — no API key leakage")
+    print("Scenario 6: observe_runnable astream")
+    print("=" * 70)
+
+    chain6 = (
+        ChatPromptTemplate.from_messages([("human", "Stream the numbers 1, 2, 3 separated by commas.")])
+        | chat_model
+        | StrOutputParser()
+    )
+    observed6 = observe_runnable(chain6, name="astream-runnable")
+
+    async def collect_astream():
+        chunks = []
+        async for chunk in observed6.astream({}):
+            chunks.append(chunk)
+        return chunks
+
+    async_chunks = asyncio.run(collect_astream())
+    check("Async stream produced chunks", len(async_chunks) > 0, f"chunks={len(async_chunks)}")
+
+    trace6, detail6 = verify_trace(svc, "astream-runnable")
+    check("Scenario 6 trace found", trace6 is not None)
+    if detail6:
+        spans6 = detail6.get("spans", [])
+        agent6 = [s for s in spans6 if s["span_kind"] == "AGENT"]
+        llm6 = [s for s in spans6 if s["span_kind"] == "LLM"]
+        gw6 = [s for s in spans6 if s["span_kind"] == "GATEWAY"]
+        check("Async stream has AGENT+LLM+GATEWAY", {"AGENT", "LLM", "GATEWAY"}.issubset({s["span_kind"] for s in spans6}))
+        check("Async stream LLM==GATEWAY", len(llm6) == len(gw6), f"llm={len(llm6)}, gw={len(gw6)}")
+        if agent6:
+            check("Async stream AGENT status OK", agent6[0].get("status") == "OK", f"status={agent6[0].get('status')}")
+
+    # ═════════════════════════════════════════════════════════
+    # Scenario 7: Privacy — API key must not leak in spans
+    # ═════════════════════════════════════════════════════════
+    print("\n" + "=" * 70)
+    print("Scenario 7: Privacy — no API key leakage")
     print("=" * 70)
 
     # Query all spans from the last 5 minutes and check no API key leakage

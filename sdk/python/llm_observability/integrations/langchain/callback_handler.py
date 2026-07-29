@@ -13,7 +13,7 @@ import time
 import re
 from typing import Any, Optional, Union, Sequence
 
-from ...context import get_current_context, reset_context, SpanContext
+from ...context import get_current_context, reset_context, set_context, SpanContext
 from ...spans import SpanKind
 from .compat import BaseCallbackHandler, ensure_langchain_available
 from .callback_registry import CallbackRunState, CallbackRunRegistry
@@ -429,7 +429,6 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
             if hasattr(tool_cm, '_span') and tool_cm._span:
                 self._register_span(tool_cm._span.span_id, tool_cm._span)
 
-            from ...context import get_current_context
             current = get_current_context()
             state = CallbackRunState(
                 run_id=str(run_id),
@@ -475,10 +474,13 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
                     pass
 
             tool_cm = state.span
-            if tool_cm is not None:
-                tool_cm.__exit__(None, None, None)
-
-            self._registry.remove(str(run_id))
+            try:
+                if tool_cm is not None:
+                    tool_cm.__exit__(None, None, None)
+            finally:
+                if tool_cm is not None and getattr(tool_cm, "_span", None) is not None:
+                    self._unregister_span(tool_cm._span)
+                self._registry.remove(str(run_id))
         except Exception as e:
             logger.debug("on_tool_end failed: %s", e)
 
@@ -499,10 +501,13 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
 
             state.ended = True
             tool_cm = state.span
-            if tool_cm is not None:
-                tool_cm.__exit__(type(error), error, error.__traceback__)
-
-            self._registry.remove(str(run_id))
+            try:
+                if tool_cm is not None:
+                    tool_cm.__exit__(type(error), error, error.__traceback__)
+            finally:
+                if tool_cm is not None and getattr(tool_cm, "_span", None) is not None:
+                    self._unregister_span(tool_cm._span)
+                self._registry.remove(str(run_id))
         except Exception as e:
             logger.debug("on_tool_error failed: %s", e)
 
@@ -575,7 +580,6 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
             if hasattr(tool_cm, '_span') and tool_cm._span:
                 self._register_span(tool_cm._span.span_id, tool_cm._span)
 
-            from ...context import get_current_context
             current = get_current_context()
             state = CallbackRunState(
                 run_id=str(run_id),
@@ -644,10 +648,13 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
                     pass
 
             tool_cm = state.span
-            if tool_cm is not None:
-                tool_cm.__exit__(None, None, None)
-
-            self._registry.remove(str(run_id))
+            try:
+                if tool_cm is not None:
+                    tool_cm.__exit__(None, None, None)
+            finally:
+                if tool_cm is not None and getattr(tool_cm, "_span", None) is not None:
+                    self._unregister_span(tool_cm._span)
+                self._registry.remove(str(run_id))
         except Exception as e:
             logger.debug("on_retriever_end failed: %s", e)
 
@@ -668,10 +675,13 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
 
             state.ended = True
             tool_cm = state.span
-            if tool_cm is not None:
-                tool_cm.__exit__(type(error), error, error.__traceback__)
-
-            self._registry.remove(str(run_id))
+            try:
+                if tool_cm is not None:
+                    tool_cm.__exit__(type(error), error, error.__traceback__)
+            finally:
+                if tool_cm is not None and getattr(tool_cm, "_span", None) is not None:
+                    self._unregister_span(tool_cm._span)
+                self._registry.remove(str(run_id))
         except Exception as e:
             logger.debug("on_retriever_error failed: %s", e)
 
@@ -744,19 +754,19 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
 
             from llm_observability import Observability
             strategy = getattr(getattr(Observability._tracer, "config", None), "payload_strategy", "masked")
-            if strategy == "off":
-                return
-            from ...tool import safe_serialize, apply_size_guard
-            from ...utils.masking import mask_payload
-            serialized = safe_serialize(data)
-            masked = mask_payload(serialized, strategy)
-            guarded, truncated, orig_size = apply_size_guard(masked, max_bytes=MAX_CUSTOM_EVENT_DATA_BYTES)
-
-            self._record_event_on_span(event_name, parent_ctx, {
-                "langchain.data": guarded,
-                "langchain.data.truncated": truncated,
-                "langchain.data.size_bytes": orig_size,
-            })
+            attributes = {}
+            if strategy != "off":
+                from ...tool import safe_serialize, apply_size_guard
+                from ...utils.masking import mask_payload
+                serialized = safe_serialize(data)
+                masked = mask_payload(serialized, strategy)
+                guarded, truncated, orig_size = apply_size_guard(masked, max_bytes=MAX_CUSTOM_EVENT_DATA_BYTES)
+                attributes.update({
+                    "langchain.data": guarded,
+                    "langchain.data.truncated": truncated,
+                    "langchain.data.size_bytes": orig_size,
+                })
+            self._record_event_on_span(event_name, parent_ctx, attributes)
         except Exception as e:
             logger.debug("on_custom_event failed: %s", e)
 
@@ -784,26 +794,34 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
                     if span:
                         span.set_attribute("langchain.callback.incomplete", True)
 
-                    # Close LLM spans
+                    # Close LLM spans and always release their event sink.
                     if state.token is not None:
                         try:
                             reset_context(state.token)
                         except Exception:
-                            pass
+                            if state.previous_context is not None:
+                                set_context(state.previous_context)
                     if span:
-                        span.end()
-                        from llm_observability import Observability
-                        tracer = Observability._tracer
-                        if state.sampled and tracer:
-                            try:
-                                tracer.reporter.report(span.to_record())
-                            except Exception:
-                                pass
+                        try:
+                            span.end()
+                            from llm_observability import Observability
+                            tracer = Observability._tracer
+                            if state.sampled and tracer:
+                                try:
+                                    tracer.reporter.report(span.to_record())
+                                except Exception:
+                                    pass
+                        finally:
+                            self._unregister_span(span)
 
-                    # Close tool spans
+                    # Close tool/retriever spans and always release their sinks.
                     tool_cm = state.span if state.run_type in ("tool", "retriever") else None
-                    if tool_cm is not None and hasattr(tool_cm, '__exit__'):
-                        tool_cm.__exit__(None, None, None)
+                    try:
+                        if tool_cm is not None and hasattr(tool_cm, '__exit__'):
+                            tool_cm.__exit__(None, None, None)
+                    finally:
+                        if tool_cm is not None and getattr(tool_cm, "_span", None) is not None:
+                            self._unregister_span(tool_cm._span)
                 except Exception:
                     pass
             self._registry.clear()
@@ -852,7 +870,6 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
                 return
 
             # Check dedup: if already in an LLM context, register virtual (spec §17)
-            from ...context import get_current_context
             current = get_current_context()
             if current and (current.logical_llm_span_active or current.span_kind == SpanKind.LLM):
                 state = CallbackRunState(
@@ -886,7 +903,6 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
             )
             handle = llm_span.__enter__()
 
-            from ...context import get_current_context
             current_after = get_current_context()
             state = CallbackRunState(
                 run_id=run_id,
@@ -902,6 +918,7 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
                 first_token_seen=False,
                 started_at=time.time(),
                 ended=False,
+                previous_context=parent_ctx,
             )
             state._llm_handle = handle  # type: ignore
             state._llm_span = llm_span._span  # type: ignore
@@ -932,8 +949,10 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
                         )
                 elif span.status != "ERROR":
                     span.set_status("OK")
-                span.end()
-                self._unregister_span(span)
+                try:
+                    span.end()
+                finally:
+                    self._unregister_span(span)
                 from llm_observability import Observability
                 tracer = Observability._tracer
                 if state.sampled and tracer:
@@ -945,7 +964,9 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
                 try:
                     reset_context(state.token)
                 except Exception:
-                    logger.debug("Callback LLM context reset failed", exc_info=True)
+                    if state.previous_context is not None:
+                        set_context(state.previous_context)
+                    logger.debug("Callback LLM context reset failed; restored parent context", exc_info=True)
 
 
     def _extract_name(self, serialized: Optional[dict]) -> str:

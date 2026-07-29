@@ -45,6 +45,7 @@ class CallbackRunState:
     first_token_seen: bool
     started_at: float
     ended: bool
+    previous_context: Optional[SpanContext] = None
 
 
 class CallbackRunRegistry:

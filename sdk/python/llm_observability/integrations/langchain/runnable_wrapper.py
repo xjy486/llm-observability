@@ -130,9 +130,18 @@ def _copy_callback_manager(existing: Any, handler: Any) -> Any:
                 value = values[name]
                 setattr(cloned, name, value)
     handlers = list(getattr(cloned, "handlers", []) or [])
+    inheritable_handlers = list(getattr(cloned, "inheritable_handlers", []) or [])
     if not any(cb is handler for cb in handlers):
-        handlers.append(handler)
-    cloned.handlers = handlers
+        if hasattr(cloned, "add_handler"):
+            cloned.add_handler(handler, inherit=True)
+        else:
+            handlers.append(handler)
+            inheritable_handlers.append(handler)
+            cloned.handlers = handlers
+            cloned.inheritable_handlers = inheritable_handlers
+    elif not any(cb is handler for cb in inheritable_handlers):
+        inheritable_handlers.append(handler)
+        cloned.inheritable_handlers = inheritable_handlers
     return cloned
 
 

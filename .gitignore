@@ -53,3 +53,6 @@ sdk/python/llm_observability/llm-observability-phase2.2-closeout-fix-requirement
 
 # Local dev docs (not shared / not committed)
 /STARTUP.md
+.codex/
+.codebuddy/
+.claude/
