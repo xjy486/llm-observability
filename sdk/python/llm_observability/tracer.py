@@ -88,6 +88,12 @@ class TraceContextManager:
             business_scene=self._business_scene,
         )
         self._span.start()
+        # Phase 2.5: inherit association properties (message_id, etc.)
+        try:
+            from .association import apply_association_to_span
+            apply_association_to_span(self._span)
+        except Exception:
+            pass
         try:
             from .span_registry import register_span_event_sink
             register_span_event_sink(self._span)
@@ -202,6 +208,30 @@ class Tracer:
             tool_type=tool_type,
             input=input,
             call_id=call_id,
+            attributes=attributes,
+        )
+
+    def task(
+        self,
+        name: str,
+        task_type: str = "task",
+        input: Any = None,
+        call_id: Optional[str] = None,
+        role: Optional[str] = None,
+        attributes: Optional[dict] = None,
+    ):
+        """Create a TASK span context manager (Phase 2.5).
+
+        Requires an active trace. Raises RuntimeError otherwise.
+        """
+        from .task import TaskContextManager
+        return TaskContextManager(
+            tracer=self,
+            name=name,
+            task_type=task_type,
+            input=input,
+            call_id=call_id,
+            role=role,
             attributes=attributes,
         )
 

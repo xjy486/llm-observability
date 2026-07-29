@@ -11,6 +11,7 @@ class SpanKind:
     TOOL = "TOOL"
     GATEWAY = "GATEWAY"
     INTERNAL = "INTERNAL"
+    TASK = "TASK"  # Phase 2.5: unified @chain/@task/client_call
 
 
 @dataclass
@@ -49,6 +50,7 @@ class Span:
     user_id: Optional[str] = None
     app_name: Optional[str] = None
     business_scene: Optional[str] = None
+    message_id: Optional[str] = None  # Phase 2.5: Association Properties
     error_type: Optional[str] = None
     error_message: Optional[str] = None
     payload: Optional[dict[str, Any]] = None
@@ -107,6 +109,7 @@ class Span:
             "user_id": self.user_id,
             "app_name": self.app_name,
             "business_scene": self.business_scene,
+            "message_id": self.message_id,
             "attributes": self.attributes,
             "events": self.events,
             "error_type": self.error_type,

@@ -45,4 +45,7 @@
   .tag-gateway {
     @apply bg-teal-100 text-teal-800;
   }
+  .tag-task {
+    @apply bg-indigo-100 text-indigo-800;
+  }
 }

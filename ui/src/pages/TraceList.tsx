@@ -10,6 +10,7 @@ export default function TraceList() {
   const [duration, setDuration] = useState(60)
   const [status, setStatus] = useState<string | undefined>(undefined)
   const [model, setModel] = useState<string | undefined>(undefined)
+  const [messageId, setMessageId] = useState<string | undefined>(undefined)
   const [offset, setOffset] = useState(0)
   const [total, setTotal] = useState(0)
   const limit = 50
@@ -22,6 +23,7 @@ export default function TraceList() {
           durationMinutes: duration,
           status,
           model,
+          message_id: messageId,
           limit,
           offset,
           sort_by: 'start_time',
@@ -36,7 +38,7 @@ export default function TraceList() {
       }
     }
     load()
-  }, [duration, status, model, offset])
+  }, [duration, status, model, messageId, offset])
 
   return (
     <div className="space-y-4">
@@ -88,6 +90,17 @@ export default function TraceList() {
           value={model || ''}
           onChange={(e) => {
             setModel(e.target.value || undefined)
+            setOffset(0)
+          }}
+          className="border border-gray-300 rounded-md px-3 py-1.5 text-sm flex-1 min-w-[200px]"
+        />
+
+        <input
+          type="text"
+          placeholder="Filter by message_id..."
+          value={messageId || ''}
+          onChange={(e) => {
+            setMessageId(e.target.value || undefined)
             setOffset(0)
           }}
           className="border border-gray-300 rounded-md px-3 py-1.5 text-sm flex-1 min-w-[200px]"

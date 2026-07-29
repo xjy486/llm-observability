@@ -28,7 +28,7 @@ EXPECTED_SPAN_COLUMNS = {
     "trace_id", "span_id", "parent_span_id", "span_name", "span_kind",
     "start_time", "end_time", "duration_ms", "status", "http_status",
     "ttft_ms", "first_chunk_ms",  # v2: ttfc_ms removed, first_chunk_ms added
-    "session_id", "user_id", "app_name", "business_scene",
+    "session_id", "user_id", "app_name", "business_scene", "message_id",
     "attributes", "events", "error_type", "error_message",
     "payload", "request_metadata", "payload_ref", "trace_inherited",
     "model", "input_tokens", "output_tokens", "total_tokens", "is_stream",
@@ -45,6 +45,7 @@ V2_NEW_COLUMNS = {
     "first_chunk_ms": "REAL",
     "app_name": "TEXT",
     "business_scene": "TEXT",
+    "message_id": "TEXT",  # Phase 2.5: Association Properties
     "payload_ref": "TEXT",
     "trace_inherited": "INTEGER DEFAULT 0",
     "model": "TEXT",
@@ -117,6 +118,7 @@ class Storage:
                     user_id TEXT,
                     app_name TEXT,
                     business_scene TEXT,
+                    message_id TEXT,
                     attributes TEXT,
                     events TEXT,
                     error_type TEXT,
@@ -187,6 +189,7 @@ class Storage:
                 CREATE INDEX IF NOT EXISTS idx_spans_user ON spans(user_id);
                 CREATE INDEX IF NOT EXISTS idx_spans_model ON spans(model);
                 CREATE INDEX IF NOT EXISTS idx_spans_kind ON spans(span_kind);
+                CREATE INDEX IF NOT EXISTS idx_spans_message ON spans(message_id);
             """)
 
             # Record schema version
@@ -217,11 +220,11 @@ class Storage:
             INSERT OR REPLACE INTO spans (
                 trace_id, span_id, parent_span_id, span_name, span_kind,
                 start_time, end_time, duration_ms, status, http_status,
-                ttft_ms, first_chunk_ms, session_id, user_id, app_name, business_scene,
+                ttft_ms, first_chunk_ms, session_id, user_id, app_name, business_scene, message_id,
                 attributes, events, error_type, error_message, payload,
                 request_metadata, payload_ref, trace_inherited,
                 model, input_tokens, output_tokens, total_tokens, is_stream
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             record["trace_id"],
             record["span_id"],
@@ -239,6 +242,7 @@ class Storage:
             record.get("user_id"),
             record.get("app_name"),
             record.get("business_scene"),
+            record.get("message_id"),
             json.dumps(record.get("attributes", {})),
             json.dumps(record.get("events", [])),
             record.get("error_type"),
@@ -290,6 +294,7 @@ class Storage:
         max_duration_ms: Optional[float] = None,
         app_name: Optional[str] = None,
         business_scene: Optional[str] = None,
+        message_id: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
         sort_by: str = "start_time",
@@ -356,6 +361,11 @@ class Storage:
                 "EXISTS (SELECT 1 FROM spans s2 WHERE s2.trace_id = s.trace_id AND s2.business_scene = ?)"
             )
             exists_params.append(business_scene)
+        if message_id is not None:
+            exists_clauses.append(
+                "EXISTS (SELECT 1 FROM spans s2 WHERE s2.trace_id = s.trace_id AND s2.message_id = ?)"
+            )
+            exists_params.append(message_id)
 
         all_conditions = direct_conditions + exists_clauses
         all_params = direct_params + exists_params
@@ -456,9 +466,15 @@ class Storage:
                     MAX(CASE WHEN s.span_kind = 'AGENT' THEN s.business_scene END),
                     MAX(s.business_scene)
                 ) as business_scene,
+                COALESCE(
+                    MAX(CASE WHEN s.span_kind = 'AGENT' THEN s.message_id END),
+                    MAX(s.message_id)
+                ) as message_id,
                 COUNT(*) as span_count,
                 SUM(CASE WHEN s.span_kind = 'LLM' THEN 1 ELSE 0 END) as llm_call_count,
                 SUM(CASE WHEN s.span_kind = 'TOOL' THEN 1 ELSE 0 END) as tool_call_count,
+                SUM(CASE WHEN s.span_kind = 'TASK' THEN 1 ELSE 0 END) as task_count,
+                SUM(CASE WHEN s.span_kind = 'TASK' AND s.attributes LIKE '%"task.type":"chain"%' THEN 1 ELSE 0 END) as chain_count,
                 SUM(CASE WHEN s.span_kind = 'LLM' THEN COALESCE(s.input_tokens, 0) ELSE 0 END) as input_tokens,
                 SUM(CASE WHEN s.span_kind = 'LLM' THEN COALESCE(s.output_tokens, 0) ELSE 0 END) as output_tokens,
                 SUM(CASE WHEN s.span_kind = 'LLM' THEN COALESCE(s.total_tokens, 0) ELSE 0 END) as total_tokens,
@@ -550,6 +566,11 @@ class Storage:
 
         llm_spans = [s for s in spans if s["span_kind"] == "LLM"]
         tool_spans = [s for s in spans if s["span_kind"] == "TOOL"]
+        task_spans = [s for s in spans if s["span_kind"] == "TASK"]
+        chain_spans = [
+            s for s in task_spans
+            if isinstance(s.get("attributes"), dict) and s["attributes"].get("task.type") == "chain"
+        ]
         input_tokens = sum(s.get("input_tokens") or 0 for s in llm_spans)
         output_tokens = sum(s.get("output_tokens") or 0 for s in llm_spans)
         total_tokens = sum(s.get("total_tokens") or 0 for s in llm_spans)
@@ -565,9 +586,12 @@ class Storage:
             "user_id": meta_span.get("user_id") or _first_non_null("user_id"),
             "app_name": meta_span.get("app_name") or _first_non_null("app_name"),
             "business_scene": meta_span.get("business_scene") or _first_non_null("business_scene"),
+            "message_id": meta_span.get("message_id") or _first_non_null("message_id"),
             "span_count": len(spans),
             "llm_call_count": len(llm_spans),
             "tool_call_count": len(tool_spans),
+            "task_count": len(task_spans),
+            "chain_count": len(chain_spans),
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,

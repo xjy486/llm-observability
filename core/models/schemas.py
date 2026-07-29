@@ -27,7 +27,7 @@ class SpanRecord(BaseModel):
     span_id: str
     parent_span_id: Optional[str] = None
     span_name: str
-    span_kind: str  # AGENT / LLM / TOOL / GATEWAY / INTERNAL
+    span_kind: str  # AGENT / LLM / TOOL / GATEWAY / TASK / INTERNAL
     start_time: float  # Unix epoch
     end_time: float
     duration_ms: float
@@ -39,6 +39,7 @@ class SpanRecord(BaseModel):
     user_id: Optional[str] = None
     app_name: Optional[str] = None
     business_scene: Optional[str] = None
+    message_id: Optional[str] = None  # Phase 2.5: Association Properties
     attributes: dict[str, Any] = Field(default_factory=dict)
     events: list[Event] = Field(default_factory=list)
     error_type: Optional[str] = None
@@ -75,6 +76,7 @@ class IngestRecord(BaseModel):
     user_id: Optional[str] = None
     app_name: Optional[str] = None
     business_scene: Optional[str] = None
+    message_id: Optional[str] = None  # Phase 2.5: Association Properties
     attributes: dict[str, Any] = Field(default_factory=dict)
     events: list[dict[str, Any]] = Field(default_factory=list)
     error_type: Optional[str] = None
@@ -103,9 +105,12 @@ class TraceSummary(BaseModel):
     user_id: Optional[str] = None
     app_name: Optional[str] = None
     business_scene: Optional[str] = None
+    message_id: Optional[str] = None  # Phase 2.5: Association Properties
     span_count: int = 0
     llm_call_count: int = 0
     tool_call_count: int = 0  # P1-5: Phase 2.2 tool span count
+    task_count: int = 0  # Phase 2.5: TASK spans
+    chain_count: int = 0  # Phase 2.5: TASK spans with task.type=chain
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
@@ -127,9 +132,12 @@ class TraceDetail(BaseModel):
     user_id: Optional[str] = None
     app_name: Optional[str] = None
     business_scene: Optional[str] = None
+    message_id: Optional[str] = None  # Phase 2.5: Association Properties
     span_count: int = 0
     llm_call_count: int = 0
     tool_call_count: int = 0  # P1-5: Phase 2.2 tool span count
+    task_count: int = 0  # Phase 2.5: TASK spans
+    chain_count: int = 0  # Phase 2.5: TASK spans with task.type=chain
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0

@@ -1,5 +1,5 @@
 """SDK configuration."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -14,7 +14,11 @@ class Config:
         payload_strategy: Payload collection strategy — off/metadata_only/masked/full.
         sample_rate: Sampling rate between 0.0 and 1.0.
         auto_instrument_openai: Whether to auto-patch OpenAI SDK on init.
+        auto_instrument_langchain: Whether to auto-instrument LangChain on init (Phase 2.5).
         capture_retriever_content: Whether to capture retriever document bodies.
+        max_attribute_bytes: Max bytes for a single attribute (default 8 KiB, max 128 KiB).
+        max_payload_bytes: Max bytes for payload serialization (default 32 KiB).
+        fail_open: If True, telemetry errors never block business (default True).
     """
     app_name: str = "unknown"
     endpoint: str = "http://localhost:8001"
@@ -22,4 +26,8 @@ class Config:
     payload_strategy: str = "masked"
     sample_rate: float = 1.0
     auto_instrument_openai: bool = True
+    auto_instrument_langchain: bool = False
     capture_retriever_content: bool = False
+    max_attribute_bytes: int = 8 * 1024
+    max_payload_bytes: int = 32 * 1024
+    fail_open: bool = True

@@ -15,6 +15,7 @@ export interface SpanRecord {
   user_id: string | null
   app_name: string | null
   business_scene: string | null
+  message_id: string | null       // Phase 2.5: Association Properties
   attributes: Record<string, unknown>
   events: Event[]
   error_type: string | null
@@ -47,9 +48,12 @@ export interface TraceSummary {
   user_id: string | null
   app_name: string | null
   business_scene: string | null
+  message_id: string | null       // Phase 2.5: Association Properties
   span_count: number
   llm_call_count: number
   tool_call_count: number
+  task_count: number               // Phase 2.5: TASK spans
+  chain_count: number              // Phase 2.5: TASK spans with task.type=chain
   input_tokens: number
   output_tokens: number
   total_tokens: number
@@ -70,9 +74,12 @@ export interface TraceDetail {
   user_id: string | null
   app_name: string | null
   business_scene: string | null
+  message_id: string | null       // Phase 2.5: Association Properties
   span_count: number
   llm_call_count: number
   tool_call_count: number
+  task_count: number               // Phase 2.5: TASK spans
+  chain_count: number              // Phase 2.5: TASK spans with task.type=chain
   input_tokens: number
   output_tokens: number
   total_tokens: number

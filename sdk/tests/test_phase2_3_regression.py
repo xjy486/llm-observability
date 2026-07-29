@@ -239,13 +239,14 @@ def test_instrument_langchain_agent_convenience_requires_init():
 # ─── SpanKind Constants Unchanged ─────────────────────────────
 
 def test_span_kinds_unchanged():
-    """Phase 2.3 must not add new SpanKind values."""
+    """Phase 2.3 must not add new SpanKind values (TASK added in Phase 2.5)."""
     from llm_observability.spans import SpanKind
     assert SpanKind.AGENT == "AGENT"
     assert SpanKind.LLM == "LLM"
     assert SpanKind.TOOL == "TOOL"
     assert SpanKind.GATEWAY == "GATEWAY"
     assert SpanKind.INTERNAL == "INTERNAL"
-    # No new kinds added
+    # Phase 2.5 adds TASK SpanKind
+    assert SpanKind.TASK == "TASK"
     members = [m for m in dir(SpanKind) if not m.startswith("_")]
-    assert set(members) == {"AGENT", "LLM", "TOOL", "GATEWAY", "INTERNAL"}
+    assert set(members) == {"AGENT", "LLM", "TOOL", "GATEWAY", "INTERNAL", "TASK"}

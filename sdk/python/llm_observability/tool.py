@@ -445,6 +445,13 @@ class ToolContextManager:
 
         span.start()
 
+        # Phase 2.5: inherit association properties
+        try:
+            from .association import apply_association_to_span
+            apply_association_to_span(span)
+        except Exception:
+            pass
+
         # P0-1 fix: Activate TOOL context ONLY after all initialization succeeds.
         # If we reach this point, the span is fully initialized and ready for
         # business code. If set_context() or anything below fails, we must

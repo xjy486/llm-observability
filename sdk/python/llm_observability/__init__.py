@@ -4,6 +4,14 @@ Public API:
     Observability.init(...)   — Initialize SDK
     Observability.trace(...)  — Create a business task Trace
     Observability.tool(...)   — Create a Tool span (Phase 2.2)
+    Observability.task(...)   — Create a Task span (Phase 2.5)
+    Observability.annotate(...) — Annotate current/explicit span (Phase 2.5)
+    Observability.set_association_properties(...) / association_context(...) (Phase 2.5)
+    Observability.inject_carrier / extract_carrier (Phase 2.5)
+    Observability.track_task_client_call / track_agent_server_call (Phase 2.5)
+
+Decorators (Phase 2.5):
+    from llm_observability.decorators import agent, chain, task, tool, llm
 
 P0-1: Reporter lifecycle is auto-managed via a background thread.
 P0-2: OpenAI Instrumentor is held as a single instance for correct lifecycle.
@@ -41,6 +49,7 @@ class Observability:
     _config: Optional[Config] = None
     _initialized: bool = False
     _openai_instrumentor = None  # P0-2: single instance
+    _instrument_manager = None  # Phase 2.5: manages all instrumentors
     _lock = threading.Lock()
     _atexit_registered = False
 
@@ -53,20 +62,23 @@ class Observability:
         payload_strategy: str = "masked",
         sample_rate: float = 1.0,
         auto_instrument_openai: bool = True,
+        auto_instrument_langchain: bool = False,
         capture_retriever_content: bool = False,
+        block_instruments: Optional[set] = None,
+        max_attribute_bytes: int = 8 * 1024,
+        max_payload_bytes: int = 32 * 1024,
+        fail_open: bool = True,
     ):
         """Initialize the SDK. Idempotent — safe to call multiple times.
 
+        Phase 2.5 additions:
+            auto_instrument_langchain: Auto-instrument LangChain on init.
+            block_instruments: set of Instruments enum values to block.
+            max_attribute_bytes / max_payload_bytes: size limits.
+            fail_open: telemetry errors never block business.
+
         P0-1: Auto-starts the Reporter in a background thread.
         P0-2: Creates and holds a single OpenAIInstrumentor instance.
-
-        Args:
-            app_name: Name of the application.
-            endpoint: Observability Core URL.
-            api_key: Optional API key for auth.
-            payload_strategy: off/metadata_only/masked/full.
-            sample_rate: Sampling rate (0.0 to 1.0).
-            auto_instrument_openai: Auto-patch OpenAI SDK.
         """
         with cls._lock:
             if cls._initialized:
@@ -80,7 +92,11 @@ class Observability:
                 payload_strategy=payload_strategy,
                 sample_rate=sample_rate,
                 auto_instrument_openai=auto_instrument_openai,
+                auto_instrument_langchain=auto_instrument_langchain,
                 capture_retriever_content=capture_retriever_content,
+                max_attribute_bytes=max_attribute_bytes,
+                max_payload_bytes=max_payload_bytes,
+                fail_open=fail_open,
             )
 
             # P0-1: Reporter with api_key for auth (P1-2)
@@ -90,9 +106,18 @@ class Observability:
             # P0-1: Auto-start Reporter in background thread
             cls._reporter.start_sync()
 
-            # P0-2: Use a single instrumentor instance
+            # Phase 2.5: Unified InstrumentManager
+            from .instruments import InstrumentManager
+            cls._instrument_manager = InstrumentManager(cls._tracer)
+            cls._instrument_manager.set_blocked(block_instruments)
+
+            # P0-2: Use a single instrumentor instance via the manager
             if auto_instrument_openai:
                 cls._instrument_openai()
+
+            # Phase 2.5: Auto LangChain
+            if auto_instrument_langchain:
+                cls._instrument_langchain()
 
             cls._initialized = True
 
@@ -296,16 +321,27 @@ class Observability:
     def _instrument_openai(cls):
         """Patch OpenAI SDK for automatic LLM span creation.
 
-        P0-2: Uses a single instrumentor instance held as a class attribute.
+        P0-2: Uses the InstrumentManager (single instance, idempotent, reversible).
+        Phase 2.5: respects block_instruments.
         """
-        try:
-            from .instrumentation.openai import OpenAIInstrumentor
-            cls._openai_instrumentor = OpenAIInstrumentor()
-            cls._openai_instrumentor.instrument(tracer=cls._tracer)
-        except ImportError:
-            logger.warning("openai package not installed — skipping auto-instrumentation")
-        except Exception as e:
-            logger.error("Failed to instrument OpenAI: %s", e)
+        from .instruments import Instruments
+        if cls._instrument_manager is not None:
+            if cls._instrument_manager.is_blocked(Instruments.OPENAI.value):
+                logger.info("OpenAI instrument is blocked — skipping")
+                return
+            ok = cls._instrument_manager.instrument(Instruments.OPENAI.value)
+            if ok:
+                cls._openai_instrumentor = cls._instrument_manager.get_instrumentor(Instruments.OPENAI.value)
+
+    @classmethod
+    def _instrument_langchain(cls):
+        """Auto-instrument LangChain (Phase 2.5)."""
+        from .instruments import Instruments
+        if cls._instrument_manager is not None:
+            if cls._instrument_manager.is_blocked(Instruments.LANGCHAIN.value):
+                logger.info("LangChain instrument is blocked — skipping")
+                return
+            cls._instrument_manager.instrument(Instruments.LANGCHAIN.value)
 
     @classmethod
     def shutdown(cls):
@@ -313,18 +349,20 @@ class Observability:
 
         P0-1: Stops the Reporter background thread.
         P0-2: Uninstrument using the same instrumentor instance.
+        Phase 2.5: Uninstrument all via InstrumentManager.
         """
         with cls._lock:
             if not cls._initialized:
                 return
 
-            # P0-2: Uninstrument using the SAME instance
-            if cls._openai_instrumentor is not None:
+            # Phase 2.5: Uninstrument all instrumentors via the manager
+            if cls._instrument_manager is not None:
                 try:
-                    cls._openai_instrumentor.uninstrument()
+                    cls._instrument_manager.uninstrument_all()
                 except Exception as e:
-                    logger.error("OpenAI uninstrument error: %s", e)
-                cls._openai_instrumentor = None
+                    logger.error("Instrument uninstrument error: %s", e)
+
+            cls._openai_instrumentor = None
 
             # P0-1: Stop Reporter background thread
             if cls._reporter is not None:
@@ -336,6 +374,7 @@ class Observability:
             cls._tracer = None
             cls._reporter = None
             cls._config = None
+            cls._instrument_manager = None
             cls._initialized = False
 
             # Reset context var to prevent cross-test/cross-invocation leakage
@@ -346,7 +385,117 @@ class Observability:
             except Exception:
                 pass
 
+            # Phase 2.5: Reset association context var
+            try:
+                from .association import _ASSOCIATION_VAR
+                _ASSOCIATION_VAR.set(_ASSOCIATION_VAR.default)
+            except Exception:
+                pass
+
             logger.info("Observability SDK shutdown complete")
+
+    # ── Phase 2.5: TASK span ──
+
+    @classmethod
+    def task(
+        cls,
+        name: str,
+        task_type: str = "task",
+        input: Any = None,
+        call_id: Optional[str] = None,
+        role: Optional[str] = None,
+        attributes: Optional[dict] = None,
+    ):
+        """Create a TASK span within the current trace (Phase 2.5).
+
+        Requires an active trace.
+        """
+        if not cls._initialized or cls._tracer is None:
+            raise RuntimeError("Observability.init() must be called before task()")
+        return cls._tracer.task(
+            name=name, task_type=task_type, input=input,
+            call_id=call_id, role=role, attributes=attributes,
+        )
+
+    # ── Phase 2.5: annotate ──
+
+    @classmethod
+    def annotate(
+        cls,
+        span=None,
+        input_data=None,
+        output_data=None,
+        attributes=None,
+        tags=None,
+        error=None,
+    ):
+        """Annotate the current (or explicit) span (Phase 2.5).
+
+        Fail-open: returns False if no active span.
+        """
+        from .annotation import annotate as _annotate
+        return _annotate(
+            span=span,
+            input_data=input_data,
+            output_data=output_data,
+            attributes=attributes,
+            tags=tags,
+            error=error,
+            tracer=cls._tracer,
+        )
+
+    # ── Phase 2.5: Association Properties ──
+
+    @classmethod
+    def set_association_properties(cls, props: dict):
+        """Set association properties for the current context.
+
+        Returns a token for reset_association_properties().
+        """
+        from .association import set_association_properties as _set
+        return _set(props)
+
+    @classmethod
+    def reset_association_properties(cls, token):
+        """Reset association properties to their previous value."""
+        from .association import reset_association_properties as _reset
+        _reset(token)
+
+    @classmethod
+    def association_context(cls, **kwargs):
+        """Context manager for scoped association properties."""
+        from .association import association_context
+        return association_context(**kwargs)
+
+    # ── Phase 2.5: Distributed Tracing ──
+
+    @classmethod
+    def inject_carrier(cls, carrier=None) -> dict:
+        """Inject trace context + association into a carrier dict."""
+        from .distributed import inject_carrier as _inject
+        return _inject(carrier)
+
+    @classmethod
+    def extract_carrier(cls, carrier):
+        """Extract trace context + association from a carrier."""
+        from .distributed import extract_carrier as _extract
+        return _extract(carrier)
+
+    @classmethod
+    def track_task_client_call(cls, name: str, carrier=None):
+        """Context manager for a TASK client_call span."""
+        if not cls._initialized or cls._tracer is None:
+            raise RuntimeError("Observability.init() must be called before track_task_client_call()")
+        from .distributed import ClientCallContextManager
+        return ClientCallContextManager(cls._tracer, name, carrier)
+
+    @classmethod
+    def track_agent_server_call(cls, name: str, carrier=None):
+        """Context manager for an AGENT server_call span."""
+        if not cls._initialized or cls._tracer is None:
+            raise RuntimeError("Observability.init() must be called before track_agent_server_call()")
+        from .distributed import ServerCallContextManager
+        return ServerCallContextManager(cls._tracer, name, carrier)
 
     @classmethod
     def _atexit_handler(cls):

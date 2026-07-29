@@ -33,6 +33,7 @@ export async function fetchTraces(params: {
   model?: string
   session_id?: string
   user_id?: string
+  message_id?: string
   limit?: number
   offset?: number
   sort_by?: string

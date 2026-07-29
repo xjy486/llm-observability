@@ -57,9 +57,22 @@ function kindColor(kind: string): string {
       return 'tag-tool'
     case 'GATEWAY':
       return 'tag-gateway'
+    case 'TASK':
+      return 'tag-task'
     default:
       return 'bg-gray-100 text-gray-800'
   }
+}
+
+// Phase 2.5: Display label for span kind — TASK maps to CHAIN/TASK/CLIENT CALL
+function kindLabel(span: SpanRecord): string {
+  if (span.span_kind === 'TASK') {
+    const taskType = span.attributes?.['task.type']
+    if (taskType === 'chain') return 'CHAIN'
+    if (taskType === 'client_call') return 'CLIENT CALL'
+    return 'TASK'
+  }
+  return span.span_kind
 }
 
 // Compute relative timing for waterfall
@@ -87,7 +100,9 @@ function WaterfallBar({
             ? 'bg-orange-400'
             : span.span_kind === 'GATEWAY'
               ? 'bg-teal-400'
-              : 'bg-gray-400'
+              : span.span_kind === 'TASK'
+                ? 'bg-indigo-400'
+                : 'bg-gray-400'
 
   return (
     <div className="relative h-5 bg-gray-100 rounded">
@@ -125,7 +140,7 @@ export default function SpanTree({ spans, selectedSpanId, onSelect }: SpanTreePr
               <span className="text-gray-400 text-xs">▾</span>
             )}
             <span className={clsx('tag', kindColor(node.span.span_kind))}>
-              {node.span.span_kind}
+              {kindLabel(node.span)}
             </span>
             <span className="text-xs font-mono text-gray-700 truncate">
               {node.span.span_name}
