@@ -8,7 +8,9 @@ When no active trace exists, ALL callbacks are no-op (no orphan spans).
 All methods are fail-open: telemetry errors never propagate to business.
 """
 import logging
+import threading
 import time
+import re
 from typing import Any, Optional, Union, Sequence
 
 from ...context import get_current_context, reset_context, SpanContext
@@ -43,6 +45,7 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
     def __init__(self):
         ensure_langchain_available()
         self._registry = CallbackRunRegistry()
+        self._state_lock = threading.RLock()
         self._chain_event_counts: dict[str, int] = {}
         self._custom_event_counts: dict[str, int] = {}
         # Track span objects by span_id for event recording
@@ -61,23 +64,50 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
         return self._registry.find_parent_context(parent_run_id or "", current)
 
     def _register_span(self, span_id: str, span: Any):
-        self._spans_by_id[span_id] = span
+        with self._state_lock:
+            self._spans_by_id[span_id] = span
+        try:
+            from ...span_registry import register_span_event_sink
+            register_span_event_sink(span)
+        except Exception:
+            pass
+
+    def _unregister_span(self, span: Any):
+        if span is None:
+            return
+        try:
+            from ...span_registry import unregister_span_event_sink
+            unregister_span_event_sink(span.trace_id, span.span_id)
+        except Exception:
+            pass
 
     def _find_span_for_events(self, span_id: str) -> Optional[Any]:
-        """Find a span to record events on."""
-        # Check direct lookup
-        span = self._spans_by_id.get(span_id)
+        """Find a span or event sink to record events on."""
+        with self._state_lock:
+            span = self._spans_by_id.get(span_id)
         if span is not None:
             return span
-        # Walk parent chain in registry
+        contexts = []
+        current = get_current_context()
+        if current is not None:
+            contexts.append(current)
+        contexts.extend(state.context for state in self._registry.all_runs() if state.context)
+        try:
+            from ...span_registry import get_span_event_sink
+            for ctx in contexts:
+                if ctx.span_id == span_id:
+                    sink = get_span_event_sink(ctx.trace_id, span_id)
+                    if sink is not None:
+                        return sink
+        except Exception:
+            pass
+        # Walk parent chain in registry.
         for state in self._registry.all_runs():
             ctx = state.context
             if ctx and ctx.span_id == span_id:
-                # Return the LLM/tool span if it's this run
                 llm_span = getattr(state, '_llm_span', None)
                 if llm_span:
                     return llm_span
-        # Fallback to root span
         return self._root_span
 
     # ─── Chain callbacks (virtual runs + events) ───
@@ -199,7 +229,8 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
         **kwargs,
     ):
         try:
-            invocation_params = kwargs.get("invocation_params", {})
+            invocation_params = dict(kwargs.get("invocation_params", {}) or {})
+            invocation_params["messages"] = messages
             run_name = kwargs.get("run_name", "") or self._extract_name(serialized)
             self._start_llm_span(
                 run_id=str(run_id),
@@ -350,14 +381,43 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
             if tracer is None:
                 return
 
+            current = get_current_context()
+            if current and current.span_kind == SpanKind.TOOL:
+                state = CallbackRunState(
+                    run_id=str(run_id),
+                    parent_run_id=str(parent_run_id) if parent_run_id else None,
+                    run_type="tool",
+                    name=kwargs.get("run_name", "") or self._extract_name(serialized) or "tool",
+                    context=current,
+                    span=None,
+                    token=None,
+                    context_owner=False,
+                    virtual=True,
+                    sampled=current.sampled,
+                    first_token_seen=False,
+                    started_at=time.time(),
+                    ended=False,
+                )
+                self._registry.register(state)
+                return
+
             run_name = kwargs.get("run_name", "") or self._extract_name(serialized) or "tool"
             tool_input = inputs if inputs else input_str
 
+            call_id = (
+                kwargs.get("call_id") or kwargs.get("tool_call_id")
+                or (metadata or {}).get("call_id")
+            )
+            from .compat import LANGCHAIN_VERSION
             tool_cm = tracer.tool(
                 name=run_name,
                 tool_type="langchain",
                 input=tool_input,
+                call_id=str(call_id) if call_id else None,
                 attributes={
+                    "framework.name": "langchain",
+                    "framework.version": LANGCHAIN_VERSION,
+                    "langchain.component": "tool",
                     "langchain.callback.mode": "true",
                     "langchain.run_id": str(run_id),
                     "langchain.parent_run_id": str(parent_run_id) if parent_run_id else "",
@@ -471,16 +531,43 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
             if tracer is None:
                 return
 
+            current = get_current_context()
+            if current and current.span_kind == SpanKind.TOOL:
+                state = CallbackRunState(
+                    run_id=str(run_id),
+                    parent_run_id=str(parent_run_id) if parent_run_id else None,
+                    run_type="retriever",
+                    name=kwargs.get("run_name", "") or self._extract_name(serialized) or "retriever",
+                    context=current,
+                    span=None,
+                    token=None,
+                    context_owner=False,
+                    virtual=True,
+                    sampled=current.sampled,
+                    first_token_seen=False,
+                    started_at=time.time(),
+                    ended=False,
+                )
+                self._registry.register(state)
+                return
+
             run_name = kwargs.get("run_name", "") or self._extract_name(serialized) or "retriever"
 
+            call_id = (kwargs.get("call_id") or kwargs.get("retriever_call_id")
+                       or (metadata or {}).get("call_id"))
+            from .compat import LANGCHAIN_VERSION
             tool_cm = tracer.tool(
                 name=run_name,
                 tool_type="retriever",
                 input={"query": query},
+                call_id=str(call_id) if call_id else None,
                 attributes={
+                    "framework.name": "langchain",
+                    "framework.version": LANGCHAIN_VERSION,
                     "langchain.component": "retriever",
                     "langchain.callback.mode": "true",
                     "langchain.run_id": str(run_id),
+                    "langchain.parent_run_id": str(parent_run_id) if parent_run_id else "",
                 },
             )
             handle = tool_cm.__enter__()
@@ -528,21 +615,31 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
             state.ended = True
             handle = getattr(state, '_tool_handle', None)
 
-            # Record retriever metadata (spec §19)
+            # Record retriever metadata; document bodies are opt-in.
             if handle and documents:
                 try:
                     doc_count = len(documents)
                     handle.set_attribute("retriever.document_count", doc_count)
-                    if doc_count > 0:
-                        metadata_keys = set()
-                        total_chars = 0
-                        for doc in documents:
-                            meta = getattr(doc, "metadata", {}) or {}
-                            metadata_keys.update(meta.keys())
-                            content = getattr(doc, "page_content", "") or ""
-                            total_chars += len(content)
-                        handle.set_attribute("retriever.document_metadata_keys", list(metadata_keys)[:20])
-                        handle.set_attribute("retriever.total_content_chars", total_chars)
+                    metadata_keys = set()
+                    total_chars = 0
+                    contents = []
+                    for doc in documents:
+                        meta = getattr(doc, "metadata", {}) or {}
+                        metadata_keys.update(meta.keys())
+                        content = getattr(doc, "page_content", "") or ""
+                        total_chars += len(content)
+                        contents.append(content)
+                    handle.set_attribute("retriever.document_metadata_keys", list(metadata_keys)[:20])
+                    handle.set_attribute("retriever.total_content_chars", total_chars)
+                    tracer = getattr(__import__("llm_observability", fromlist=["Observability"]), "Observability")._tracer
+                    if getattr(getattr(tracer, "config", None), "capture_retriever_content", False):
+                        from ...tool import safe_serialize, apply_size_guard
+                        from ...utils.masking import mask_payload
+                        strategy = getattr(tracer.config, "payload_strategy", "masked")
+                        content = mask_payload(safe_serialize(contents), strategy)
+                        guarded, truncated, _ = apply_size_guard(content)
+                        if hasattr(handle, "set_output"):
+                            handle.set_output({"documents": guarded, "truncated": truncated})
                 except Exception:
                     pass
 
@@ -636,20 +733,30 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
             if parent_ctx is None:
                 return
 
-            event_name = str(name)[:MAX_CUSTOM_EVENT_NAME_LENGTH]
-            count = self._custom_event_counts.get(parent_ctx.span_id, 0)
-            if count >= MAX_CUSTOM_EVENTS_PER_SPAN:
-                logger.debug("Custom event limit reached for span %s", parent_ctx.span_id)
-                return
-            self._custom_event_counts[parent_ctx.span_id] = count + 1
+            normalized = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(name)).strip("-.")
+            event_name = f"langchain.custom.{normalized[:MAX_CUSTOM_EVENT_NAME_LENGTH - 17]}"
+            with self._state_lock:
+                count = self._custom_event_counts.get(parent_ctx.span_id, 0)
+                if count >= MAX_CUSTOM_EVENTS_PER_SPAN:
+                    logger.debug("Custom event limit reached for span %s", parent_ctx.span_id)
+                    return
+                self._custom_event_counts[parent_ctx.span_id] = count + 1
 
+            from llm_observability import Observability
+            strategy = getattr(getattr(Observability._tracer, "config", None), "payload_strategy", "masked")
+            if strategy == "off":
+                return
             from ...tool import safe_serialize, apply_size_guard
             from ...utils.masking import mask_payload
             serialized = safe_serialize(data)
-            masked = mask_payload(serialized, "masked")
+            masked = mask_payload(serialized, strategy)
             guarded, truncated, orig_size = apply_size_guard(masked, max_bytes=MAX_CUSTOM_EVENT_DATA_BYTES)
 
-            self._record_event_on_span(event_name, parent_ctx, {"langchain.data": guarded})
+            self._record_event_on_span(event_name, parent_ctx, {
+                "langchain.data": guarded,
+                "langchain.data.truncated": truncated,
+                "langchain.data.size_bytes": orig_size,
+            })
         except Exception as e:
             logger.debug("on_custom_event failed: %s", e)
 
@@ -700,9 +807,10 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
                 except Exception:
                     pass
             self._registry.clear()
-            self._chain_event_counts.clear()
-            self._custom_event_counts.clear()
-            self._spans_by_id.clear()
+            with self._state_lock:
+                self._chain_event_counts.clear()
+                self._custom_event_counts.clear()
+                self._spans_by_id.clear()
             self._root_span = None
         except Exception as e:
             logger.debug("close_open_runs failed: %s", e)
@@ -807,49 +915,38 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
             logger.debug("_start_llm_span failed: %s", e)
 
     def _finalize_llm_span(self, state: CallbackRunState, exc_type=None, exc_val=None):
-        """Finalize an LLM span: set status, end, report, reset context."""
+        """Finalize an LLM span while always restoring callback context."""
         try:
-            span = getattr(state, '_llm_span', None)
-            if span is None:
-                return
-
-            if exc_type is not None:
-                from .compat import is_langgraph_interrupt
-                if is_langgraph_interrupt(exc_val):
-                    span.set_attribute("langchain.interrupted", True)
-                else:
-                    try:
+            try:
+                span = getattr(state, "_llm_span", None)
+                if span is None:
+                    return
+                if exc_type is not None:
+                    from .compat import is_langgraph_interrupt
+                    if is_langgraph_interrupt(exc_val):
+                        span.set_attribute("langchain.interrupted", True)
+                    else:
                         span.set_error(
                             error_type=exc_type.__name__,
-                            error_message=str(exc_val) if exc_val else "",
+                            error_message=_safe_callback_error_message(exc_val),
                         )
-                    except Exception:
-                        pass
-            else:
-                if span.status != "ERROR":
+                elif span.status != "ERROR":
                     span.set_status("OK")
-
-            span.end()
-
-            # Reset context — may fail in async mode if the token was created
-            # in a different contextvars.Context (e.g. asyncio task boundary).
-            # This is safe to ignore; the parent context will be restored when
-            # the trace scope exits.
+                span.end()
+                self._unregister_span(span)
+                from llm_observability import Observability
+                tracer = Observability._tracer
+                if state.sampled and tracer:
+                    tracer.reporter.report(span.to_record())
+            except Exception:
+                logger.exception("Callback LLM finalization failed")
+        finally:
             if state.token is not None:
                 try:
                     reset_context(state.token)
                 except Exception:
-                    pass
+                    logger.debug("Callback LLM context reset failed", exc_info=True)
 
-            from llm_observability import Observability
-            tracer = Observability._tracer
-            if state.sampled and tracer:
-                try:
-                    tracer.reporter.report(span.to_record())
-                except Exception as e:
-                    logger.error("Failed to report callback LLM span: %s", e)
-        except Exception as e:
-            logger.debug("_finalize_llm_span failed: %s", e)
 
     def _extract_name(self, serialized: Optional[dict]) -> str:
         try:
@@ -889,18 +986,16 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
             if not parent_span_id:
                 return
 
-            count = self._chain_event_counts.get(parent_span_id, 0)
-            if count >= MAX_CHAIN_EVENTS_PER_SPAN:
-                logger.debug("Chain event limit reached for span %s", parent_span_id)
-                # Record truncation event once
-                if count == MAX_CHAIN_EVENTS_PER_SPAN:
+            with self._state_lock:
+                count = self._chain_event_counts.get(parent_span_id, 0)
+                if count >= MAX_CHAIN_EVENTS_PER_SPAN:
+                    self._chain_event_counts[parent_span_id] = count + 1
                     span = self._find_span_for_events(parent_span_id)
                     if span:
                         span.set_attribute("langchain.events.truncated", True)
-                        span.set_attribute("langchain.events.dropped_count", 1)
+                        span.set_attribute("langchain.events.dropped_count", count - MAX_CHAIN_EVENTS_PER_SPAN + 1)
+                    return
                 self._chain_event_counts[parent_span_id] = count + 1
-                return
-            self._chain_event_counts[parent_span_id] = count + 1
 
             span = self._find_span_for_events(parent_span_id)
             if span is not None:
@@ -922,3 +1017,10 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
                 span.add_event(event_name, time.time(), attributes)
         except Exception as e:
             logger.debug("_record_event_on_span failed: %s", e)
+
+
+def _safe_callback_error_message(error: BaseException) -> str:
+    try:
+        return str(error)
+    except Exception:
+        return "<error message unavailable>"

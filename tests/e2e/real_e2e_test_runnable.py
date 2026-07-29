@@ -30,7 +30,10 @@ sys.path.insert(0, str(ROOT / "proxy"))
 sys.path.insert(0, str(ROOT / "core"))
 
 # ─── Config ───────────────────────────────────────────────────
-AGNES_API_KEY = os.getenv("AGNES_API_KEY", "sk-uwIowNLMNrjJHG2vjeT5m6tDj98gZgiSEYRhGhnJALYfqMUj")
+AGNES_API_KEY = os.getenv("AGNES_API_KEY")
+if not AGNES_API_KEY:
+    print("AGNES_API_KEY is not set")
+    sys.exit(1)
 AGNES_BASE_URL = "https://apihub.agnes-ai.com"
 AGNES_MODEL = "agnes-2.0-flash"
 

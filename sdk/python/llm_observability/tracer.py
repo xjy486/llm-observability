@@ -88,6 +88,11 @@ class TraceContextManager:
             business_scene=self._business_scene,
         )
         self._span.start()
+        try:
+            from .span_registry import register_span_event_sink
+            register_span_event_sink(self._span)
+        except Exception:
+            pass
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -130,6 +135,12 @@ class TraceContextManager:
             except Exception:
                 logger.exception("AGENT instrumentation finalization failed")
         finally:
+            try:
+                if self._span is not None:
+                    from .span_registry import unregister_span_event_sink
+                    unregister_span_event_sink(self._span.trace_id, self._span.span_id)
+            except Exception:
+                pass
             # Blocker 2: Context MUST be restored even if any step above throws.
             if self._token is not None:
                 reset_context(self._token)

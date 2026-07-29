@@ -14,6 +14,7 @@ class Config:
         payload_strategy: Payload collection strategy — off/metadata_only/masked/full.
         sample_rate: Sampling rate between 0.0 and 1.0.
         auto_instrument_openai: Whether to auto-patch OpenAI SDK on init.
+        capture_retriever_content: Whether to capture retriever document bodies.
     """
     app_name: str = "unknown"
     endpoint: str = "http://localhost:8001"
@@ -21,3 +22,4 @@ class Config:
     payload_strategy: str = "masked"
     sample_rate: float = 1.0
     auto_instrument_openai: bool = True
+    capture_retriever_content: bool = False

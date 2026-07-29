@@ -5,14 +5,17 @@ Injects LangChainObservabilityCallbackHandler into the config.
 
 Spec §4-6: One invocation = one AGENT Trace.
 """
+import copy
+import inspect
 import logging
 import time
-from typing import Any, Optional
+from typing import Any, Optional, Callable, Union
 
 from ...context import get_current_context
 from .compat import ensure_langchain_available
 from .callback_handler import LangChainObservabilityCallbackHandler
 from .runnable_metadata import capture_root_payload
+from .stream_accumulator import BoundedStreamAccumulator
 
 logger = logging.getLogger("llm_obs.integrations.langchain.runnable_wrapper")
 
@@ -23,6 +26,9 @@ def observe_runnable(
     runnable: Any,
     name: str = "runnable",
     root_mode: str = "auto",
+    session_id: Optional[Union[str, Callable]] = None,
+    user_id: Optional[Union[str, Callable]] = None,
+    business_scene: Optional[Union[str, Callable]] = None,
 ) -> "ObservedLangChainRunnable":
     """Wrap a LangChain Runnable with observability.
 
@@ -52,6 +58,9 @@ def observe_runnable(
         runnable=runnable,
         name=name,
         root_mode=root_mode,
+        session_id=session_id,
+        user_id=user_id,
+        business_scene=business_scene,
     )
 
 
@@ -73,37 +82,72 @@ def _inject_callback_handler(
 
     if existing is None:
         config["callbacks"] = [handler]
-    elif isinstance(existing, list):
-        for cb in existing:
-            if cb is handler:
-                config["callbacks"] = existing
-                break
-        else:
-            config["callbacks"] = existing + [handler]
-    else:
-        # CallbackManager or other
+    elif isinstance(existing, (list, tuple)):
+        callbacks = list(existing)
+        if not any(cb is handler for cb in callbacks):
+            callbacks.append(handler)
+        config["callbacks"] = callbacks
+    elif hasattr(existing, "handlers"):
         try:
-            if hasattr(existing, "add_handler"):
-                handlers = getattr(existing, "handlers", [])
-                if handler not in handlers:
-                    existing.add_handler(handler)
-                config["callbacks"] = existing
-            else:
-                config["callbacks"] = [existing, handler]
-        except Exception:
-            config["callbacks"] = [handler]
+            config["callbacks"] = _copy_callback_manager(existing, handler)
+        except Exception as exc:
+            # Never mutate or discard user callbacks when a version-specific
+            # CallbackManager cannot be copied safely.
+            logger.warning("Could not isolate LangChain CallbackManager; skipping observability callback: %s", exc)
+            config["callbacks"] = existing
+    else:
+        config["callbacks"] = [existing, handler]
 
     return config
+
+
+def _copy_callback_manager(existing: Any, handler: Any) -> Any:
+    """Clone a CallbackManager without changing its user-owned state."""
+    manager_cls = type(existing)
+    names = (
+        "handlers", "inheritable_handlers", "parent_run_id", "tags",
+        "inheritable_tags", "metadata", "inheritable_metadata",
+    )
+    values = {
+        "handlers": list(getattr(existing, "handlers", []) or []),
+        "inheritable_handlers": list(getattr(existing, "inheritable_handlers", []) or []),
+        "parent_run_id": getattr(existing, "parent_run_id", None),
+        "tags": list(getattr(existing, "tags", []) or []),
+        "inheritable_tags": list(getattr(existing, "inheritable_tags", []) or []),
+        "metadata": dict(getattr(existing, "metadata", {}) or {}),
+        "inheritable_metadata": dict(getattr(existing, "inheritable_metadata", {}) or {}),
+    }
+    try:
+        parameters = inspect.signature(manager_cls).parameters
+        kwargs = {name: values[name] for name in names if name in parameters}
+        cloned = manager_cls(**kwargs)
+    except Exception:
+        # A shallow copy is still safe when every mutable callback collection
+        # is replaced before the clone is returned.
+        cloned = copy.copy(existing)
+        for name in names:
+            if hasattr(existing, name):
+                value = values[name]
+                setattr(cloned, name, value)
+    handlers = list(getattr(cloned, "handlers", []) or [])
+    if not any(cb is handler for cb in handlers):
+        handlers.append(handler)
+    cloned.handlers = handlers
+    return cloned
 
 
 class _RunnableScope:
     """Context manager that creates/reuses an AGENT Root Trace."""
 
-    def __init__(self, name, root_mode, config=None, input=None):
+    def __init__(self, name, root_mode, config=None, input=None,
+                 session_id=None, user_id=None, business_scene=None):
         self._name = name
         self._root_mode = root_mode
         self._config = config
         self._input = input
+        self._session_id = session_id
+        self._user_id = user_id
+        self._business_scene = business_scene
         self._trace_cm = None
         self._created_trace = False
         self._existing_ctx = None
@@ -135,8 +179,19 @@ class _RunnableScope:
             self._existing_ctx = current
             return self
 
-        # Create new trace
-        self._trace_cm = Observability.trace(name=self._name)
+        # Create new trace with fail-closed identity mapping.
+        from .agent_wrapper import (
+            _resolve_session_id, _resolve_user_id, _resolve_business_scene,
+        )
+        session_id = _resolve_session_id(self._session_id, self._input, self._config)
+        user_id = _resolve_user_id(self._user_id, self._input, self._config)
+        business_scene = _resolve_business_scene(self._business_scene, self._input, self._config)
+        self._trace_cm = Observability.trace(
+            name=self._name,
+            session_id=session_id,
+            user_id=user_id,
+            business_scene=business_scene,
+        )
         self._trace_cm.__enter__()
         self._created_trace = True
 
@@ -235,10 +290,16 @@ class ObservedLangChainRunnable:
         runnable: Any,
         name: str = "runnable",
         root_mode: str = "auto",
+        session_id=None,
+        user_id=None,
+        business_scene=None,
     ):
         self._runnable = runnable
         self._name = name
         self._root_mode = root_mode
+        self._session_id = session_id
+        self._user_id = user_id
+        self._business_scene = business_scene
 
     def _create_handler(self) -> LangChainObservabilityCallbackHandler:
         """Create a fresh handler for each invocation (spec §6)."""
@@ -253,7 +314,11 @@ class ObservedLangChainRunnable:
         handler = self._create_handler()
         prepared_config = self._prepare_config(config, handler)
 
-        scope = _RunnableScope(self._name, self._root_mode, config=prepared_config, input=input)
+        scope = _RunnableScope(
+            self._name, self._root_mode, config=prepared_config, input=input,
+            session_id=self._session_id, user_id=self._user_id,
+            business_scene=self._business_scene,
+        )
         with scope:
             scope.bind_handler(handler)
             try:
@@ -268,7 +333,11 @@ class ObservedLangChainRunnable:
         handler = self._create_handler()
         prepared_config = self._prepare_config(config, handler)
 
-        scope = _RunnableScope(self._name, self._root_mode, config=prepared_config, input=input)
+        scope = _RunnableScope(
+            self._name, self._root_mode, config=prepared_config, input=input,
+            session_id=self._session_id, user_id=self._user_id,
+            business_scene=self._business_scene,
+        )
         with scope:
             scope.bind_handler(handler)
             try:
@@ -284,18 +353,20 @@ class ObservedLangChainRunnable:
         prepared_config = self._prepare_config(config, handler)
 
         def _generator():
-            scope = _RunnableScope(self._name, self._root_mode, config=prepared_config, input=input)
+            scope = _RunnableScope(
+                self._name, self._root_mode, config=prepared_config, input=input,
+                session_id=self._session_id, user_id=self._user_id,
+                business_scene=self._business_scene,
+            )
             with scope:
                 scope.bind_handler(handler)
-                collected = []
+                accumulator = BoundedStreamAccumulator()
                 try:
                     for item in self._runnable.stream(input, config=prepared_config, **kwargs):
-                        collected.append(item)
+                        accumulator.append(item)
                         yield item
-                    if collected:
-                        scope.set_root_output(collected[-1] if len(collected) == 1 else collected)
-                except GeneratorExit:
-                    raise
+                    if accumulator.count:
+                        scope.set_root_output(accumulator.finalize())
                 finally:
                     handler.close_open_runs(reason="stream_exit")
 
@@ -306,18 +377,20 @@ class ObservedLangChainRunnable:
         handler = self._create_handler()
         prepared_config = self._prepare_config(config, handler)
 
-        scope = _RunnableScope(self._name, self._root_mode, config=prepared_config, input=input)
+        scope = _RunnableScope(
+            self._name, self._root_mode, config=prepared_config, input=input,
+            session_id=self._session_id, user_id=self._user_id,
+            business_scene=self._business_scene,
+        )
         with scope:
             scope.bind_handler(handler)
-            collected = []
+            accumulator = BoundedStreamAccumulator()
             try:
                 async for item in self._runnable.astream(input, config=prepared_config, **kwargs):
-                    collected.append(item)
+                    accumulator.append(item)
                     yield item
-                if collected:
-                    scope.set_root_output(collected[-1] if len(collected) == 1 else collected)
-            except GeneratorExit:
-                raise
+                if accumulator.count:
+                    scope.set_root_output(accumulator.finalize())
             finally:
                 handler.close_open_runs(reason="astream_exit")
 

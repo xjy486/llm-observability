@@ -53,6 +53,7 @@ class Observability:
         payload_strategy: str = "masked",
         sample_rate: float = 1.0,
         auto_instrument_openai: bool = True,
+        capture_retriever_content: bool = False,
     ):
         """Initialize the SDK. Idempotent — safe to call multiple times.
 
@@ -79,6 +80,7 @@ class Observability:
                 payload_strategy=payload_strategy,
                 sample_rate=sample_rate,
                 auto_instrument_openai=auto_instrument_openai,
+                capture_retriever_content=capture_retriever_content,
             )
 
             # P0-1: Reporter with api_key for auth (P1-2)
@@ -269,7 +271,10 @@ class Observability:
         )
 
     @classmethod
-    def observe_runnable(cls, runnable, name="runnable", root_mode="auto"):
+    def observe_runnable(
+        cls, runnable, name="runnable", root_mode="auto",
+        session_id=None, user_id=None, business_scene=None,
+    ):
         """Wrap a LangChain Runnable with observability (Phase 2.4).
 
         Convenience method that calls observe_runnable() under the hood.
@@ -278,7 +283,14 @@ class Observability:
         if not cls._initialized or cls._tracer is None:
             raise RuntimeError("Observability.init() must be called before observe_runnable()")
         from .integrations.langchain.runnable_wrapper import observe_runnable
-        return observe_runnable(runnable, name=name, root_mode=root_mode)
+        return observe_runnable(
+            runnable,
+            name=name,
+            root_mode=root_mode,
+            session_id=session_id,
+            user_id=user_id,
+            business_scene=business_scene,
+        )
 
     @classmethod
     def _instrument_openai(cls):

@@ -877,7 +877,7 @@ def main():
     print("=" * 70)
     print("Real E2E Test: SDK → Proxy → Core → Agnes 2.0 Flash")
     print("=" * 70)
-    print(f"  API Key: {AGNES_API_KEY[:10]}...{AGNES_API_KEY[-4:]}")
+    print("  API Key: configured")
     print(f"  Model:   {AGNES_MODEL}")
     print(f"  Base URL: {AGNES_BASE_URL}")
 
