@@ -65,7 +65,7 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
 
     def _register_span(self, span_id: str, span: Any):
         with self._state_lock:
-            self._spans_by_id[span_id] = span
+            self._spans_by_id[str(span_id)] = span
         try:
             from ...span_registry import register_span_event_sink
             register_span_event_sink(span)
@@ -75,6 +75,8 @@ class LangChainObservabilityCallbackHandler(BaseCallbackHandler if BaseCallbackH
     def _unregister_span(self, span: Any):
         if span is None:
             return
+        with self._state_lock:
+            self._spans_by_id.pop(str(span.span_id), None)
         try:
             from ...span_registry import unregister_span_event_sink
             unregister_span_event_sink(span.trace_id, span.span_id)

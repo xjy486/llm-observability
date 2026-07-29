@@ -186,7 +186,7 @@ def run_e2e_tests(svc: ServiceManager):
     from langchain_core.messages import HumanMessage
     from langchain_core.prompts import ChatPromptTemplate
     from langchain_core.output_parsers import StrOutputParser
-    from langchain_core.runnables import RunnableLambda
+    from langchain_core.runnables import RunnableConfig, RunnableLambda
     from langchain_openai import ChatOpenAI
     from llm_observability import Observability
     from llm_observability.integrations.langchain.runnable_wrapper import observe_runnable
@@ -357,10 +357,10 @@ def run_e2e_tests(svc: ServiceManager):
     check("User got llm_start callback", "llm_start" in user_calls, f"calls={user_calls}")
 
     # ═════════════════════════════════════════════════════════
-    # Scenario 5: Runnable with tool (nested TOOL → LLM → GATEWAY)
+    # Scenario 5: Runnable with tool (sibling TOOL + LLM → GATEWAY)
     # ═════════════════════════════════════════════════════════
     print("\n" + "=" * 70)
-    print("Scenario 5: observe_runnable with tool (nested LLM)")
+    print("Scenario 5: observe_runnable with tool (sibling)")
     print("=" * 70)
 
     from langchain_core.tools import tool
@@ -410,7 +410,52 @@ def run_e2e_tests(svc: ServiceManager):
         check("Tool-runnable LLM==GATEWAY (no dup)", len(llm5) == len(gw5), f"llm={len(llm5)}, gw={len(gw5)}")
         if tool5 and llm5:
             check("TOOL and LLM share trace", tool5[0]["trace_id"] == llm5[0]["trace_id"])
-            check("LLM is not nested under TOOL", llm5[0]["parent_span_id"] != tool5[0]["span_id"])
+            check("LLM is sibling of TOOL", llm5[0]["parent_span_id"] == agent5[0]["span_id"] if agent5 else False)
+
+    # ═════════════════════════════════════════════════════════
+    # Scenario 5b: Nested Tool that calls Model (TOOL → LLM → GATEWAY)
+    # ═════════════════════════════════════════════════════════
+    print("\n" + "=" * 70)
+    print("Scenario 5b: observe_runnable with nested TOOL→LLM")
+    print("=" * 70)
+
+    nested_model = ChatOpenAI(
+        model=AGNES_MODEL,
+        api_key=AGNES_API_KEY,
+        base_url=svc.proxy_url + "/v1",
+        temperature=0,
+    )
+
+    @tool
+    def model_tool(query: str, config: RunnableConfig) -> str:
+        """Invoke a nested model inside a tool."""
+        return nested_model.invoke([HumanMessage(content=query)], config=config).content
+
+    chain5b = observe_runnable(model_tool, name="nested-tool-runnable")
+    result5b = chain5b.invoke("Reply with just the number 42.")
+    check("Nested tool runnable completed", bool(result5b), f"result={result5b!r}")
+
+    trace5b, detail5b = verify_trace(svc, "nested-tool-runnable")
+    check("Scenario 5b trace found", trace5b is not None)
+
+    if detail5b:
+        spans5b = detail5b.get("spans", [])
+        agent5b = [s for s in spans5b if s["span_kind"] == "AGENT"]
+        llm5b = [s for s in spans5b if s["span_kind"] == "LLM"]
+        gw5b = [s for s in spans5b if s["span_kind"] == "GATEWAY"]
+        tool5b = [
+            s for s in spans5b
+            if s["span_kind"] == "TOOL"
+            and s.get("attributes", {}).get("langchain.component") == "tool"
+        ]
+        check("Nested tool-runnable has AGENT", len(agent5b) >= 1, f"count={len(agent5b)}")
+        check("Nested tool-runnable has TOOL", len(tool5b) == 1, f"count={len(tool5b)}")
+        check("Nested tool-runnable has LLM", len(llm5b) >= 1, f"count={len(llm5b)}")
+        check("Nested tool-runnable LLM==GATEWAY", len(llm5b) == len(gw5b), f"llm={len(llm5b)}, gw={len(gw5b)}")
+        if tool5b and llm5b and agent5b:
+            check("TOOL parent is AGENT", tool5b[0]["parent_span_id"] == agent5b[0]["span_id"])
+            check("LLM parent is TOOL", llm5b[0]["parent_span_id"] == tool5b[0]["span_id"])
+            check("GATEWAY parent is LLM", gw5b[0]["parent_span_id"] == llm5b[0]["span_id"])
 
     # ═════════════════════════════════════════════════════════
     # Scenario 6: Async streaming with early close

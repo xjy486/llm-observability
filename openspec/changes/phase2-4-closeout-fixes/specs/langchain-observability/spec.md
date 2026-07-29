@@ -18,19 +18,25 @@ When a Runnable receives a user-owned `CallbackManager`, the wrapper MUST clone 
 - **THEN** the observability callback receives the child lifecycle events
 - **AND** the original manager remains unchanged
 
-### Requirement: Callback-created event sinks have bounded lifetimes
+### Requirement: Callback-created event sinks and local references have bounded lifetimes
 
-Tool, Retriever, and LLM callback spans MUST unregister their global event sinks after success, error, span-end failure, or forced handler cleanup.
+Tool, Retriever, and LLM callback spans MUST remove both the local `_spans_by_id` reference and the global event sink after success, error, span-end failure, or forced handler cleanup. A long-lived manual handler reused across traces MUST NOT accumulate ended span references.
 
 #### Scenario: Normal and error cleanup
 
-- **WHEN** a Tool or Retriever callback completes or errors
-- **THEN** its event sink is absent from the global sink registry
+- **WHEN** a Tool, Retriever, or LLM callback completes or errors
+- **THEN** its span is absent from the handler's local `_spans_by_id` map
+- **AND** its event sink is absent from the global sink registry
 
 #### Scenario: Forced cleanup and LLM end failure
 
 - **WHEN** a handler closes an unfinished run or an LLM span end raises
-- **THEN** the corresponding event sink is still removed
+- **THEN** the local span reference and global event sink are both removed
+
+#### Scenario: Manual handler reuse
+
+- **WHEN** a long-lived manual handler is reused across multiple traces
+- **THEN** `len(handler._spans_by_id)` is `0` after each trace completes
 
 ### Requirement: Async callback finalization restores the parent context
 

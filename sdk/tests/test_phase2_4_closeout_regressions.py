@@ -304,3 +304,66 @@ async def test_astream_early_aclose_restores_context(init_sdk):
     await stream.__anext__()
     await stream.aclose()
     assert get_current_context() is None
+
+
+def test_tool_local_span_reference_removed_after_end(init_sdk):
+    handler = LangChainObservabilityCallbackHandler()
+    with Observability.trace(name="tool-local-end"):
+        handler.on_tool_start({"name": "tool"}, "input", "tool-local-end")
+        span = handler._registry.get("tool-local-end").span._span
+        assert str(span.span_id) in handler._spans_by_id
+        handler.on_tool_end("output", "tool-local-end")
+        assert str(span.span_id) not in handler._spans_by_id
+        assert _sink_for(span) is None
+
+
+def test_retriever_local_span_reference_removed_after_end(init_sdk):
+    handler = LangChainObservabilityCallbackHandler()
+    with Observability.trace(name="retriever-local-end"):
+        handler.on_retriever_start({"name": "retriever"}, "query", "retriever-local-end")
+        span = handler._registry.get("retriever-local-end").span._span
+        handler.on_retriever_end([], "retriever-local-end")
+        assert str(span.span_id) not in handler._spans_by_id
+        assert _sink_for(span) is None
+
+
+def test_llm_local_span_reference_removed_after_end(init_sdk):
+    handler = LangChainObservabilityCallbackHandler()
+    with Observability.trace(name="llm-local-end"):
+        handler.on_chat_model_start(
+            {"name": "model"}, [[HumanMessage(content="hello")]], "llm-local-end"
+        )
+        span = handler._registry.get("llm-local-end")._llm_span
+        handler.on_llm_end(None, "llm-local-end")
+        assert str(span.span_id) not in handler._spans_by_id
+        assert _sink_for(span) is None
+
+
+def test_manual_callback_handler_reuse_has_bounded_span_map(init_sdk):
+    handler = LangChainObservabilityCallbackHandler()
+    for i in range(3):
+        run_id = f"reuse-llm-{i}"
+        with Observability.trace(name=f"reuse-trace-{i}"):
+            handler.on_chat_model_start(
+                {"name": "model"}, [[HumanMessage(content="hello")]], run_id
+            )
+            handler.on_llm_end(None, run_id)
+    assert len(handler._spans_by_id) == 0
+
+
+def test_span_end_failure_removes_local_and_global_reference(init_sdk):
+    handler = LangChainObservabilityCallbackHandler()
+    with Observability.trace(name="llm-end-failure-local"):
+        handler.on_chat_model_start(
+            {"name": "model"}, [[HumanMessage(content="hello")]], "llm-end-failure-local"
+        )
+        state = handler._registry.get("llm-end-failure-local")
+        span = state._llm_span
+
+        def fail_end():
+            raise RuntimeError("end failed")
+
+        span.end = fail_end
+        handler.on_llm_end(None, "llm-end-failure-local")
+        assert str(span.span_id) not in handler._spans_by_id
+        assert _sink_for(span) is None
