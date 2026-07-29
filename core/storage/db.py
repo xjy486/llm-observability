@@ -474,7 +474,7 @@ class Storage:
                 SUM(CASE WHEN s.span_kind = 'LLM' THEN 1 ELSE 0 END) as llm_call_count,
                 SUM(CASE WHEN s.span_kind = 'TOOL' THEN 1 ELSE 0 END) as tool_call_count,
                 SUM(CASE WHEN s.span_kind = 'TASK' THEN 1 ELSE 0 END) as task_count,
-                SUM(CASE WHEN s.span_kind = 'TASK' AND s.attributes LIKE '%"task.type":"chain"%' THEN 1 ELSE 0 END) as chain_count,
+                SUM(CASE WHEN s.span_kind = 'TASK' AND json_extract(s.attributes, '$."task.type"') = 'chain' THEN 1 ELSE 0 END) as chain_count,
                 SUM(CASE WHEN s.span_kind = 'LLM' THEN COALESCE(s.input_tokens, 0) ELSE 0 END) as input_tokens,
                 SUM(CASE WHEN s.span_kind = 'LLM' THEN COALESCE(s.output_tokens, 0) ELSE 0 END) as output_tokens,
                 SUM(CASE WHEN s.span_kind = 'LLM' THEN COALESCE(s.total_tokens, 0) ELSE 0 END) as total_tokens,

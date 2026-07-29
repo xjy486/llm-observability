@@ -116,8 +116,37 @@ def resolve_trace_context(headers: dict) -> TraceContext:
 
 
 def extract_metadata_headers(headers: dict) -> dict:
-    """Extract session_id, user_id, and other metadata from custom headers."""
+    """Extract session_id, user_id, and other metadata from custom headers.
+
+    Phase 2.5 (P0-5): also parses the W3C `baggage` header for Association
+    Properties (user/session_id/message_id/business_scenario) so the Gateway
+    span inherits them. Compat headers (X-*) take precedence over baggage.
+    """
     meta = {}
+    # First, parse baggage (lowest priority — compat headers override below)
+    baggage = None
+    for k, v in headers.items():
+        if k.lower() == "baggage":
+            baggage = v
+            break
+    if baggage:
+        try:
+            for pair in str(baggage).split(","):
+                if "=" in pair:
+                    bk, bv = pair.split("=", 1)
+                    bk = bk.strip()
+                    bv = bv.strip()
+                    if bk == "user" and "user_id" not in meta:
+                        meta["user_id"] = bv
+                    elif bk == "session_id" and "session_id" not in meta:
+                        meta["session_id"] = bv
+                    elif bk == "message_id" and "message_id" not in meta:
+                        meta["message_id"] = bv
+                    elif bk == "business_scenario" and "business_scene" not in meta:
+                        meta["business_scene"] = bv
+        except Exception:
+            pass
+
     for k, v in headers.items():
         kl = k.lower()
         if kl == "x-session-id":

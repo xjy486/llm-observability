@@ -153,6 +153,13 @@ class TaskContextManager:
         except Exception:
             pass
 
+        # P0-6: register event sink so annotate() can resolve the active TASK span
+        try:
+            from .span_registry import register_span_event_sink
+            register_span_event_sink(span)
+        except Exception:
+            pass
+
         ctx = SpanContext(
             trace_id=current.trace_id,
             span_id=span_id,
@@ -209,16 +216,29 @@ class TaskContextManager:
             self._span.end()
 
             if self._sampled:
-                self._process_output()
-                self._set_request_metadata()
+                # P0-7: output processing must not prevent reporting on failure
+                try:
+                    self._process_output()
+                except Exception:
+                    logger.debug("TASK output processing failed", exc_info=True)
+                try:
+                    self._set_request_metadata()
+                except Exception:
+                    logger.debug("TASK request_metadata failed", exc_info=True)
 
-            current = get_current_context()
-            if current and current.sampled:
+            # Use the captured sampled decision (context may differ after reset)
+            if self._sampled:
                 try:
                     self._tracer.reporter.report(self._span.to_record())
                 except Exception as e:
                     logger.error("Failed to report TASK span: %s", e)
         finally:
+            # P0-6: unregister event sink
+            try:
+                from .span_registry import unregister_span_event_sink
+                unregister_span_event_sink(self._span.trace_id, self._span.span_id)
+            except Exception:
+                pass
             if self._token is not None:
                 reset_context(self._token)
         return False

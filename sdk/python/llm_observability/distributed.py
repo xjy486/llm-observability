@@ -13,9 +13,14 @@ Compat headers (read-only): X-Session-Id, X-User-Id, X-App-Name, X-Business-Scen
 
 Carrier only carries Trace Context + Association metadata — never Prompt,
 Response, API Key, or full Tool Output.
+
+P1-5: inject_carrier mutates the provided carrier IN PLACE and returns the
+same object (``returned is carrier``). Baggage values are W3C percent-encoded
+(handles comma/equals/space/Unicode/control chars).
 """
 import logging
 from typing import Any, Optional, Union
+from urllib.parse import quote, unquote
 
 from .context import (
     SpanContext, get_current_context, set_context, reset_context,
@@ -32,16 +37,30 @@ from .association import (
 logger = logging.getLogger("llm_obs.distributed")
 
 
+def _encode_baggage_value(value: str) -> str:
+    """W3C baggage percent-encoding for a value.
+
+    Encodes commas, equals, spaces, and non-token characters so the baggage
+    header remains parseable. Control characters are also encoded.
+    """
+    if value is None:
+        return ""
+    # quote with safe='' encodes everything except alphanumerics and _.-~
+    # We also encode ',' and '=' (reserved baggage delimiters).
+    return quote(str(value), safe="")
+
+
 def inject_carrier(carrier: Optional[dict] = None) -> dict:
     """Inject trace context + association metadata into a carrier dict.
 
-    Returns a new dict (or updates the provided one). Only trace context
-    and association metadata are included — never payload or secrets.
+    P1-5: Mutates the provided carrier IN PLACE and returns the SAME object
+    (``returned is carrier``). If carrier is None, a new dict is created.
+    Only trace context and association metadata are included — never payload
+    or secrets. Baggage values are W3C percent-encoded.
     """
     if carrier is None:
         carrier = {}
-    else:
-        carrier = dict(carrier)
+    # P1-5: mutate in place (do NOT copy)
 
     ctx = get_current_context()
     if ctx is not None:
@@ -65,6 +84,7 @@ def inject_carrier(carrier: Optional[dict] = None) -> dict:
     session_id = assoc.session_id
     business_scenario = assoc.business_scenario
     message_id = assoc.message_id
+    app_name = None
 
     if active_span is not None:
         if user is None and getattr(active_span, "user_id", None) is not None:
@@ -75,22 +95,36 @@ def inject_carrier(carrier: Optional[dict] = None) -> dict:
             business_scenario = active_span.business_scene
         if message_id is None and getattr(active_span, "message_id", None) is not None:
             message_id = active_span.message_id
+        if getattr(active_span, "app_name", None) is not None:
+            app_name = active_span.app_name
 
-    baggage_parts = []
+    # Compat headers (plain, unencoded — HTTP header values)
     if user is not None:
         carrier["X-User-Id"] = user
-        baggage_parts.append(f"user={user}")
     if session_id is not None:
         carrier["X-Session-Id"] = session_id
-        baggage_parts.append(f"session_id={session_id}")
     if business_scenario is not None:
         carrier["X-Business-Scene"] = business_scenario
-        baggage_parts.append(f"business_scenario={business_scenario}")
+    if app_name is not None:
+        carrier["X-App-Name"] = app_name
+
+    # W3C baggage (percent-encoded values)
+    baggage_parts = []
+    if user is not None:
+        baggage_parts.append(f"user={_encode_baggage_value(user)}")
+    if session_id is not None:
+        baggage_parts.append(f"session_id={_encode_baggage_value(session_id)}")
+    if business_scenario is not None:
+        baggage_parts.append(f"business_scenario={_encode_baggage_value(business_scenario)}")
     if message_id is not None:
-        baggage_parts.append(f"message_id={message_id}")
+        baggage_parts.append(f"message_id={_encode_baggage_value(message_id)}")
+    if app_name is not None:
+        baggage_parts.append(f"app_name={_encode_baggage_value(app_name)}")
 
     if baggage_parts:
         carrier["baggage"] = ",".join(baggage_parts)
+    elif "baggage" in carrier:
+        del carrier["baggage"]
 
     return carrier
 
@@ -163,12 +197,13 @@ def extract_carrier(carrier: dict) -> Optional[ExtractedContext]:
     if baggage:
         try:
             for pair in str(baggage).split(","):
+                pair = pair.strip()
                 if "=" in pair:
                     k, v = pair.split("=", 1)
                     k = k.strip()
-                    v = v.strip()
+                    v = unquote(v.strip())  # P1-5: decode percent-encoded baggage
                     canonical = ALIASES.get(k, k)
-                    if canonical in ("user", "session_id", "message_id", "business_scenario"):
+                    if canonical in ("user", "session_id", "message_id", "business_scenario", "app_name"):
                         assoc[canonical] = _sanitize_value(v)
         except Exception:
             pass
@@ -178,6 +213,7 @@ def extract_carrier(carrier: dict) -> Optional[ExtractedContext]:
         "x-user-id": "user",
         "x-session-id": "session_id",
         "x-business-scene": "business_scenario",
+        "x-app-name": "app_name",
     }
     for header, canonical in compat_map.items():
         val = lower_items.get(header)
@@ -276,12 +312,18 @@ class ServerCallContextManager:
         self._created_trace = False
 
     def _build_context(self) -> tuple[Optional[str], Optional[str], bool, dict]:
-        """Return (trace_id, parent_span_id, sampled, association_dict)."""
+        """Return (trace_id, parent_span_id, sampled, association_dict).
+
+        P0-2: legal remote trace_flags → inherit sampled; no valid carrier →
+        use the local sample_rate.
+        """
         extracted = extract_carrier(self._carrier) if self._carrier is not None else None
         if extracted is not None:
             return extracted.trace_id, extracted.parent_span_id, extracted.sampled, extracted.association
-        # No valid carrier — create a new trace
-        return generate_trace_id(), None, True, {}
+        # No valid carrier — create a new trace, sampling per local config
+        import random
+        sampled = random.random() < self._tracer.config.sample_rate
+        return generate_trace_id(), None, sampled, {}
 
     def __enter__(self):
         trace_id, parent_span_id, sampled, assoc = self._build_context()

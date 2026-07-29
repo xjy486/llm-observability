@@ -85,6 +85,18 @@ class Observability:
                 logger.warning("Observability.init() already called — skipping (idempotent)")
                 return
 
+            # P1-1: validate config ranges
+            if not (1024 <= max_attribute_bytes <= 128 * 1024):
+                raise ValueError(
+                    f"max_attribute_bytes must be between 1 KiB and 128 KiB, got {max_attribute_bytes}"
+                )
+            if max_payload_bytes < 1024:
+                raise ValueError(
+                    f"max_payload_bytes must be >= 1 KiB, got {max_payload_bytes}"
+                )
+            if not (0.0 <= sample_rate <= 1.0):
+                raise ValueError(f"sample_rate must be between 0.0 and 1.0, got {sample_rate}")
+
             cls._config = Config(
                 app_name=app_name,
                 endpoint=endpoint,
@@ -385,10 +397,10 @@ class Observability:
             except Exception:
                 pass
 
-            # Phase 2.5: Reset association context var
+            # Phase 2.5: Reset association context var (P1-3)
             try:
-                from .association import _ASSOCIATION_VAR
-                _ASSOCIATION_VAR.set(_ASSOCIATION_VAR.default)
+                from .association import clear_association_properties
+                clear_association_properties()
             except Exception:
                 pass
 

@@ -452,6 +452,13 @@ class ToolContextManager:
         except Exception:
             pass
 
+        # P0-6: register event sink so annotate() can resolve the active TOOL span
+        try:
+            from .span_registry import register_span_event_sink
+            register_span_event_sink(span)
+        except Exception:
+            pass
+
         # P0-1 fix: Activate TOOL context ONLY after all initialization succeeds.
         # If we reach this point, the span is fully initialized and ready for
         # business code. If set_context() or anything below fails, we must
@@ -528,12 +535,19 @@ class ToolContextManager:
 
             # P1-1: Skip payload processing if unsampled
             # P1-4: Output processing happens AFTER span.end()
+            # P0-7: output processing must not prevent reporting on failure
             if self._sampled:
-                self._process_output()
-                self._set_request_metadata()
+                try:
+                    self._process_output()
+                except Exception:
+                    logger.debug("TOOL output processing failed", exc_info=True)
+                try:
+                    self._set_request_metadata()
+                except Exception:
+                    logger.debug("TOOL request_metadata failed", exc_info=True)
 
-            current = get_current_context()
-            if current and current.sampled:
+            # P0-2: use captured sampled decision (context may differ after reset)
+            if self._sampled:
                 try:
                     self._tracer.reporter.report(self._span.to_record())
                 except Exception as e:
@@ -543,6 +557,13 @@ class ToolContextManager:
             # Without this, a str(exc_val) or reporter failure would leave
             # the TOOL context active, causing subsequent spans to attach
             # to a stale TOOL parent.
+            # P0-6: unregister event sink
+            if self._span is not None:
+                try:
+                    from .span_registry import unregister_span_event_sink
+                    unregister_span_event_sink(self._span.trace_id, self._span.span_id)
+                except Exception:
+                    pass
             if self._token is not None:
                 reset_context(self._token)
         return False

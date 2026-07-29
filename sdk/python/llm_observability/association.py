@@ -100,6 +100,15 @@ def _normalize_keys(props: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+# Sentinel for distinguishing "key absent" from "key explicitly None"
+_UNSET = object()
+
+
+def clear_association_properties() -> None:
+    """P1-3: Clear association properties to an empty AssociationProperties."""
+    _ASSOCIATION_VAR.set(AssociationProperties())
+
+
 def get_association_properties() -> AssociationProperties:
     """Get the current association properties (never None)."""
     return _ASSOCIATION_VAR.get()
@@ -127,15 +136,35 @@ def apply_association_to_span(span) -> None:
 def set_association_properties(props: dict[str, Any]) -> Token:
     """Set association properties, returning a token for reset.
 
-    Normalizes aliases (user_id->user, business_scene->business_scenario)
-    and applies fail-closed sanitization.
+    P1-4 (nested merge): the new properties are MERGED with the current
+    context — explicit fields override, unset fields inherit the outer
+    context. Normalizes aliases and applies fail-closed sanitization.
     """
     normalized = _normalize_keys(props)
+    current = _ASSOCIATION_VAR.get()
+    # Merge: explicit (normalized) values win; gaps inherit current context
+    user = _sanitize_value(normalized.get("user")) if "user" in normalized else current.user
+    session_id = _sanitize_value(normalized.get("session_id")) if "session_id" in normalized else current.session_id
+    message_id = _sanitize_value(normalized.get("message_id")) if "message_id" in normalized else current.message_id
+    business_scenario = (
+        _sanitize_value(normalized.get("business_scenario"))
+        if "business_scenario" in normalized
+        else current.business_scenario
+    )
+    # Allow explicit None to clear a field
+    if normalized.get("user", _UNSET) is None:
+        user = None
+    if normalized.get("session_id", _UNSET) is None:
+        session_id = None
+    if normalized.get("message_id", _UNSET) is None:
+        message_id = None
+    if normalized.get("business_scenario", _UNSET) is None:
+        business_scenario = None
     sanitized = AssociationProperties(
-        user=_sanitize_value(normalized.get("user")),
-        session_id=_sanitize_value(normalized.get("session_id")),
-        message_id=_sanitize_value(normalized.get("message_id")),
-        business_scenario=_sanitize_value(normalized.get("business_scenario")),
+        user=user,
+        session_id=session_id,
+        message_id=message_id,
+        business_scenario=business_scenario,
     )
     return _ASSOCIATION_VAR.set(sanitized)
 

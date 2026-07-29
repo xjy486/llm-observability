@@ -109,15 +109,29 @@ def _get_tracer():
     return Observability._tracer
 
 
-def _check_initialized(fail_open: bool) -> bool:
-    """Return True if SDK is initialized; otherwise handle per fail_open."""
+def _check_initialized(fail_open) -> bool:
+    """Return True if SDK is initialized; otherwise handle per fail_open.
+
+    P1-1: fail_open=None resolves to the global Config.fail_open value.
+    """
     from llm_observability import Observability
     if Observability._initialized and Observability._tracer is not None:
         return True
+    # P1-1: resolve None -> global config
+    if fail_open is None:
+        fail_open = getattr(Observability._config, "fail_open", True)
     if fail_open:
         logger.warning("Observability not initialized — decorator running without observation")
         return False
     raise RuntimeError("Observability.init() must be called before using decorators (fail_open=False)")
+
+
+def _resolve_fail_open(fail_open) -> bool:
+    """P1-1: resolve fail_open=None to the global Config.fail_open value."""
+    if fail_open is not None:
+        return fail_open
+    from llm_observability import Observability
+    return getattr(Observability._config, "fail_open", True)
 
 
 # ── AGENT decorator ──
@@ -170,6 +184,63 @@ def agent(
     return decorator
 
 
+def _capture_decorator_input(span, func, args, kwargs, tracer):
+    """P0-3: capture decorator input through the privacy pipeline."""
+    try:
+        bound = _bind_arguments(func, args, kwargs)
+        strategy = getattr(tracer.config, "payload_strategy", "masked")
+        if strategy == "off":
+            return
+        from .tool import safe_serialize, mask_payload, apply_size_guard
+        serialized = safe_serialize(bound)
+        masked = mask_payload(serialized, strategy)
+        guarded, truncated, _ = apply_size_guard(masked)
+        if span.payload is None:
+            span.payload = {}
+        span.payload["input"] = guarded
+        span.set_attribute("task.input.truncated", truncated)
+    except Exception:
+        logger.debug("decorator input capture failed", exc_info=True)
+
+
+def _capture_decorator_output(span, result, tracer):
+    """P0-3: capture decorator output through the privacy pipeline."""
+    try:
+        strategy = getattr(tracer.config, "payload_strategy", "masked")
+        if strategy == "off":
+            return
+        from .tool import safe_serialize, mask_payload, apply_size_guard
+        serialized = safe_serialize(result)
+        masked = mask_payload(serialized, strategy)
+        guarded, truncated, _ = apply_size_guard(masked)
+        if span.payload is None:
+            span.payload = {}
+        span.payload["output"] = guarded
+        span.set_attribute("task.output.truncated", truncated)
+    except Exception:
+        logger.debug("decorator output capture failed", exc_info=True)
+
+
+def _stream_sync(gen, span, tracer):
+    """P0-8: yield from a sync generator while bounded-accumulating for output."""
+    from .integrations.langchain.stream_accumulator import BoundedStreamAccumulator
+    acc = BoundedStreamAccumulator()
+    for item in gen:
+        acc.append(item)
+        yield item
+    _capture_decorator_output(span, acc.finalize(), tracer)
+
+
+async def _stream_async(agen, span, tracer):
+    """P0-8: yield from an async generator while bounded-accumulating for output."""
+    from .integrations.langchain.stream_accumulator import BoundedStreamAccumulator
+    acc = BoundedStreamAccumulator()
+    async for item in agen:
+        acc.append(item)
+        yield item
+    _capture_decorator_output(span, acc.finalize(), tracer)
+
+
 def _create_agent_span(func_name, nested_mode, explicit, fail_open):
     """Create (or reuse) the AGENT root span. Returns (span, token, tracer, reused)."""
     if not _check_initialized(fail_open):
@@ -188,17 +259,18 @@ def _create_agent_span(func_name, nested_mode, explicit, fail_open):
 
     trace_id = generate_trace_id()
     span_id = generate_span_id()
+    # P0-2: Sample BEFORE creating the context, so the context carries the
+    # correct sampled flag and downstream spans (LLM/TOOL/TASK) inherit it.
+    import random
+    sampled = random.random() < tracer.config.sample_rate
     ctx = SpanContext(
         trace_id=trace_id,
         span_id=span_id,
         parent_span_id=None,
         span_kind=SpanKind.AGENT,
-        sampled=True,
+        sampled=sampled,
     )
     token = set_context(ctx)
-
-    import random
-    sampled = random.random() < tracer.config.sample_rate
 
     span = Span(
         trace_id=trace_id,
@@ -211,6 +283,7 @@ def _create_agent_span(func_name, nested_mode, explicit, fail_open):
     span.set_attribute("operation.type", "agent")
     _apply_association(span, explicit)
     span.start()
+    span._decorator_sampled = sampled  # finalizer uses this (context may be gone)
 
     try:
         from .span_registry import register_span_event_sink
@@ -241,7 +314,9 @@ def _finalize_agent_span(span, token, tracer, reused, exc_type, exc_val, exc_tb)
             else:
                 span.set_status("OK")
             span.end()
-            if get_current_context() is not None and get_current_context().sampled:
+            # P0-2: use the sampled decision captured at span creation time.
+            sampled = getattr(span, "_decorator_sampled", True)
+            if sampled:
                 tracer.reporter.report(span.to_record())
         except Exception:
             logger.exception("AGENT decorator finalization failed")
@@ -256,6 +331,7 @@ def _finalize_agent_span(span, token, tracer, reused, exc_type, exc_val, exc_tb)
 
 
 def _run_agent_sync(func, args, kwargs, name, nested_mode, explicit, fail_open):
+    import sys as _sys
     func_name = name or func.__name__
     span, token, tracer, reused = _create_agent_span(func_name, nested_mode, explicit, fail_open)
     if span is None and token is None and not reused:
@@ -271,13 +347,18 @@ def _run_agent_sync(func, args, kwargs, name, nested_mode, explicit, fail_open):
                 sink.add_event("sdk.agent.reused")
         except Exception:
             pass
+    # P0-3: capture input via the AGENT span's event sink (privacy pipeline)
+    if span is not None:
+        _capture_decorator_input(span, func, args, kwargs, tracer)
     try:
         result = func(*args, **kwargs)
+        if span is not None:
+            _capture_decorator_output(span, result, tracer)
         return result
     except BaseException:
         raise
     finally:
-        _finalize_agent_span(span, token, tracer, reused, *sys_exc_info())
+        _finalize_agent_span(span, token, tracer, reused, *_sys.exc_info())
 
 
 async def _run_agent_async(func, args, kwargs, name, nested_mode, explicit, fail_open):
@@ -295,8 +376,12 @@ async def _run_agent_async(func, args, kwargs, name, nested_mode, explicit, fail
                 sink.add_event("sdk.agent.reused")
         except Exception:
             pass
+    if span is not None:
+        _capture_decorator_input(span, func, args, kwargs, tracer)
     try:
         result = await func(*args, **kwargs)
+        if span is not None:
+            _capture_decorator_output(span, result, tracer)
         return result
     except BaseException:
         raise
@@ -311,8 +396,13 @@ def _run_agent_sync_gen(func, args, kwargs, name, nested_mode, explicit, fail_op
     if span is None and token is None and not reused:
         yield from func(*args, **kwargs)
         return
+    if span is not None:
+        _capture_decorator_input(span, func, args, kwargs, tracer)
     try:
-        yield from func(*args, **kwargs)
+        if span is not None:
+            yield from _stream_sync(func(*args, **kwargs), span, tracer)
+        else:
+            yield from func(*args, **kwargs)
     except BaseException:
         raise
     finally:
@@ -327,9 +417,15 @@ async def _run_agent_async_gen(func, args, kwargs, name, nested_mode, explicit, 
         async for item in func(*args, **kwargs):
             yield item
         return
+    if span is not None:
+        _capture_decorator_input(span, func, args, kwargs, tracer)
     try:
-        async for item in func(*args, **kwargs):
-            yield item
+        if span is not None:
+            async for item in _stream_async(func(*args, **kwargs), span, tracer):
+                yield item
+        else:
+            async for item in func(*args, **kwargs):
+                yield item
     except BaseException:
         raise
     finally:
@@ -392,7 +488,7 @@ def _run_task_sync(func, args, kwargs, task_type, name, fail_open, extra):
     tracer = _get_tracer()
     current = get_current_context()
     if current is None:
-        if fail_open:
+        if _resolve_fail_open(fail_open):
             logger.warning("@%s: no active trace — running without observation", task_type)
             return func(*args, **kwargs)
         raise RuntimeError(f"@{task_type}: requires an active trace")
@@ -413,7 +509,7 @@ async def _run_task_async(func, args, kwargs, task_type, name, fail_open, extra)
     tracer = _get_tracer()
     current = get_current_context()
     if current is None:
-        if fail_open:
+        if _resolve_fail_open(fail_open):
             logger.warning("@%s: no active trace — running without observation", task_type)
             return await func(*args, **kwargs)
         raise RuntimeError(f"@{task_type}: requires an active trace")
@@ -435,7 +531,7 @@ def _run_task_sync_gen(func, args, kwargs, task_type, name, fail_open, extra):
     tracer = _get_tracer()
     current = get_current_context()
     if current is None:
-        if fail_open:
+        if _resolve_fail_open(fail_open):
             logger.warning("@%s: no active trace — running without observation", task_type)
             yield from func(*args, **kwargs)
             return
@@ -446,9 +542,13 @@ def _run_task_sync_gen(func, args, kwargs, task_type, name, fail_open, extra):
     with TaskContextManager(
         tracer=tracer, name=func_name, task_type=task_type, input=bound_input,
     ) as handle:
-        result = list(func(*args, **kwargs))
-        handle.set_output(result)
-        yield from result
+        # P0-8: true streaming — yield as items arrive, bounded-accumulate for output
+        from .integrations.langchain.stream_accumulator import BoundedStreamAccumulator
+        acc = BoundedStreamAccumulator()
+        for item in func(*args, **kwargs):
+            acc.append(item)
+            yield item
+        handle.set_output(acc.finalize())
 
 
 async def _run_task_async_gen(func, args, kwargs, task_type, name, fail_open, extra):
@@ -459,7 +559,7 @@ async def _run_task_async_gen(func, args, kwargs, task_type, name, fail_open, ex
     tracer = _get_tracer()
     current = get_current_context()
     if current is None:
-        if fail_open:
+        if _resolve_fail_open(fail_open):
             logger.warning("@%s: no active trace — running without observation", task_type)
             async for item in func(*args, **kwargs):
                 yield item
@@ -468,14 +568,15 @@ async def _run_task_async_gen(func, args, kwargs, task_type, name, fail_open, ex
     func_name = name or func.__name__
     from .task import TaskContextManager
     bound_input = _bind_arguments(func, args, kwargs)
-    collected = []
+    from .integrations.langchain.stream_accumulator import BoundedStreamAccumulator
+    acc = BoundedStreamAccumulator()
     with TaskContextManager(
         tracer=tracer, name=func_name, task_type=task_type, input=bound_input,
     ) as handle:
         async for item in func(*args, **kwargs):
-            collected.append(item)
+            acc.append(item)
             yield item
-        handle.set_output(collected)
+        handle.set_output(acc.finalize())
 
 
 # ── TOOL decorator (reuses Phase 2.2) ──
@@ -515,7 +616,7 @@ def _run_tool_sync(func, args, kwargs, name, tool_type, fail_open):
         return func(*args, **kwargs)
     tracer = _get_tracer()
     if get_current_context() is None:
-        if fail_open:
+        if _resolve_fail_open(fail_open):
             logger.warning("@tool: no active trace — running without observation")
             return func(*args, **kwargs)
         raise RuntimeError("@tool: requires an active trace")
@@ -532,7 +633,7 @@ async def _run_tool_async(func, args, kwargs, name, tool_type, fail_open):
         return await func(*args, **kwargs)
     tracer = _get_tracer()
     if get_current_context() is None:
-        if fail_open:
+        if _resolve_fail_open(fail_open):
             logger.warning("@tool: no active trace — running without observation")
             return await func(*args, **kwargs)
         raise RuntimeError("@tool: requires an active trace")
@@ -550,16 +651,19 @@ def _run_tool_sync_gen(func, args, kwargs, name, tool_type, fail_open):
         return
     tracer = _get_tracer()
     if get_current_context() is None:
-        if fail_open:
+        if _resolve_fail_open(fail_open):
             yield from func(*args, **kwargs)
             return
         raise RuntimeError("@tool: requires an active trace")
     func_name = name or func.__name__
     bound_input = _bind_arguments(func, args, kwargs)
+    from .integrations.langchain.stream_accumulator import BoundedStreamAccumulator
+    acc = BoundedStreamAccumulator()
     with tracer.tool(name=func_name, tool_type=tool_type, input=bound_input) as handle:
-        result = list(func(*args, **kwargs))
-        handle.set_output(result)
-        yield from result
+        for item in func(*args, **kwargs):
+            acc.append(item)
+            yield item
+        handle.set_output(acc.finalize())
 
 
 async def _run_tool_async_gen(func, args, kwargs, name, tool_type, fail_open):
@@ -569,19 +673,20 @@ async def _run_tool_async_gen(func, args, kwargs, name, tool_type, fail_open):
         return
     tracer = _get_tracer()
     if get_current_context() is None:
-        if fail_open:
+        if _resolve_fail_open(fail_open):
             async for item in func(*args, **kwargs):
                 yield item
             return
         raise RuntimeError("@tool: requires an active trace")
     func_name = name or func.__name__
     bound_input = _bind_arguments(func, args, kwargs)
-    collected = []
+    from .integrations.langchain.stream_accumulator import BoundedStreamAccumulator
+    acc = BoundedStreamAccumulator()
     with tracer.tool(name=func_name, tool_type=tool_type, input=bound_input) as handle:
         async for item in func(*args, **kwargs):
-            collected.append(item)
+            acc.append(item)
             yield item
-        handle.set_output(collected)
+        handle.set_output(acc.finalize())
 
 
 # ── LLM decorator ──
@@ -628,7 +733,7 @@ def _create_llm_span(func_name, model, fail_open):
     tracer = _get_tracer()
     current = get_current_context()
     if current is None:
-        if fail_open:
+        if _resolve_fail_open(fail_open):
             logger.warning("@llm: no active trace — running without observation")
             return None, None, tracer
         raise RuntimeError("@llm: requires an active trace")
@@ -656,6 +761,7 @@ def _create_llm_span(func_name, model, fail_open):
         span.set_attribute("gen_ai.request.model", model)
     _apply_association(span)
     span.start()
+    span._decorator_sampled = current.sampled  # P0-2: inherit parent sampling
 
     try:
         from .span_registry import register_span_event_sink
@@ -676,13 +782,13 @@ def _finalize_llm_span(span, token, tracer, exc_type, exc_val, exc_tb):
             if exc_type is not None and not _control_flow_exception(exc_type, exc_val):
                 span.set_error(
                     error_type=exc_type.__name__,
-                    error_message=_safe_tool_error_message(exc_val) if exc_val else "",
+                    error_message=_safe_error_message(exc_val) if exc_val else "",
                 )
             else:
                 span.set_status("OK")
             span.end()
-            ctx = get_current_context()
-            if ctx is not None and ctx.sampled:
+            sampled = getattr(span, "_decorator_sampled", True)
+            if sampled:
                 tracer.reporter.report(span.to_record())
         except Exception:
             logger.exception("LLM decorator finalization failed")
@@ -702,8 +808,12 @@ def _run_llm_sync(func, args, kwargs, name, model, fail_open):
     span, token, tracer = _create_llm_span(func_name, model, fail_open)
     if span is None and token is None:
         return func(*args, **kwargs)
+    if span is not None:
+        _capture_decorator_input(span, func, args, kwargs, tracer)
     try:
         result = func(*args, **kwargs)
+        if span is not None:
+            _capture_decorator_output(span, result, tracer)
         return result
     except BaseException:
         raise
@@ -717,8 +827,12 @@ async def _run_llm_async(func, args, kwargs, name, model, fail_open):
     span, token, tracer = _create_llm_span(func_name, model, fail_open)
     if span is None and token is None:
         return await func(*args, **kwargs)
+    if span is not None:
+        _capture_decorator_input(span, func, args, kwargs, tracer)
     try:
         result = await func(*args, **kwargs)
+        if span is not None:
+            _capture_decorator_output(span, result, tracer)
         return result
     except BaseException:
         raise
@@ -733,8 +847,13 @@ def _run_llm_sync_gen(func, args, kwargs, name, model, fail_open):
     if span is None and token is None:
         yield from func(*args, **kwargs)
         return
+    if span is not None:
+        _capture_decorator_input(span, func, args, kwargs, tracer)
     try:
-        yield from func(*args, **kwargs)
+        if span is not None:
+            yield from _stream_sync(func(*args, **kwargs), span, tracer)
+        else:
+            yield from func(*args, **kwargs)
     except BaseException:
         raise
     finally:
@@ -749,9 +868,15 @@ async def _run_llm_async_gen(func, args, kwargs, name, model, fail_open):
         async for item in func(*args, **kwargs):
             yield item
         return
+    if span is not None:
+        _capture_decorator_input(span, func, args, kwargs, tracer)
     try:
-        async for item in func(*args, **kwargs):
-            yield item
+        if span is not None:
+            async for item in _stream_async(func(*args, **kwargs), span, tracer):
+                yield item
+        else:
+            async for item in func(*args, **kwargs):
+                yield item
     except BaseException:
         raise
     finally:

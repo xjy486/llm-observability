@@ -83,10 +83,14 @@ def inject_headers(
     user_id: Optional[str] = None,
     app_name: Optional[str] = None,
     business_scene: Optional[str] = None,
+    message_id: Optional[str] = None,
 ) -> dict:
     """Build headers for downstream propagation.
 
     Includes traceparent, optional ownership marker, and metadata headers.
+    Phase 2.5 (P0-5): also emits a `baggage` header carrying association
+    metadata (user/session_id/message_id/business_scenario) so the downstream
+    Gateway/Server can inherit Association Properties.
 
     Args:
         ctx: The active span context.
@@ -95,6 +99,7 @@ def inject_headers(
         user_id: Optional user ID.
         app_name: Optional application name.
         business_scene: Optional business scene tag.
+        message_id: Optional message_id (Phase 2.5 association).
 
     Returns:
         Dict of headers to inject into the downstream request.
@@ -112,5 +117,19 @@ def inject_headers(
         headers["X-App-Name"] = app_name
     if business_scene:
         headers["X-Business-Scene"] = business_scene
+
+    # P0-5: baggage carries association metadata (incl. message_id) for the
+    # downstream Gateway/Server to inherit.
+    baggage_parts = []
+    if user_id:
+        baggage_parts.append(f"user={user_id}")
+    if session_id:
+        baggage_parts.append(f"session_id={session_id}")
+    if business_scene:
+        baggage_parts.append(f"business_scenario={business_scene}")
+    if message_id:
+        baggage_parts.append(f"message_id={message_id}")
+    if baggage_parts:
+        headers["baggage"] = ",".join(baggage_parts)
 
     return headers

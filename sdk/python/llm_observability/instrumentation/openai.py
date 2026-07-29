@@ -167,11 +167,23 @@ class OpenAIInstrumentor(BaseInstrumentor):
 
         span.start()
 
-        # Inject traceparent + ownership marker into headers
+        # P0-5: inherit Association Properties (user/session_id/message_id/...)
+        try:
+            from ..association import apply_association_to_span
+            apply_association_to_span(span)
+        except Exception:
+            pass
+
+        # Inject traceparent + ownership marker + association into headers
         headers = kwargs.pop("extra_headers", None) or {}
         inject = inject_headers(
             llm_ctx,
             is_logical_llm=True,
+            session_id=span.session_id,
+            user_id=span.user_id,
+            app_name=span.app_name,
+            business_scene=span.business_scene,
+            message_id=span.message_id,
         )
         headers.update(inject)
         kwargs["extra_headers"] = headers
@@ -317,8 +329,23 @@ class OpenAIInstrumentor(BaseInstrumentor):
 
         span.start()
 
+        # P0-5: inherit Association Properties
+        try:
+            from ..association import apply_association_to_span
+            apply_association_to_span(span)
+        except Exception:
+            pass
+
         headers = kwargs.pop("extra_headers", None) or {}
-        inject = inject_headers(llm_ctx, is_logical_llm=True)
+        inject = inject_headers(
+            llm_ctx,
+            is_logical_llm=True,
+            session_id=span.session_id,
+            user_id=span.user_id,
+            app_name=span.app_name,
+            business_scene=span.business_scene,
+            message_id=span.message_id,
+        )
         headers.update(inject)
         kwargs["extra_headers"] = headers
 

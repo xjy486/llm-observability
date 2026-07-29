@@ -661,6 +661,7 @@ class ProxyHandler:
             "user_id": metadata.get("user_id"),
             "app_name": metadata.get("app_name", "unknown"),
             "business_scene": metadata.get("business_scene"),
+            "message_id": metadata.get("message_id"),  # P0-5: Association Properties
             "attributes": attributes,
             "events": events,
             "error_type": error_type,
