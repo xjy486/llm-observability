@@ -408,7 +408,16 @@ class Observability:
             except Exception:
                 pass
 
-            logger.info("Observability SDK shutdown complete")
+            # Phase 2.5: Clear span event sink registry (P1-3 leak guard).
+            # Spans whose __exit__ failed (e.g. fault-injection tests) would
+            # otherwise linger in the global registry across shutdown/init cycles.
+            try:
+                from .span_registry import clear_span_event_sinks
+                clear_span_event_sinks()
+            except Exception:
+                pass
+
+        logger.info("Observability SDK shutdown complete")
 
     # ── Phase 2.5: TASK span ──
 
