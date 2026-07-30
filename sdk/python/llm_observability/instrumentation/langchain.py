@@ -70,6 +70,10 @@ def _collect_candidate_classes():
         "langchain_core.runnables.base.RunnableMap",
         "langchain_core.runnables.base.RunnableLambda",
         "langchain_core.runnables.base.RunnablePassthrough",
+        # Blocker 1: CompiledStateGraph inherits invoke from Pregel, which DOES
+        # define invoke/ainvoke/stream/astream in its own __dict__. Patching
+        # Pregel covers create_agent() / CompiledGraph invocations.
+        "langgraph.pregel.Pregel",
         "langgraph.graph.state.CompiledStateGraph",
         "langgraph.graph.graph.CompiledGraph",
     ):
@@ -273,20 +277,28 @@ class LangChainInstrumentor(BaseInstrumentor):
     def _copy_config(self, kwargs):
         """Non-destructive Config copy. ALWAYS places the copy back into kwargs.
 
-        1.1 fix: even when the user passed no config, we create an empty dict,
-        place it into kwargs["config"], and return it so _merge_callback can
-        inject our handler and LangChain actually receives it.
+        Blocker 2: SHALLOW copy only — never deepcopy. Deepcopying would clone
+        user Callback handler instances, breaking stateful callbacks (the user's
+        original handler would never receive events; only the clone would). We
+        shallow-copy the config dict and the callbacks list so handler object
+        identity is preserved while the config itself is safe to mutate.
         """
         config = kwargs.get("config")
         if config is None:
             config_copy = {}
             new_kwargs = {**kwargs, "config": config_copy}
             return new_kwargs, config_copy
-        try:
-            config_copy = copy.deepcopy(config)
-        except Exception:
+        # Shallow copy the config dict (preserve handler object references)
+        if isinstance(config, dict):
+            config_copy = dict(config)
+            # Shallow-copy the callbacks list if present (keep handler refs)
+            cbs = config_copy.get("callbacks")
+            if isinstance(cbs, list):
+                config_copy["callbacks"] = list(cbs)
+        else:
+            # Non-dict config (e.g. RunnableConfig dataclass) — best-effort copy
             try:
-                config_copy = dict(config) if isinstance(config, dict) else {}
+                config_copy = dict(config)
             except Exception:
                 config_copy = {}
         new_kwargs = {**kwargs, "config": config_copy}
@@ -296,8 +308,9 @@ class LangChainInstrumentor(BaseInstrumentor):
         """Merge our callback handler into the COPIED config (non-destructive).
 
         Preserves user callbacks: None / list / CallbackManager / AsyncCallbackManager.
-        A CallbackManager is unwrapped to its .handlers list (we're operating on a
-        deep copy, so this is non-destructive to the user's original).
+        Blocker 2: CallbackManager is CLONED via .copy() (preserves handler identity
+        + full semantics: inheritable_handlers/tags/metadata/parent_run_id), then our
+        handler is added. User handler instances are never copied.
         """
         if handler is None:
             return
@@ -307,15 +320,20 @@ class LangChainInstrumentor(BaseInstrumentor):
         if existing is None:
             config_copy["callbacks"] = [handler]
             return
-        # Unwrap CallbackManager / AsyncCallbackManager to a handlers list
-        if hasattr(existing, "handlers") and not isinstance(existing, list):
-            existing = list(existing.handlers)
-            config_copy["callbacks"] = existing
+        # CallbackManager / AsyncCallbackManager — clone + add handler (identity preserved)
+        if hasattr(existing, "handlers") and hasattr(existing, "copy") and not isinstance(existing, list):
+            try:
+                cloned = existing.copy()
+                cloned.add_handler(handler, inherit=False)
+                config_copy["callbacks"] = cloned
+                return
+            except Exception:
+                logger.debug("CallbackManager clone failed; falling back", exc_info=True)
         if isinstance(existing, list):
             if not any(isinstance(c, type(handler)) for c in existing):
                 config_copy["callbacks"] = existing + [handler]
         else:
-            # Single handler object — wrap alongside
+            # Single handler object — wrap alongside (preserve reference)
             config_copy["callbacks"] = [existing, handler]
 
     # ── Sync invocation ──

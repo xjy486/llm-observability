@@ -168,7 +168,9 @@ def _proxy_sanitize_value(value: str, max_length: int = 256) -> str:
         return None
     try:
         text = str(value)
-        text = "".join(ch for ch in text if ch == "\t" or ch == "\n" or ord(ch) >= 0x20)
+        # P1-4: strip ALL control characters including CR/LF/tab to prevent
+        # log injection / header injection / UI display issues.
+        text = "".join(ch for ch in text if ord(ch) >= 0x20 or ch == " ")
         return text[:max_length]
     except Exception:
         return "<redacted>"

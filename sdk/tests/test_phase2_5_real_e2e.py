@@ -478,9 +478,11 @@ def test_scenario_g_gateway_via_proxy(mock_core, mock_upstream):
         auto_instrument_openai=True,
     )
     tracer = Observability._tracer
-    proxy_client = openai.OpenAI(api_key="test-key", base_url=proxy_url)
+    # base_url MUST include /v1 so the request path is /v1/chat/completions,
+    # which matches the proxy's observed_paths (else it passthroughs with no telemetry)
+    proxy_client = openai.OpenAI(api_key="test-key", base_url=proxy_url + "/v1")
 
-    @agent(name="gateway-agent")
+    @agent(name="gateway-agent", user_id="u1", session_id="s1", message_id="m1")
     def gateway_agent():
         resp = proxy_client.chat.completions.create(
             model="mock-model",
@@ -491,44 +493,31 @@ def test_scenario_g_gateway_via_proxy(mock_core, mock_upstream):
     result = gateway_agent()
     assert result, "expected a response"
     _drain()
-    # SDK side: AGENT + LLM reported
-    records = _records()
-    assert any(r["span_kind"] == "AGENT" for r in records), "missing AGENT"
-    assert any(r["span_kind"] == "LLM" for r in records), "missing LLM"
-
-    # Proxy side: send a direct request with SDK-style ownership headers to
-    # validate the proxy creates a GATEWAY span sharing the SDK trace.
-    import urllib.request as _urllib
-    from llm_observability.context import get_current_context
-    from llm_observability.propagation import inject_traceparent
-    with tracer.trace(name="gateway-direct", session_id="s1", user_id="u1"):
-        ctx = get_current_context()
-        tp = inject_traceparent(ctx)
-        body = json.dumps({"model": "mock-model", "messages": [{"role": "user", "content": "hi"}]}).encode()
-        req = _urllib.Request(
-            f"{proxy_url}/v1/chat/completions", data=body,
-            headers={
-                "Content-Type": "application/json",
-                "X-LLM-OBS-Span-Role": "llm",
-                "traceparent": tp,
-                "X-User-Id": "u1",
-                "X-Session-Id": "s1",
-            },
-        )
-        _urllib.urlopen(req, timeout=10).read()
-    _drain()
-    # Wait for the proxy reporter to flush GATEWAY
+    # Wait for the proxy reporter to flush GATEWAY to mock_core
     for _ in range(20):
         _t.sleep(0.5)
         if any(r["span_kind"] == "GATEWAY" for r in _records()):
             break
     records = _records()
-    kinds = [r["span_kind"] for r in records]
-    assert "GATEWAY" in kinds, f"missing GATEWAY in {kinds}"
+    # Hard assertions on the real SDK request's parent chain (Blocker 4)
+    agent_recs = [r for r in records if r["span_kind"] == "AGENT"]
+    llm_recs = [r for r in records if r["span_kind"] == "LLM"]
     gateway_recs = [r for r in records if r["span_kind"] == "GATEWAY"]
-    # GATEWAY inherited association from headers
-    assert gateway_recs[0].get("user_id") == "u1"
-    assert gateway_recs[0].get("session_id") == "s1"
+    assert len(agent_recs) == 1, f"expected 1 AGENT, got {len(agent_recs)}"
+    assert len(llm_recs) == 1, f"expected 1 LLM, got {len(llm_recs)}"
+    assert len(gateway_recs) == 1, f"expected 1 GATEWAY, got {len(gateway_recs)}"
+    agent_rec = agent_recs[0]
+    llm_rec = llm_recs[0]
+    gateway_rec = gateway_recs[0]
+    # All share the same trace
+    assert agent_rec["trace_id"] == llm_rec["trace_id"] == gateway_rec["trace_id"]
+    # LLM is child of AGENT
+    assert llm_rec["parent_span_id"] == agent_rec["span_id"]
+    # GATEWAY is child of LLM (parent chain: AGENT -> LLM -> GATEWAY)
+    assert gateway_rec["parent_span_id"] == llm_rec["span_id"]
+    # Association inherited on the GATEWAY (same call, not a separate manual request)
+    assert gateway_rec.get("user_id") == "u1"
+    assert gateway_rec.get("session_id") == "s1"
     # Restore the reporter init
     reporter_mod.TelemetryReporter.__init__ = orig_reporter_init
 

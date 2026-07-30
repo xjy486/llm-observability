@@ -618,18 +618,31 @@ def _run_task_sync_gen(func, args, kwargs, task_type, name, fail_open, extra):
     func_name = name or func.__name__
     from .task import TaskContextManager
     bound_input = _bind_arguments(func, args, kwargs)
-    with TaskContextManager(
-        tracer=tracer, name=func_name, task_type=task_type, input=bound_input,
-    ) as handle:
-        # P0-8: true streaming — yield as items arrive, bounded-accumulate for output
-        from .integrations.langchain.stream_accumulator import BoundedStreamAccumulator
-        acc = BoundedStreamAccumulator(
-            max_bytes=getattr(tracer.config, "max_payload_bytes", 32 * 1024)
+    # Blocker 3: generator init fail-open — catch cm.__enter__() failure
+    try:
+        cm = TaskContextManager(
+            tracer=tracer, name=func_name, task_type=task_type, input=bound_input,
         )
+        handle = cm.__enter__()
+    except Exception:
+        if _resolve_fail_open(fail_open):
+            logger.warning("@%s: span init failed — running without observation", task_type, exc_info=True)
+            yield from func(*args, **kwargs)
+            return
+        raise
+    from .integrations.langchain.stream_accumulator import BoundedStreamAccumulator
+    acc = BoundedStreamAccumulator(
+        max_bytes=getattr(tracer.config, "max_payload_bytes", 32 * 1024)
+    )
+    try:
         for item in func(*args, **kwargs):
             acc.append(item)
             yield item
         handle.set_output(acc.finalize())
+    except BaseException:
+        raise
+    finally:
+        cm.__exit__(*sys_exc_info())
 
 
 async def _run_task_async_gen(func, args, kwargs, task_type, name, fail_open, extra):
@@ -649,17 +662,32 @@ async def _run_task_async_gen(func, args, kwargs, task_type, name, fail_open, ex
     func_name = name or func.__name__
     from .task import TaskContextManager
     bound_input = _bind_arguments(func, args, kwargs)
+    # Blocker 3: async generator init fail-open
+    try:
+        cm = TaskContextManager(
+            tracer=tracer, name=func_name, task_type=task_type, input=bound_input,
+        )
+        handle = cm.__enter__()
+    except Exception:
+        if _resolve_fail_open(fail_open):
+            logger.warning("@%s: span init failed — running without observation", task_type, exc_info=True)
+            async for item in func(*args, **kwargs):
+                yield item
+            return
+        raise
     from .integrations.langchain.stream_accumulator import BoundedStreamAccumulator
     acc = BoundedStreamAccumulator(
         max_bytes=getattr(tracer.config, "max_payload_bytes", 32 * 1024)
     )
-    with TaskContextManager(
-        tracer=tracer, name=func_name, task_type=task_type, input=bound_input,
-    ) as handle:
+    try:
         async for item in func(*args, **kwargs):
             acc.append(item)
             yield item
         handle.set_output(acc.finalize())
+    except BaseException:
+        raise
+    finally:
+        cm.__exit__(*sys_exc_info())
 
 
 # ── TOOL decorator (reuses Phase 2.2) ──
@@ -764,15 +792,29 @@ def _run_tool_sync_gen(func, args, kwargs, name, tool_type, fail_open):
         raise RuntimeError("@tool: requires an active trace")
     func_name = name or func.__name__
     bound_input = _bind_arguments(func, args, kwargs)
+    # Blocker 3: generator init fail-open
+    try:
+        cm = tracer.tool(name=func_name, tool_type=tool_type, input=bound_input)
+        handle = cm.__enter__()
+    except Exception:
+        if _resolve_fail_open(fail_open):
+            logger.warning("@tool: span init failed — running without observation", exc_info=True)
+            yield from func(*args, **kwargs)
+            return
+        raise
     from .integrations.langchain.stream_accumulator import BoundedStreamAccumulator
     acc = BoundedStreamAccumulator(
         max_bytes=getattr(tracer.config, "max_payload_bytes", 32 * 1024)
     )
-    with tracer.tool(name=func_name, tool_type=tool_type, input=bound_input) as handle:
+    try:
         for item in func(*args, **kwargs):
             acc.append(item)
             yield item
         handle.set_output(acc.finalize())
+    except BaseException:
+        raise
+    finally:
+        cm.__exit__(*sys_exc_info())
 
 
 async def _run_tool_async_gen(func, args, kwargs, name, tool_type, fail_open):
@@ -789,15 +831,30 @@ async def _run_tool_async_gen(func, args, kwargs, name, tool_type, fail_open):
         raise RuntimeError("@tool: requires an active trace")
     func_name = name or func.__name__
     bound_input = _bind_arguments(func, args, kwargs)
+    # Blocker 3: async generator init fail-open
+    try:
+        cm = tracer.tool(name=func_name, tool_type=tool_type, input=bound_input)
+        handle = cm.__enter__()
+    except Exception:
+        if _resolve_fail_open(fail_open):
+            logger.warning("@tool: span init failed — running without observation", exc_info=True)
+            async for item in func(*args, **kwargs):
+                yield item
+            return
+        raise
     from .integrations.langchain.stream_accumulator import BoundedStreamAccumulator
     acc = BoundedStreamAccumulator(
         max_bytes=getattr(tracer.config, "max_payload_bytes", 32 * 1024)
     )
-    with tracer.tool(name=func_name, tool_type=tool_type, input=bound_input) as handle:
+    try:
         async for item in func(*args, **kwargs):
             acc.append(item)
             yield item
         handle.set_output(acc.finalize())
+    except BaseException:
+        raise
+    finally:
+        cm.__exit__(*sys_exc_info())
 
 
 # ── LLM decorator ──
