@@ -197,17 +197,17 @@ def extract_metadata_headers(headers: dict) -> dict:
     for k, v in headers.items():
         kl = k.lower()
         if kl == "x-session-id":
-            meta["session_id"] = v
+            meta["session_id"] = _proxy_sanitize_value(v)
         elif kl == "x-user-id":
-            meta["user_id"] = v
+            meta["user_id"] = _proxy_sanitize_value(v)
         elif kl == "x-app-name" or kl == "x-service-name":
-            meta["app_name"] = v
+            meta["app_name"] = _proxy_sanitize_value(v)
         elif kl == "x-business-scene":
-            meta["business_scene"] = v
+            meta["business_scene"] = _proxy_sanitize_value(v)
         elif kl.startswith("x-trace-"):
             # Custom trace attributes
             attr_key = kl.replace("x-trace-", "")
-            meta[f"attr_{attr_key}"] = v
+            meta[f"attr_{attr_key}"] = _proxy_sanitize_value(v)
     return meta
 
 

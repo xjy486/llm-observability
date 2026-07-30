@@ -24,7 +24,7 @@ import functools
 import logging
 import threading
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .base import BaseInstrumentor
@@ -40,6 +40,9 @@ class AutoInvocationState:
     handler: Any = None
     root_trace_cm: Any = None
     depth: int = 0
+    # P1-2: lock protects depth against concurrent RunnableParallel branches
+    # that share the same state object via contextvars.copy_context().
+    _lock: threading.Lock = field(default_factory=threading.Lock, compare=False, repr=False)
 
 
 _AUTO_STATE: ContextVar[Optional[AutoInvocationState]] = ContextVar(
@@ -183,7 +186,8 @@ class LangChainInstrumentor(BaseInstrumentor):
         from ..context import get_current_context
         existing = _AUTO_STATE.get()
         if existing is not None:
-            existing.depth += 1
+            with existing._lock:
+                existing.depth += 1
             return existing, False, None
 
         if get_current_context() is not None:
@@ -201,8 +205,10 @@ class LangChainInstrumentor(BaseInstrumentor):
         """Exit an invocation. Closes open runs + root, clears ContextVar."""
         if state is None:
             return
-        state.depth -= 1
-        if is_root or state.depth <= 0:
+        with state._lock:
+            state.depth -= 1
+            should_close = is_root or state.depth <= 0
+        if should_close:
             # 1.4: close any unfinished callback runs (end/error missing)
             if state.handler is not None:
                 try:

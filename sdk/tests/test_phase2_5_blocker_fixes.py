@@ -92,6 +92,61 @@ def test_create_agent_ainvoke_auto_instrumented():
             Observability.shutdown()
 
 
+def test_create_agent_stream_auto_instrumented():
+    """create_agent().stream() produces an AGENT (auto-root) via Pregel patch."""
+    _clean_init(auto_instrument_langchain=True)
+    try:
+        from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+        from langchain_core.messages import AIMessage
+        from langgraph.prebuilt import create_agent
+
+        model = GenericFakeChatModel(messages=iter([AIMessage(content="done")]))
+        agent_obj = create_agent(model=model, tools=[], prompt="answer")
+        chunks = list(agent_obj.stream({"messages": [{"role": "user", "content": "hi"}]}))
+        assert chunks, "expected at least one stream chunk"
+        if Observability._initialized:
+            Observability.shutdown()
+        recs = _records()
+        kinds = [r["span_kind"] for r in recs]
+        assert "AGENT" in kinds, f"missing AGENT (auto-root) in {kinds}"
+    except ImportError:
+        pytest.skip("langgraph create_agent not available")
+    finally:
+        if Observability._initialized:
+            Observability.shutdown()
+
+
+def test_create_agent_astream_auto_instrumented():
+    """create_agent().astream() produces an AGENT (auto-root) async."""
+    _clean_init(auto_instrument_langchain=True)
+    try:
+        from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+        from langchain_core.messages import AIMessage
+        from langgraph.prebuilt import create_agent
+
+        model = GenericFakeChatModel(messages=iter([AIMessage(content="done")]))
+        agent_obj = create_agent(model=model, tools=[], prompt="answer")
+
+        async def run():
+            chunks = []
+            async for chunk in agent_obj.astream({"messages": [{"role": "user", "content": "hi"}]}):
+                chunks.append(chunk)
+            return chunks
+
+        chunks = asyncio.run(run())
+        assert chunks, "expected at least one stream chunk"
+        if Observability._initialized:
+            Observability.shutdown()
+        recs = _records()
+        kinds = [r["span_kind"] for r in recs]
+        assert "AGENT" in kinds, f"missing AGENT (auto-root) in {kinds}"
+    except ImportError:
+        pytest.skip("langgraph create_agent not available")
+    finally:
+        if Observability._initialized:
+            Observability.shutdown()
+
+
 # ── Blocker 2: user callback identity + CallbackManager ──
 
 def test_user_callback_object_identity_preserved():
@@ -174,6 +229,35 @@ def test_callback_manager_tags_preserved():
     if Observability._initialized:
         Observability.shutdown()
     assert mgr.tags == ["t1", "t2"]
+
+
+def test_callback_manager_inheritable_handlers_preserved():
+    """CallbackManager inheritable_handlers survive the clone (Blocker 2)."""
+    _clean_init(auto_instrument_langchain=True)
+    from langchain_core.runnables import RunnableLambda
+    from langchain_core.callbacks import BaseCallbackHandler
+    from langchain_core.callbacks.manager import CallbackManager
+
+    class InheritableNoop(BaseCallbackHandler):
+        def on_chain_start(self, *a, **kw): pass
+
+    inheritable_h = InheritableNoop()
+    mgr = CallbackManager(
+        handlers=[],
+        inheritable_handlers=[inheritable_h],
+        tags=["t1"],
+        inheritable_tags=["it1"],
+        metadata={"k": "v"},
+        inheritable_metadata={"ik": "iv"},
+    )
+    chain = RunnableLambda(lambda x: x)
+    chain.invoke("hi", config={"callbacks": mgr})
+    if Observability._initialized:
+        Observability.shutdown()
+    # Original manager's inheritable_handlers not mutated
+    assert inheritable_h in mgr.inheritable_handlers
+    assert mgr.inheritable_tags == ["it1"]
+    assert mgr.inheritable_metadata.get("ik") == "iv"
 
 
 # ── Blocker 3: generator init fail-open ──

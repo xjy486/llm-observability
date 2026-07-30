@@ -361,8 +361,10 @@ class ToolHandle:
                     continue
                 _, sanitized = _sanitize_attribute_pair(k, v)
                 clean_attrs[normalized_k] = sanitized
-            # Size-guard the entire event attributes
-            clean_attrs = _apply_size_limit_to_value(clean_attrs, MAX_EVENT_ATTRIBUTES_SIZE_BYTES) if isinstance(clean_attrs, dict) else clean_attrs
+            # P1-3: Size-guard the entire event attributes using RUNTIME config
+            # (not the compile-time constant MAX_EVENT_ATTRIBUTES_SIZE_BYTES).
+            max_attr = getattr(self._tracer.config, "max_attribute_bytes", MAX_EVENT_ATTRIBUTES_SIZE_BYTES) if self._tracer else MAX_EVENT_ATTRIBUTES_SIZE_BYTES
+            clean_attrs = _apply_size_limit_to_value(clean_attrs, max_attr) if isinstance(clean_attrs, dict) else clean_attrs
         self._span.add_event(normalized_name, attributes=clean_attrs)
 
     def set_error(self, error_type: str, error_message: str):

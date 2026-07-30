@@ -58,7 +58,9 @@ class TaskHandle:
         self._span.set_attribute(normalized_key, sanitized)
 
     def add_event(self, name: Any, attributes: dict = None):
-        normalized_name = name
+        # P1-3: normalize event name (was missing — bare name passed through)
+        from .tool import normalize_event_name
+        normalized_name = normalize_event_name(name)
         clean_attrs = {}
         if attributes:
             for k, v in attributes.items():
@@ -67,6 +69,9 @@ class TaskHandle:
                     continue
                 _, sanitized = _sanitize_attribute_pair(k, v)
                 clean_attrs[normalized_k] = sanitized
+            # P1-3: Size-guard the entire event attributes using RUNTIME config
+            max_attr = self._tracer.config.max_attribute_bytes if self._tracer else MAX_ATTRIBUTE_SIZE_BYTES
+            clean_attrs = _apply_size_limit_to_value(clean_attrs, max_attr) if isinstance(clean_attrs, dict) else clean_attrs
         self._span.add_event(normalized_name, attributes=clean_attrs)
 
     def set_error(self, error_type: str, error_message: str):
