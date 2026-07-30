@@ -68,7 +68,7 @@ jobs:
       - run: pip install -r requirements/base.txt
       - run: pip install -e sdk/python
       - run: |
-          python -m pytest sdk/tests/test_phase2_2_final_fixes.py sdk/tests/test_phase2_3_regression.py -q --tb=short
+          python -m pytest tests/test_phase2_2_final_fixes.py sdk/tests/test_phase2_3_regression.py -q --tb=short
 
   real-e2e:
     name: Real E2E (Live Endpoint)

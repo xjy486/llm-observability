@@ -1,0 +1,28 @@
+# requirements/base.txt
+# Unified dependencies for CI — covers core + proxy + SDK runtime + test suites.
+# All CI jobs install this first:  pip install -r requirements/base.txt
+
+# ─── Core (FastAPI API server) ───
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.5.0
+
+# ─── Proxy + SDK runtime ───
+aiohttp>=3.9.0
+
+# ─── Scripts ───
+requests>=2.28.0
+
+# ─── LangChain integration ───
+# Required by sdk/tests/ phase 2.3 & 2.4 suites (top-level imports of
+# langchain / langchain_core / langgraph). Versions pinned to the
+# phase 2.3 lock file (requirements/phase2.3-langchain-lock.txt).
+langchain==1.3.14
+langchain-core==1.5.1
+langgraph==1.2.9
+langchain-openai==1.4.0
+
+# ─── Test dependencies ───
+pytest>=7.0
+pytest-asyncio>=0.21
+openai>=1.0
