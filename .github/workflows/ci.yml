@@ -69,3 +69,22 @@ jobs:
       - run: pip install -e sdk/python
       - run: |
           python -m pytest sdk/tests/test_phase2_2_final_fixes.py sdk/tests/test_phase2_3_regression.py -q --tb=short
+
+  real-e2e:
+    name: Real E2E (Live Endpoint)
+    runs-on: ubuntu-latest
+    # Only on trusted branches with secrets; fork PRs excluded
+    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements/base.txt
+      - run: pip install -e sdk/python
+      - env:
+          E2E_API_KEY: ${{ secrets.E2E_API_KEY }}
+          E2E_BASE_URL: ${{ secrets.E2E_BASE_URL }}
+          E2E_MODEL: ${{ secrets.E2E_MODEL }}
+        run: |
+          python -m pytest sdk/tests/test_phase2_5_real_e2e.py -q --tb=short

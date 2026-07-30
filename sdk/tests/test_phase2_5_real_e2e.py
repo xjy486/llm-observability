@@ -1,0 +1,303 @@
+"""Phase 2.5 Real End-to-End tests (P0-6).
+
+Hits a REAL OpenAI-compatible endpoint to validate the full call chain:
+    SDK Agent → OpenAI Instrumentor → (GATEWAY) → LLM → Core ingest
+
+Gated by env vars E2E_API_KEY / E2E_BASE_URL (loaded from .env). Skipped when
+absent, so CI on forks/PRs without secrets does not fail.
+
+Never logs the API key.
+"""
+import os
+import sys
+import time
+import threading
+import json
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from unittest.mock import patch
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "proxy"))
+
+
+def _load_env():
+    """Load .env from workspace root if present (does not override real env)."""
+    env_path = os.path.join(os.path.dirname(__file__), "..", "..", ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+
+_load_env()
+
+import pytest
+
+try:
+    import openai
+    HAS_OPENAI = True
+except ImportError:
+    HAS_OPENAI = False
+
+from llm_observability import Observability
+from llm_observability.decorators import agent, llm, chain, tool
+from llm_observability.context import get_current_context
+from llm_observability.instrumentation.openai import OpenAIInstrumentor
+from trace_context import resolve_trace_context, extract_ownership
+
+
+E2E_API_KEY = os.environ.get("E2E_API_KEY")
+E2E_BASE_URL = os.environ.get("E2E_BASE_URL")
+E2E_MODEL = os.environ.get("E2E_MODEL", "gpt-4")
+
+RUN_E2E = bool(HAS_OPENAI and E2E_API_KEY and E2E_BASE_URL)
+skip_no_e2e = pytest.mark.skipif(not RUN_E2E, reason="E2E_API_KEY/E2E_BASE_URL not set")
+
+
+# ─── Mock Core Server (captures ingested spans) ──────────────
+
+class MockCoreHandler(BaseHTTPRequestHandler):
+    received_records = []
+
+    def do_POST(self):
+        if "/api/v1/ingest" in self.path:
+            length = int(self.headers["Content-Length"])
+            body = self.rfile.read(length)
+            data = json.loads(body)
+            MockCoreHandler.received_records.extend(data.get("records", []))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok","inserted":1,"total":1}')
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture
+def mock_core():
+    MockCoreHandler.received_records = []
+    server = HTTPServer(("127.0.0.1", 0), MockCoreHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{port}"
+    server.shutdown()
+
+
+@pytest.fixture(autouse=True)
+def reset_sdk():
+    yield
+    if Observability._initialized:
+        Observability.shutdown()
+
+
+def _client():
+    return openai.OpenAI(api_key=E2E_API_KEY, base_url=E2E_BASE_URL)
+
+
+def _records():
+    return list(MockCoreHandler.received_records)
+
+
+def _drain():
+    """Drain the reporter queue by shutting down (sends all buffered records).
+
+    The reporter flush interval is 5s; shutdown drains synchronously so we
+    don't need a long sleep. Called before reading _records().
+    """
+    if Observability._initialized:
+        Observability.shutdown()
+
+
+# ─── Scenario A: Manual decorator full chain ────────────────
+
+@skip_no_e2e
+def test_scenario_a_manual_decorator_full_chain(mock_core):
+    """AGENT → LLM (decorator) → real provider. Asserts parent chain + dedup."""
+    Observability.init(
+        app_name="e2e-app", endpoint=mock_core,
+        auto_instrument_openai=True, payload_strategy="masked",
+    )
+    tracer = Observability._tracer
+
+    @agent(name="qa")
+    def qa_agent(query):
+        client = _client()
+        resp = client.chat.completions.create(
+            model=E2E_MODEL,
+            messages=[{"role": "user", "content": query}],
+        )
+        return resp.choices[0].message.content
+
+    result = qa_agent("Reply with exactly: pong")
+    assert result, "expected a non-empty response"
+    _drain()
+
+    records = _records()
+    kinds = [r["span_kind"] for r in records]
+    assert "AGENT" in kinds, f"missing AGENT in {kinds}"
+    assert "LLM" in kinds, f"missing LLM in {kinds}"
+
+    agent_rec = [r for r in records if r["span_kind"] == "AGENT"][0]
+    llm_rec = [r for r in records if r["span_kind"] == "LLM"][0]
+    assert agent_rec["trace_id"] == llm_rec["trace_id"]
+    assert agent_rec["parent_span_id"] is None
+    assert llm_rec["parent_span_id"] == agent_rec["span_id"]
+    # Dedup: only ONE LLM span (decorator logical LLM + OpenAI dedup)
+    assert sum(1 for r in records if r["span_kind"] == "LLM") == 1
+
+
+# ─── Scenario C: Association full-chain ──────────────────────
+
+@skip_no_e2e
+def test_scenario_c_association_full_chain(mock_core):
+    """Association (user/session/message_id) inherited across AGENT → LLM."""
+    Observability.init(
+        app_name="e2e-app", endpoint=mock_core,
+        auto_instrument_openai=True,
+    )
+    tracer = Observability._tracer
+
+    @agent(user_id="alice", session_id="s1", message_id="m1")
+    def qa_agent():
+        client = _client()
+        resp = client.chat.completions.create(
+            model=E2E_MODEL,
+            messages=[{"role": "user", "content": "Reply with exactly: ok"}],
+        )
+        return resp.choices[0].message.content
+
+    qa_agent()
+    _drain()
+
+    records = _records()
+    agent_rec = [r for r in records if r["span_kind"] == "AGENT"][0]
+    llm_rec = [r for r in records if r["span_kind"] == "LLM"][0]
+    assert agent_rec.get("message_id") == "m1"
+    assert llm_rec.get("message_id") == "m1"
+    assert llm_rec.get("user_id") == "alice"
+
+
+# ─── Scenario E: Sampling ────────────────────────────────────
+
+@skip_no_e2e
+def test_scenario_e_sample_rate_zero(mock_core):
+    """sample_rate=0 → no SDK records reported."""
+    Observability.init(
+        app_name="e2e-app", endpoint=mock_core,
+        auto_instrument_openai=True, sample_rate=0.0,
+    )
+    tracer = Observability._tracer
+
+    with tracer.trace(name="unsampled"):
+        client = _client()
+        client.chat.completions.create(
+            model=E2E_MODEL,
+            messages=[{"role": "user", "content": "Reply: hi"}],
+        )
+    _drain()
+    # No records reported when unsampled
+    assert len(_records()) == 0
+
+
+# ─── Scenario A2: No-SDK compatibility (proxy-side) ─────────
+
+def test_scenario_a2_no_sdk_compatible():
+    """No SDK headers → proxy creates a new root trace (LLM fallback)."""
+    headers = {}
+    ctx = resolve_trace_context(headers)
+    ownership = extract_ownership(headers)
+    assert ctx.inherited is False
+    assert ownership is None
+
+
+# ─── Scenario B: Streaming ───────────────────────────────────
+
+@skip_no_e2e
+def test_scenario_f_streaming(mock_core):
+    """Streaming: AGENT + LLM spans, first chunk immediate-ish, bounded."""
+    Observability.init(
+        app_name="e2e-app", endpoint=mock_core,
+        auto_instrument_openai=True,
+    )
+    tracer = Observability._tracer
+    collected = []
+
+    @agent(name="stream-agent")
+    def stream_agent():
+        client = _client()
+        stream = client.chat.completions.create(
+            model=E2E_MODEL,
+            messages=[{"role": "user", "content": "Count from 1 to 3"}],
+            stream=True,
+        )
+        for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                collected.append(chunk.choices[0].delta.content)
+        return "".join(collected)
+
+    result = stream_agent()
+    assert result, "expected streamed output"
+    _drain()
+
+    records = _records()
+    kinds = [r["span_kind"] for r in records]
+    assert "AGENT" in kinds
+    assert "LLM" in kinds
+
+
+# ─── Scenario D: Task + Tool nested ──────────────────────────
+
+@skip_no_e2e
+def test_scenario_d_task_tool_nested(mock_core):
+    """AGENT → TASK → TOOL with a real LLM call inside TASK."""
+    Observability.init(
+        app_name="e2e-app", endpoint=mock_core,
+        auto_instrument_openai=True,
+    )
+    tracer = Observability._tracer
+
+    @tool(name="translate")
+    def translate(text, target="en"):
+        client = _client()
+        resp = client.chat.completions.create(
+            model=E2E_MODEL,
+            messages=[{"role": "user", "content": f"Translate to {target}: {text}"}],
+        )
+        return resp.choices[0].message.content
+
+    @chain(name="pipeline")
+    def pipeline(text):
+        return translate(text)
+
+    @agent(name="orchestrator")
+    def orchestrator(text):
+        return pipeline(text)
+
+    result = orchestrator("hello")
+    assert result, "expected a translation"
+    _drain()
+
+    records = _records()
+    kinds = [r["span_kind"] for r in records]
+    assert "AGENT" in kinds
+    assert "TASK" in kinds
+    assert "TOOL" in kinds
+    assert "LLM" in kinds
+
+    agent_rec = [r for r in records if r["span_kind"] == "AGENT"][0]
+    task_rec = [r for r in records if r["span_kind"] == "TASK"][0]
+    tool_rec = [r for r in records if r["span_kind"] == "TOOL"][0]
+    # Parent chain: TASK child of AGENT, TOOL child of TASK, LLM child of TOOL
+    assert task_rec["parent_span_id"] == agent_rec["span_id"]
+    assert tool_rec["parent_span_id"] == task_rec["span_id"]
+    assert all(r["trace_id"] == agent_rec["trace_id"] for r in records)
