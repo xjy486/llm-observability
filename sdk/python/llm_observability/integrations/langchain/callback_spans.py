@@ -147,7 +147,10 @@ class CallbackLLMHandle:
                     if messages:
                         normalized = normalize_messages(messages)
                         masked = mask_payload(normalized, strategy)
-                        guarded, truncated, orig_size = apply_size_guard(masked)
+                        guarded, truncated, orig_size = apply_size_guard(
+                        masked,
+                        max_bytes=self._tracer.config.max_payload_bytes if self._tracer else 32 * 1024,
+                    )
                         if self._span.payload is None:
                             self._span.payload = {}
                         self._span.payload["output"] = guarded
@@ -271,7 +274,10 @@ class CallbackLLMSpan:
                     else:
                         normalized = safe_serialize(self._invocation_params)
                     masked = mask_payload(normalized, strategy)
-                    guarded, truncated, orig_size = apply_size_guard(masked)
+                    guarded, truncated, orig_size = apply_size_guard(
+                        masked,
+                        max_bytes=self._tracer.config.max_payload_bytes if self._tracer else 32 * 1024,
+                    )
                     if span.payload is None:
                         span.payload = {}
                     span.payload["input"] = guarded
@@ -279,6 +285,13 @@ class CallbackLLMSpan:
                     logger.debug("LLM callback input payload failed: %s", e)
 
         span.start()
+
+        # Blocker 2.2: inherit Association Properties (user/session_id/message_id/...)
+        try:
+            from ...association import apply_association_to_span
+            apply_association_to_span(span)
+        except Exception:
+            pass
 
         try:
             self._token = set_context(ctx)

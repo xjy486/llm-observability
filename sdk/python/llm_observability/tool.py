@@ -489,6 +489,8 @@ class ToolContextManager:
                 pass
             raise
 
+        # Blocker 3.2: remember the parent context so a failed reset can restore it
+        self._previous_context = current
         self._handle = ToolHandle(span, tracer=self._tracer)
         return self._handle
 
@@ -567,12 +569,16 @@ class ToolContextManager:
                     unregister_span_event_sink(self._span.trace_id, self._span.span_id)
                 except Exception:
                     logger.debug("TOOL event sink unregister failed", exc_info=True)
-            # P0-2: reset_context itself must be fail-open
+            # P0-2: reset_context itself must be fail-open (Blocker 3.2: restore parent)
             if self._token is not None:
                 try:
                     reset_context(self._token)
                 except Exception:
                     logger.exception("TOOL context reset failed")
+                    try:
+                        set_context(getattr(self, "_previous_context", None))
+                    except Exception:
+                        pass
         return False
 
     def _process_input(self):

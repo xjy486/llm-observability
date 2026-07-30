@@ -100,24 +100,43 @@ def test_task_reporter_failure_preserves_success_result():
 
 
 def test_task_reset_context_failure_does_not_replace_business_error():
+    """reset_context failure in TASK __exit__ does not replace business error,
+    and restores the previous context (Blocker 3.2/3.3)."""
     _clean_init()
     tracer = Observability._tracer
-    from llm_observability import context as ctx_mod
-    original_reset = ctx_mod.reset_context
-    call_count = [0]
+    # Patch the ACTUAL reference used by task.py (imported at load time)
+    import llm_observability.task as task_mod
+    original_reset = task_mod.reset_context
     def flaky_reset(token):
-        call_count[0] += 1
-        if call_count[0] >= 100:  # only the TASK reset (high count threshold)
-            raise RuntimeError("reset fail")
-        original_reset(token)
-    ctx_mod.reset_context = flaky_reset
+        raise RuntimeError("reset fail")
+    task_mod.reset_context = flaky_reset
     try:
         with pytest.raises(ValueError):
             with tracer.trace(name="root"):
                 with tracer.task(name="sub"):
                     raise ValueError("biz error")
     finally:
-        ctx_mod.reset_context = original_reset
+        task_mod.reset_context = original_reset
+    Observability.shutdown()
+
+
+def test_tool_reset_context_failure_does_not_replace_business_error():
+    """reset_context failure in TOOL __exit__ does not replace business error,
+    and restores the previous context (Blocker 3.2/3.3)."""
+    _clean_init()
+    tracer = Observability._tracer
+    import llm_observability.tool as tool_mod
+    original_reset = tool_mod.reset_context
+    def flaky_reset(token):
+        raise RuntimeError("reset fail")
+    tool_mod.reset_context = flaky_reset
+    try:
+        with pytest.raises(ValueError):
+            with tracer.trace(name="root"):
+                with tracer.tool(name="search"):
+                    raise ValueError("biz error")
+    finally:
+        tool_mod.reset_context = original_reset
     Observability.shutdown()
 
 
@@ -176,6 +195,75 @@ def test_tool_reporter_failure_preserves_success_result():
                 h.set_output("ok")
     finally:
         tracer.reporter.report = original
+    Observability.shutdown()
+
+
+# ── Blocker 3.1: span-init failure + fail_open ──
+
+def test_task_set_context_failure_fail_open_runs_business():
+    """set_context failure + fail_open=True runs business without observation."""
+    _clean_init(fail_open=True)
+    tracer = Observability._tracer
+    import llm_observability.task as task_mod
+    original_set = task_mod.set_context
+    def failing_set(ctx):
+        raise RuntimeError("set_context boom")
+    task_mod.set_context = failing_set
+    try:
+        from llm_observability.decorators import chain
+        @chain()
+        def sub():
+            return "biz-result"
+        # Inside a trace, set_context fails -> fail_open runs business
+        with tracer.trace(name="root"):
+            result = sub()
+        assert result == "biz-result"
+    finally:
+        task_mod.set_context = original_set
+    Observability.shutdown()
+
+
+def test_task_set_context_failure_fail_closed_raises():
+    """set_context failure + fail_open=False propagates the init error."""
+    _clean_init(fail_open=False)
+    tracer = Observability._tracer
+    import llm_observability.task as task_mod
+    original_set = task_mod.set_context
+    def failing_set(ctx):
+        raise RuntimeError("set_context boom")
+    task_mod.set_context = failing_set
+    try:
+        from llm_observability.decorators import chain
+        @chain()
+        def sub():
+            return "biz-result"
+        with tracer.trace(name="root"):
+            with pytest.raises(RuntimeError):
+                sub()
+    finally:
+        task_mod.set_context = original_set
+    Observability.shutdown()
+
+
+def test_tool_set_context_failure_fail_open_runs_business():
+    """set_context failure in TOOL + fail_open=True runs business."""
+    _clean_init(fail_open=True)
+    tracer = Observability._tracer
+    import llm_observability.tool as tool_mod
+    original_set = tool_mod.set_context
+    def failing_set(ctx):
+        raise RuntimeError("set_context boom")
+    tool_mod.set_context = failing_set
+    try:
+        from llm_observability.decorators import tool
+        @tool()
+        def search():
+            return "biz-result"
+        with tracer.trace(name="root"):
+            result = search()
+        assert result == "biz-result"
+    finally:
+        tool_mod.set_context = original_set
     Observability.shutdown()
 
 

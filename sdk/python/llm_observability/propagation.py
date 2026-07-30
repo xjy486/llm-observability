@@ -120,15 +120,18 @@ def inject_headers(
 
     # P0-5: baggage carries association metadata (incl. message_id) for the
     # downstream Gateway/Server to inherit.
+    # Blocker 2.1: use the unified W3C percent-encoding contract so special
+    # characters (comma/equals/space/unicode/control) are safely encoded.
+    from .association_propagation import encode_baggage_value
     baggage_parts = []
     if user_id:
-        baggage_parts.append(f"user={user_id}")
+        baggage_parts.append(f"user={encode_baggage_value(user_id)}")
     if session_id:
-        baggage_parts.append(f"session_id={session_id}")
+        baggage_parts.append(f"session_id={encode_baggage_value(session_id)}")
     if business_scene:
-        baggage_parts.append(f"business_scenario={business_scene}")
+        baggage_parts.append(f"business_scenario={encode_baggage_value(business_scene)}")
     if message_id:
-        baggage_parts.append(f"message_id={message_id}")
+        baggage_parts.append(f"message_id={encode_baggage_value(message_id)}")
     if baggage_parts:
         headers["baggage"] = ",".join(baggage_parts)
 

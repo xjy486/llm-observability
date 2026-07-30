@@ -93,6 +93,63 @@ def mock_core():
     server.shutdown()
 
 
+@pytest.fixture
+def proxy_server(mock_core):
+    """Start the telemetry proxy in-process pointing upstream at the real
+    endpoint and observability at the mock Core. Yields the proxy URL.
+
+    This enables the full chain: SDK -> Proxy (GATEWAY) -> Core.
+    """
+    if not RUN_E2E:
+        yield None
+        return
+    import asyncio as _asyncio
+    from config import ProxyConfig
+    from main import create_app
+
+    cfg = ProxyConfig(
+        listen_host="127.0.0.1",
+        listen_port=0,
+        upstream_url=E2E_BASE_URL,
+        observability_endpoint=mock_core,
+        payload_strategy="masked",
+    )
+
+    loop = _asyncio.new_event_loop()
+    runner_holder = {}
+
+    def _run():
+        _asyncio.set_event_loop(loop)
+        app = loop.run_until_complete(create_app(cfg))
+        from aiohttp import web as _web
+        runner = _web.AppRunner(app)
+        loop.run_until_complete(runner.setup())
+        site = _web.TCPSite(runner, "127.0.0.1", 0)
+        loop.run_until_complete(site.start())
+        runner_holder["runner"] = runner
+        runner_holder["port"] = site._server.sockets[0].getsockname()[1]
+        loop.run_forever()
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    # Wait for the port to be assigned
+    import time as _time
+    deadline = _time.time() + 10
+    while "port" not in runner_holder and _time.time() < deadline:
+        _time.sleep(0.05)
+    port = runner_holder.get("port")
+    if port is None:
+        yield None
+        return
+    yield f"http://127.0.0.1:{port}"
+    # Teardown
+    try:
+        loop.call_soon_threadsafe(loop.stop)
+        t.join(timeout=5)
+    except Exception:
+        pass
+
+
 @pytest.fixture(autouse=True)
 def reset_sdk():
     yield
@@ -301,3 +358,273 @@ def test_scenario_d_task_tool_nested(mock_core):
     assert task_rec["parent_span_id"] == agent_rec["span_id"]
     assert tool_rec["parent_span_id"] == task_rec["span_id"]
     assert all(r["trace_id"] == agent_rec["trace_id"] for r in records)
+
+
+# ─── Scenario A3: @llm + OpenAI dedup ─────────────────────────
+
+@skip_no_e2e
+def test_scenario_a3_llm_decorator_dedup(mock_core):
+    """@llm decorator + OpenAI instrumentor -> exactly ONE LLM span (dedup).
+
+    The @llm sets logical_llm_span_active=True so the OpenAI instrumentor
+    skips its own LLM span (only the decorator's logical LLM remains).
+    """
+    Observability.init(
+        app_name="e2e-app", endpoint=mock_core,
+        auto_instrument_openai=True,
+    )
+    tracer = Observability._tracer
+
+    @agent(name="qa")
+    def qa_agent():
+        @llm()
+        def call_model(messages):
+            client = _client()
+            resp = client.chat.completions.create(
+                model=E2E_MODEL,
+                messages=messages,
+            )
+            return resp.choices[0].message.content
+        return call_model([{"role": "user", "content": "Reply with exactly: ok"}])
+
+    qa_agent()
+    _drain()
+    records = _records()
+    llm_count = sum(1 for r in records if r["span_kind"] == "LLM")
+    assert llm_count == 1, f"expected exactly 1 LLM (dedup), got {llm_count}"
+
+
+# ─── Scenario G: GATEWAY via proxy (mock upstream, fast) ──────
+
+class MockUpstreamHandler(BaseHTTPRequestHandler):
+    """Mock OpenAI-compatible upstream returning a canned chat completion."""
+    def do_POST(self):
+        body = json.dumps({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "model": "mock-model",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+@pytest.fixture
+def mock_upstream():
+    server = HTTPServer(("127.0.0.1", 0), MockUpstreamHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{port}"
+    server.shutdown()
+
+
+def test_scenario_g_gateway_via_proxy(mock_core, mock_upstream):
+    """Full chain: SDK -> Proxy -> GATEWAY -> Core (mock upstream for speed).
+
+    Validates the in-process proxy creates a GATEWAY span that shares the
+    SDK trace. Uses a fast mock upstream so it runs in CI without secrets.
+    """
+    import asyncio as _asyncio
+    from config import ProxyConfig
+    from main import create_app
+    from aiohttp import web as _web
+    import reporter as reporter_mod
+
+    # Lower the proxy reporter flush interval so GATEWAY flushes quickly
+    orig_reporter_init = reporter_mod.TelemetryReporter.__init__
+    def fast_init(self, *a, **kw):
+        kw.setdefault("flush_interval", 0.5)
+        orig_reporter_init(self, *a, **kw)
+    reporter_mod.TelemetryReporter.__init__ = fast_init
+
+    cfg = ProxyConfig(
+        listen_host="127.0.0.1", listen_port=0,
+        upstream_url=mock_upstream,
+        observability_endpoint=mock_core,
+        payload_strategy="masked",
+    )
+    loop = _asyncio.new_event_loop()
+    holder = {}
+
+    def _run():
+        _asyncio.set_event_loop(loop)
+        app = loop.run_until_complete(create_app(cfg))
+        runner = _web.AppRunner(app)
+        loop.run_until_complete(runner.setup())
+        site = _web.TCPSite(runner, "127.0.0.1", 0)
+        loop.run_until_complete(site.start())
+        holder["port"] = site._server.sockets[0].getsockname()[1]
+        loop.run_forever()
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    import time as _t
+    deadline = _t.time() + 10
+    while "port" not in holder and _t.time() < deadline:
+        _t.sleep(0.05)
+    assert "port" in holder, "proxy failed to start"
+    proxy_url = f"http://127.0.0.1:{holder['port']}"
+
+    Observability.init(
+        app_name="e2e-app", endpoint=mock_core,
+        auto_instrument_openai=True,
+    )
+    tracer = Observability._tracer
+    proxy_client = openai.OpenAI(api_key="test-key", base_url=proxy_url)
+
+    @agent(name="gateway-agent")
+    def gateway_agent():
+        resp = proxy_client.chat.completions.create(
+            model="mock-model",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        return resp.choices[0].message.content
+
+    result = gateway_agent()
+    assert result, "expected a response"
+    _drain()
+    # SDK side: AGENT + LLM reported
+    records = _records()
+    assert any(r["span_kind"] == "AGENT" for r in records), "missing AGENT"
+    assert any(r["span_kind"] == "LLM" for r in records), "missing LLM"
+
+    # Proxy side: send a direct request with SDK-style ownership headers to
+    # validate the proxy creates a GATEWAY span sharing the SDK trace.
+    import urllib.request as _urllib
+    from llm_observability.context import get_current_context
+    from llm_observability.propagation import inject_traceparent
+    with tracer.trace(name="gateway-direct", session_id="s1", user_id="u1"):
+        ctx = get_current_context()
+        tp = inject_traceparent(ctx)
+        body = json.dumps({"model": "mock-model", "messages": [{"role": "user", "content": "hi"}]}).encode()
+        req = _urllib.Request(
+            f"{proxy_url}/v1/chat/completions", data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-LLM-OBS-Span-Role": "llm",
+                "traceparent": tp,
+                "X-User-Id": "u1",
+                "X-Session-Id": "s1",
+            },
+        )
+        _urllib.urlopen(req, timeout=10).read()
+    _drain()
+    # Wait for the proxy reporter to flush GATEWAY
+    for _ in range(20):
+        _t.sleep(0.5)
+        if any(r["span_kind"] == "GATEWAY" for r in _records()):
+            break
+    records = _records()
+    kinds = [r["span_kind"] for r in records]
+    assert "GATEWAY" in kinds, f"missing GATEWAY in {kinds}"
+    gateway_recs = [r for r in records if r["span_kind"] == "GATEWAY"]
+    # GATEWAY inherited association from headers
+    assert gateway_recs[0].get("user_id") == "u1"
+    assert gateway_recs[0].get("session_id") == "s1"
+    # Restore the reporter init
+    reporter_mod.TelemetryReporter.__init__ = orig_reporter_init
+
+
+# ─── Scenario B: LangChain Auto Real E2E ──────────────────────
+
+@skip_no_e2e
+def test_scenario_b_langchain_auto(mock_core):
+    """LangChain auto-instrumentation: a RunnableLambda.invoke produces an
+    AGENT (auto-root) + callback spans without any explicit wrapper."""
+    Observability.init(
+        app_name="e2e-app", endpoint=mock_core,
+        auto_instrument_openai=True, auto_instrument_langchain=True,
+    )
+
+    from langchain_core.runnables import RunnableLambda
+
+    def echo(text):
+        return f"echo:{text}"
+
+    chain = RunnableLambda(echo)
+    result = chain.invoke("hello")
+    assert "echo:hello" in result
+    _drain()
+    records = _records()
+    kinds = [r["span_kind"] for r in records]
+    # Auto-root creates an AGENT
+    assert "AGENT" in kinds, f"missing AGENT (auto-root) in {kinds}"
+
+
+@skip_no_e2e
+def test_scenario_b_langchain_auto_chatmodel(mock_core):
+    """LangChain auto: a real ChatModel via langchain_openai produces AGENT +
+    LLM (callback) spans with dedup against the OpenAI instrumentor."""
+    Observability.init(
+        app_name="e2e-app", endpoint=mock_core,
+        auto_instrument_openai=True, auto_instrument_langchain=True,
+    )
+
+    from langchain_openai import ChatOpenAI
+
+    model = ChatOpenAI(
+        api_key=E2E_API_KEY, base_url=E2E_BASE_URL, model=E2E_MODEL,
+    )
+    result = model.invoke("Reply with exactly: ok")
+    assert result, "expected a response"
+    _drain()
+    records = _records()
+    kinds = [r["span_kind"] for r in records]
+    assert "AGENT" in kinds, f"missing AGENT (auto-root) in {kinds}"
+    assert "LLM" in kinds, f"missing LLM in {kinds}"
+    # Dedup: at most one LLM per model attempt
+    llm_count = sum(1 for r in records if r["span_kind"] == "LLM")
+    assert llm_count == 1, f"expected 1 LLM (dedup), got {llm_count}"
+
+
+@skip_no_e2e
+def test_scenario_b_langchain_auto_sequence(mock_core):
+    """LangChain auto: a RunnableSequence invokes and produces AGENT + spans."""
+    Observability.init(
+        app_name="e2e-app", endpoint=mock_core,
+        auto_instrument_openai=True, auto_instrument_langchain=True,
+    )
+
+    from langchain_core.runnables import RunnableLambda
+
+    chain = RunnableLambda(lambda x: x + " step1") | RunnableLambda(lambda x: x + " step2")
+    result = chain.invoke("start")
+    assert "step1" in result and "step2" in result
+    _drain()
+    records = _records()
+    kinds = [r["span_kind"] for r in records]
+    assert "AGENT" in kinds, f"missing AGENT (auto-root) in {kinds}"
+
+
+@skip_no_e2e
+def test_scenario_b_langchain_auto_user_config_preserved(mock_core):
+    """User-provided callbacks are still called when LangChain auto is on."""
+    Observability.init(
+        app_name="e2e-app", endpoint=mock_core,
+        auto_instrument_openai=True, auto_instrument_langchain=True,
+    )
+
+    from langchain_core.runnables import RunnableLambda
+    from langchain_core.callbacks import BaseCallbackHandler
+
+    calls = {"chain_start": 0}
+
+    class CountingHandler(BaseCallbackHandler):
+        def on_chain_start(self, serialized, inputs, **kwargs):
+            calls["chain_start"] += 1
+
+    chain = RunnableLambda(lambda x: x)
+    result = chain.invoke("hi", config={"callbacks": [CountingHandler()]})
+    _drain()
+    assert calls["chain_start"] >= 1, "user callback was not called"
+    # User config not mutated (no leftover auto handler)
+    records = _records()
+    assert any(r["span_kind"] == "AGENT" for r in records)

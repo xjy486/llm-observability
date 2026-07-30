@@ -548,12 +548,26 @@ def _run_task_sync(func, args, kwargs, task_type, name, fail_open, extra):
     func_name = name or func.__name__
     from .task import TaskContextManager
     bound_input = _bind_arguments(func, args, kwargs)
-    with TaskContextManager(
-        tracer=tracer, name=func_name, task_type=task_type, input=bound_input,
-    ) as handle:
+    # Blocker 3.1: span-init failures (e.g. set_context) must not block business
+    # when fail_open; run business without observation instead.
+    try:
+        cm = TaskContextManager(
+            tracer=tracer, name=func_name, task_type=task_type, input=bound_input,
+        )
+        handle = cm.__enter__()
+    except Exception:
+        if _resolve_fail_open(fail_open):
+            logger.warning("@%s: span init failed — running without observation", task_type, exc_info=True)
+            return func(*args, **kwargs)
+        raise
+    try:
         result = func(*args, **kwargs)
         handle.set_output(result)
         return result
+    except BaseException:
+        raise
+    finally:
+        cm.__exit__(*sys_exc_info())
 
 
 async def _run_task_async(func, args, kwargs, task_type, name, fail_open, extra):
@@ -569,12 +583,24 @@ async def _run_task_async(func, args, kwargs, task_type, name, fail_open, extra)
     func_name = name or func.__name__
     from .task import TaskContextManager
     bound_input = _bind_arguments(func, args, kwargs)
-    with TaskContextManager(
-        tracer=tracer, name=func_name, task_type=task_type, input=bound_input,
-    ) as handle:
+    try:
+        cm = TaskContextManager(
+            tracer=tracer, name=func_name, task_type=task_type, input=bound_input,
+        )
+        handle = cm.__enter__()
+    except Exception:
+        if _resolve_fail_open(fail_open):
+            logger.warning("@%s: span init failed — running without observation", task_type, exc_info=True)
+            return await func(*args, **kwargs)
+        raise
+    try:
         result = await func(*args, **kwargs)
         handle.set_output(result)
         return result
+    except BaseException:
+        raise
+    finally:
+        cm.__exit__(*sys_exc_info())
 
 
 def _run_task_sync_gen(func, args, kwargs, task_type, name, fail_open, extra):
@@ -624,7 +650,9 @@ async def _run_task_async_gen(func, args, kwargs, task_type, name, fail_open, ex
     from .task import TaskContextManager
     bound_input = _bind_arguments(func, args, kwargs)
     from .integrations.langchain.stream_accumulator import BoundedStreamAccumulator
-    acc = BoundedStreamAccumulator()
+    acc = BoundedStreamAccumulator(
+        max_bytes=getattr(tracer.config, "max_payload_bytes", 32 * 1024)
+    )
     with TaskContextManager(
         tracer=tracer, name=func_name, task_type=task_type, input=bound_input,
     ) as handle:
@@ -677,10 +705,22 @@ def _run_tool_sync(func, args, kwargs, name, tool_type, fail_open):
         raise RuntimeError("@tool: requires an active trace")
     func_name = name or func.__name__
     bound_input = _bind_arguments(func, args, kwargs)
-    with tracer.tool(name=func_name, tool_type=tool_type, input=bound_input) as handle:
+    try:
+        cm = tracer.tool(name=func_name, tool_type=tool_type, input=bound_input)
+        handle = cm.__enter__()
+    except Exception:
+        if _resolve_fail_open(fail_open):
+            logger.warning("@tool: span init failed — running without observation", exc_info=True)
+            return func(*args, **kwargs)
+        raise
+    try:
         result = func(*args, **kwargs)
         handle.set_output(result)
         return result
+    except BaseException:
+        raise
+    finally:
+        cm.__exit__(*sys_exc_info())
 
 
 async def _run_tool_async(func, args, kwargs, name, tool_type, fail_open):
@@ -694,10 +734,22 @@ async def _run_tool_async(func, args, kwargs, name, tool_type, fail_open):
         raise RuntimeError("@tool: requires an active trace")
     func_name = name or func.__name__
     bound_input = _bind_arguments(func, args, kwargs)
-    with tracer.tool(name=func_name, tool_type=tool_type, input=bound_input) as handle:
+    try:
+        cm = tracer.tool(name=func_name, tool_type=tool_type, input=bound_input)
+        handle = cm.__enter__()
+    except Exception:
+        if _resolve_fail_open(fail_open):
+            logger.warning("@tool: span init failed — running without observation", exc_info=True)
+            return await func(*args, **kwargs)
+        raise
+    try:
         result = await func(*args, **kwargs)
         handle.set_output(result)
         return result
+    except BaseException:
+        raise
+    finally:
+        cm.__exit__(*sys_exc_info())
 
 
 def _run_tool_sync_gen(func, args, kwargs, name, tool_type, fail_open):
@@ -713,7 +765,9 @@ def _run_tool_sync_gen(func, args, kwargs, name, tool_type, fail_open):
     func_name = name or func.__name__
     bound_input = _bind_arguments(func, args, kwargs)
     from .integrations.langchain.stream_accumulator import BoundedStreamAccumulator
-    acc = BoundedStreamAccumulator()
+    acc = BoundedStreamAccumulator(
+        max_bytes=getattr(tracer.config, "max_payload_bytes", 32 * 1024)
+    )
     with tracer.tool(name=func_name, tool_type=tool_type, input=bound_input) as handle:
         for item in func(*args, **kwargs):
             acc.append(item)
@@ -736,7 +790,9 @@ async def _run_tool_async_gen(func, args, kwargs, name, tool_type, fail_open):
     func_name = name or func.__name__
     bound_input = _bind_arguments(func, args, kwargs)
     from .integrations.langchain.stream_accumulator import BoundedStreamAccumulator
-    acc = BoundedStreamAccumulator()
+    acc = BoundedStreamAccumulator(
+        max_bytes=getattr(tracer.config, "max_payload_bytes", 32 * 1024)
+    )
     with tracer.tool(name=func_name, tool_type=tool_type, input=bound_input) as handle:
         async for item in func(*args, **kwargs):
             acc.append(item)

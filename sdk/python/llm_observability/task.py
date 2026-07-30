@@ -188,6 +188,8 @@ class TaskContextManager:
                 pass
             raise
 
+        # Blocker 3.2: remember the parent context so a failed reset can restore it
+        self._previous_context = current
         self._handle = TaskHandle(span, tracer=self._tracer)
         return self._handle
 
@@ -251,12 +253,17 @@ class TaskContextManager:
                 unregister_span_event_sink(self._span.trace_id, self._span.span_id)
             except Exception:
                 logger.debug("TASK event sink unregister failed", exc_info=True)
-            # P0-2: reset_context itself must be fail-open
+            # P0-2: reset_context itself must be fail-open (Blocker 3.2: restore parent)
             if self._token is not None:
                 try:
                     reset_context(self._token)
                 except Exception:
                     logger.exception("TASK context reset failed")
+                    try:
+                        from .context import set_context
+                        set_context(getattr(self, "_previous_context", None))
+                    except Exception:
+                        pass
         return False
 
     async def __aenter__(self) -> TaskHandle:

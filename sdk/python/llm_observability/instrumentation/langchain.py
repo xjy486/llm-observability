@@ -1,25 +1,30 @@
 """LangChain Auto-Instrumentation — Phase 2.5 final closeout (P0-1).
 
 Reliable auto-instrumentation via a per-invocation ContextVar state model
-layered on top of Runnable base-class patching. This fixes:
+layered on top of class method patching. This fixes:
 
 - Import-order independence (methods resolved at call time on the class).
 - Per-invocation isolation: fresh handler/registry/state per root invocation;
   nested calls reuse the root's state (no duplicate AGENT).
-- Non-destructive user Config (deep copy before mutating callbacks).
-- User callback preservation (list / CallbackManager / AsyncCallbackManager).
-- Hard dedup vs observe_runnable / observe_agent / middleware / OpenAI.
-
-The ContextVar holds `AutoInvocationState(handler, root_trace_cm, depth)`.
-Root call (no active trace, depth 0): create state. Nested (depth>0 or active
-trace): reuse, depth++. Exit root: close runs, end AGENT, clear ContextVar.
+- Non-destructive user Config (deep copy before mutating callbacks); the
+  copied config is ALWAYS placed back into kwargs["config"] (even when the
+  user passed no config), so the callback reaches LangChain.
+- Async correctness: ainvoke/astream wrappers await the coroutine INSIDE the
+  try/finally, so the AGENT root stays open for the full async execution.
+- Subclass coverage: patches invoke/ainvoke/stream/astream on Runnable AND on
+  every subclass that overrides these methods in its own __dict__ (e.g.
+  BaseChatModel, RunnableSequence, RunnableBinding, RunnableParallel,
+  CompiledGraph), so Direct ChatModel / Sequence / Agent invocations enter
+  the wrapper.
+- Handler cleanup: on root exit, calls handler.close_open_runs() to finalize
+  any unfinished callback spans.
 """
 import copy
 import functools
 import logging
 import threading
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from .base import BaseInstrumentor
@@ -42,40 +47,91 @@ _AUTO_STATE: ContextVar[Optional[AutoInvocationState]] = ContextVar(
 )
 
 
+def _collect_candidate_classes():
+    """Collect Runnable + subclasses that override invoke/ainvoke/stream/astream.
+
+    Only classes that define the method in their OWN __dict__ (i.e. override the
+    base) are returned for a given method, so patching them is necessary.
+    """
+    candidates = []
+    try:
+        from langchain_core.runnables.base import Runnable
+        candidates.append(Runnable)
+    except ImportError:
+        return []
+    # Subclasses known to override invoke/ainvoke/stream/astream
+    for path in (
+        "langchain_core.language_models.chat_models.BaseChatModel",
+        "langchain_core.language_models.llms.BaseLLM",
+        "langchain_core.runnables.base.RunnableSequence",
+        "langchain_core.runnables.base.RunnableParallel",
+        "langchain_core.runnables.base.RunnableBinding",
+        "langchain_core.runnables.base.RunnableBindingBase",
+        "langchain_core.runnables.base.RunnableMap",
+        "langchain_core.runnables.base.RunnableLambda",
+        "langchain_core.runnables.base.RunnablePassthrough",
+        "langgraph.graph.state.CompiledStateGraph",
+        "langgraph.graph.graph.CompiledGraph",
+    ):
+        try:
+            mod_name, cls_name = path.rsplit(".", 1)
+            mod = __import__(mod_name, fromlist=[cls_name])
+            cls = getattr(mod, cls_name, None)
+            if cls is not None and cls not in candidates:
+                candidates.append(cls)
+        except Exception:
+            pass
+    return candidates
+
+
 class LangChainInstrumentor(BaseInstrumentor):
-    """Auto-instruments LangChain by patching Runnable base-class methods."""
+    """Auto-instruments LangChain by patching Runnable + subclass methods."""
 
     def __init__(self):
         super().__init__()
         self._tracer = None
-        self._originals: dict[str, Any] = {}
-        self._runnable_cls = None
+        # originals keyed by (class, method_name)
+        self._originals: dict[tuple, Any] = {}
+        self._patched_classes: list = []
         self._lock = threading.Lock()
 
     def instrument(self, tracer=None, **kwargs):
         """Install the LangChain auto-instrumentation."""
         if self._patched:
             return
-        try:
-            from langchain_core.runnables.base import Runnable
-        except ImportError:
+        candidates = _collect_candidate_classes()
+        if not candidates:
             logger.warning("langchain_core not installed — cannot auto-instrument")
             return
 
         self._tracer = tracer
-        self._runnable_cls = Runnable
         instrumentor = self
 
-        for method_name in _PATCHED_METHODS:
-            original = getattr(Runnable, method_name, None)
-            if original is None:
-                continue
-            self._originals[method_name] = original
-            wrapper = instrumentor._make_wrapper(method_name, original)
-            setattr(Runnable, method_name, wrapper)
+        for cls in candidates:
+            for method_name in _PATCHED_METHODS:
+                # Only patch if the class defines the method in its OWN __dict__
+                # (i.e. it overrides the base). For the base Runnable itself,
+                # always patch.
+                if cls is not candidates[0] and method_name not in cls.__dict__:
+                    continue
+                original = cls.__dict__.get(method_name)
+                if original is None:
+                    continue
+                self._originals[(cls, method_name)] = original
+                wrapper = instrumentor._make_wrapper(method_name, original)
+                try:
+                    setattr(cls, method_name, wrapper)
+                    if cls not in self._patched_classes:
+                        self._patched_classes.append(cls)
+                except (TypeError, AttributeError):
+                    # Some classes are immutable (e.g. ABCs); skip
+                    pass
 
         self._patched = True
-        logger.info("LangChain auto-instrumentation installed (Runnable patch)")
+        logger.info(
+            "LangChain auto-instrumentation installed (%d classes patched)",
+            len(self._patched_classes),
+        )
 
     def _make_wrapper(self, method_name: str, original):
         """Build a wrapper for a Runnable method."""
@@ -84,7 +140,7 @@ class LangChainInstrumentor(BaseInstrumentor):
         if method_name == "invoke":
             @functools.wraps(original)
             def wrapper(self_runnable, *args, **kwargs):
-                return instrumentor._run_with_auto_root(
+                return instrumentor._run_sync_with_auto_root(
                     original, self_runnable, args, kwargs,
                 )
             return wrapper
@@ -92,7 +148,7 @@ class LangChainInstrumentor(BaseInstrumentor):
         if method_name == "ainvoke":
             @functools.wraps(original)
             async def awrapper(self_runnable, *args, **kwargs):
-                return await instrumentor._run_with_auto_root(
+                return await instrumentor._run_async_with_auto_root(
                     original, self_runnable, args, kwargs,
                 )
             return awrapper
@@ -119,12 +175,7 @@ class LangChainInstrumentor(BaseInstrumentor):
     # ── Per-invocation state management ──
 
     def _enter_invocation(self):
-        """Enter an invocation. Returns (state, is_root, token).
-
-        Root invocation (no active trace, no existing state): creates a fresh
-        handler + AGENT root, sets the ContextVar. Nested: reuses state,
-        increments depth.
-        """
+        """Enter an invocation. Returns (state, is_root, token)."""
         from ..context import get_current_context
         existing = _AUTO_STATE.get()
         if existing is not None:
@@ -132,12 +183,10 @@ class LangChainInstrumentor(BaseInstrumentor):
             return existing, False, None
 
         if get_current_context() is not None:
-            # A trace already exists (e.g., user @agent) — don't auto-create root
             state = AutoInvocationState(handler=self._build_callback_handler(), depth=1)
             token = _AUTO_STATE.set(state)
             return state, False, token
 
-        # Root invocation: create handler + AGENT root
         handler = self._build_callback_handler()
         root_cm, _ = self._maybe_open_root()
         state = AutoInvocationState(handler=handler, root_trace_cm=root_cm, depth=1)
@@ -145,15 +194,24 @@ class LangChainInstrumentor(BaseInstrumentor):
         return state, True, token
 
     def _exit_invocation(self, state, is_root, token, exc_val=None):
-        """Exit an invocation. Closes root on root exit, clears ContextVar."""
+        """Exit an invocation. Closes open runs + root, clears ContextVar."""
         if state is None:
             return
         state.depth -= 1
         if is_root or state.depth <= 0:
-            # Root exit: close open runs, end AGENT, clear ContextVar
+            # 1.4: close any unfinished callback runs (end/error missing)
+            if state.handler is not None:
+                try:
+                    state.handler.close_open_runs(reason="auto_invocation_exit")
+                except Exception:
+                    logger.debug("close_open_runs failed", exc_info=True)
+            # Close the AGENT root
             self._close_root(state.root_trace_cm, exc_val)
             if token is not None:
-                _AUTO_STATE.reset(token)
+                try:
+                    _AUTO_STATE.reset(token)
+                except Exception:
+                    _AUTO_STATE.set(None)
             else:
                 _AUTO_STATE.set(None)
 
@@ -196,15 +254,37 @@ class LangChainInstrumentor(BaseInstrumentor):
         except Exception:
             logger.debug("auto-root trace close failed", exc_info=True)
 
+    def _normalize_config_to_kwargs(self, args, kwargs):
+        """Extract a positional config arg into kwargs.
+
+        LangChain invoke/ainvoke signature: invoke(self, input, config=None, **kwargs).
+        When a Sequence calls step.invoke(input, config), config arrives as
+        args[1]. We move it into kwargs so _copy_config/_merge_callback can
+        operate on it without creating a duplicate positional+keyword conflict.
+
+        Returns (new_args, kwargs_with_config).
+        """
+        if len(args) >= 2 and "config" not in kwargs:
+            # args layout after self_runnable: (input, config, ...)
+            kwargs = {**kwargs, "config": args[1]}
+            args = (args[0],) + args[2:]
+        return args, kwargs
+
     def _copy_config(self, kwargs):
-        """Non-destructive Config copy (P0-1): never mutate user Config."""
+        """Non-destructive Config copy. ALWAYS places the copy back into kwargs.
+
+        1.1 fix: even when the user passed no config, we create an empty dict,
+        place it into kwargs["config"], and return it so _merge_callback can
+        inject our handler and LangChain actually receives it.
+        """
         config = kwargs.get("config")
         if config is None:
-            return kwargs, {}
+            config_copy = {}
+            new_kwargs = {**kwargs, "config": config_copy}
+            return new_kwargs, config_copy
         try:
             config_copy = copy.deepcopy(config)
         except Exception:
-            # Fallback: shallow dict copy
             try:
                 config_copy = dict(config) if isinstance(config, dict) else {}
             except Exception:
@@ -216,6 +296,8 @@ class LangChainInstrumentor(BaseInstrumentor):
         """Merge our callback handler into the COPIED config (non-destructive).
 
         Preserves user callbacks: None / list / CallbackManager / AsyncCallbackManager.
+        A CallbackManager is unwrapped to its .handlers list (we're operating on a
+        deep copy, so this is non-destructive to the user's original).
         """
         if handler is None:
             return
@@ -224,16 +306,24 @@ class LangChainInstrumentor(BaseInstrumentor):
         existing = config_copy.get("callbacks")
         if existing is None:
             config_copy["callbacks"] = [handler]
-        elif isinstance(existing, list):
+            return
+        # Unwrap CallbackManager / AsyncCallbackManager to a handlers list
+        if hasattr(existing, "handlers") and not isinstance(existing, list):
+            existing = list(existing.handlers)
+            config_copy["callbacks"] = existing
+        if isinstance(existing, list):
             if not any(isinstance(c, type(handler)) for c in existing):
                 config_copy["callbacks"] = existing + [handler]
         else:
-            # CallbackManager / AsyncCallbackManager — wrap alongside (don't replace)
+            # Single handler object — wrap alongside
             config_copy["callbacks"] = [existing, handler]
 
-    def _run_with_auto_root(self, original, self_runnable, args, kwargs):
-        """Run a non-streaming invocation with per-invocation state."""
+    # ── Sync invocation ──
+
+    def _run_sync_with_auto_root(self, original, self_runnable, args, kwargs):
+        """Run a sync invocation with per-invocation state."""
         state, is_root, token = self._enter_invocation()
+        args, kwargs = self._normalize_config_to_kwargs(args, kwargs)
         kwargs, config_copy = self._copy_config(kwargs)
         self._merge_callback(config_copy, state.handler if state else None)
         exc_val = None
@@ -245,9 +335,33 @@ class LangChainInstrumentor(BaseInstrumentor):
         finally:
             self._exit_invocation(state, is_root, token, exc_val)
 
-    def _stream_sync_with_auto_root(self, original, self_runnable, args, kwargs):
-        """Run a sync streaming invocation with per-invocation state."""
+    # ── Async invocation (1.2 fix: await INSIDE try/finally) ──
+
+    async def _run_async_with_auto_root(self, original, self_runnable, args, kwargs):
+        """Run an async invocation with per-invocation state.
+
+        The coroutine is awaited INSIDE the try/finally so the AGENT root and
+        auto state stay open for the full async execution (not closed before
+        the coroutine runs).
+        """
         state, is_root, token = self._enter_invocation()
+        args, kwargs = self._normalize_config_to_kwargs(args, kwargs)
+        kwargs, config_copy = self._copy_config(kwargs)
+        self._merge_callback(config_copy, state.handler if state else None)
+        exc_val = None
+        try:
+            return await original(self_runnable, *args, **kwargs)
+        except BaseException as e:
+            exc_val = e
+            raise
+        finally:
+            self._exit_invocation(state, is_root, token, exc_val)
+
+    # ── Streaming ──
+
+    def _stream_sync_with_auto_root(self, original, self_runnable, args, kwargs):
+        state, is_root, token = self._enter_invocation()
+        args, kwargs = self._normalize_config_to_kwargs(args, kwargs)
         kwargs, config_copy = self._copy_config(kwargs)
         self._merge_callback(config_copy, state.handler if state else None)
         exc_val = None
@@ -261,8 +375,8 @@ class LangChainInstrumentor(BaseInstrumentor):
             self._exit_invocation(state, is_root, token, exc_val)
 
     async def _stream_async_with_auto_root(self, original, self_runnable, args, kwargs):
-        """Run an async streaming invocation with per-invocation state."""
         state, is_root, token = self._enter_invocation()
+        args, kwargs = self._normalize_config_to_kwargs(args, kwargs)
         kwargs, config_copy = self._copy_config(kwargs)
         self._merge_callback(config_copy, state.handler if state else None)
         exc_val = None
@@ -276,20 +390,18 @@ class LangChainInstrumentor(BaseInstrumentor):
             self._exit_invocation(state, is_root, token, exc_val)
 
     def uninstrument(self):
-        """Restore original Runnable methods (full recovery on shutdown)."""
+        """Restore original methods on all patched classes (full recovery)."""
         if not self._patched:
             return
         with self._lock:
-            for method_name, original in self._originals.items():
-                if self._runnable_cls is not None and hasattr(self._runnable_cls, method_name):
-                    try:
-                        setattr(self._runnable_cls, method_name, original)
-                    except Exception:
-                        pass
+            for (cls, method_name), original in self._originals.items():
+                try:
+                    setattr(cls, method_name, original)
+                except Exception:
+                    pass
             self._originals.clear()
-            self._runnable_cls = None
+            self._patched_classes.clear()
             self._tracer = None
             self._patched = False
-        # Clear any lingering invocation state
         _AUTO_STATE.set(None)
-        logger.info("LangChain auto-instrumentation removed (Runnable restored)")
+        logger.info("LangChain auto-instrumentation removed (all classes restored)")

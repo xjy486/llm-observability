@@ -128,6 +128,10 @@ def _proxy_parse_association_baggage(header: str) -> dict:
     """Parse a W3C baggage header (shared contract with SDK association_propagation).
 
     Returns canonical field -> value with compat-header key mapping to proxy meta keys.
+    Blocker 2.3: applies the same security limits as the SDK module:
+    - 256-char length limit per value
+    - control-character filtering
+    - fail-closed sanitization
     """
     result: dict[str, str] = {}
     if not header:
@@ -138,7 +142,7 @@ def _proxy_parse_association_baggage(header: str) -> dict:
             if "=" in pair:
                 k, v = pair.split("=", 1)
                 k = k.strip()
-                v = _proxy_decode_baggage_value(v.strip())
+                v = _proxy_sanitize_value(_proxy_decode_baggage_value(v.strip()))
                 if k == "user":
                     result["user_id"] = v
                 elif k == "session_id":
@@ -152,6 +156,22 @@ def _proxy_parse_association_baggage(header: str) -> dict:
     except Exception:
         pass
     return result
+
+
+def _proxy_sanitize_value(value: str, max_length: int = 256) -> str:
+    """Fail-closed sanitization matching the SDK association_propagation contract.
+
+    Strips control characters, truncates to max_length. Masking failures return
+    '<redacted>'.
+    """
+    if value is None:
+        return None
+    try:
+        text = str(value)
+        text = "".join(ch for ch in text if ch == "\t" or ch == "\n" or ord(ch) >= 0x20)
+        return text[:max_length]
+    except Exception:
+        return "<redacted>"
 
 
 def extract_metadata_headers(headers: dict) -> dict:
