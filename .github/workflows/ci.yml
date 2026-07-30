@@ -28,7 +28,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -r core/requirements.txt -r proxy/requirements.txt
+      - run: pip install -r requirements/base.txt
       - run: |
           python -m pytest tests/ -q --tb=short
 
@@ -40,7 +40,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -r core/requirements.txt -r proxy/requirements.txt
+      - run: pip install -r requirements/base.txt
       - run: |
           python -c "import sys; sys.path.insert(0,'proxy'); sys.path.insert(0,'core'); import trace_context, handler; print('proxy OK')"
 
@@ -65,8 +65,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -r core/requirements.txt -r proxy/requirements.txt
-      - run: pip install -e "sdk/python[dev,langchain]"
+      - run: pip install -r requirements/base.txt
+      - run: pip install -e sdk/python
       - run: |
           python -m pytest sdk/tests/test_phase2_2_final_fixes.py sdk/tests/test_phase2_3_regression.py -q --tb=short
 
@@ -80,8 +80,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -r core/requirements.txt -r proxy/requirements.txt
-      - run: pip install -e "sdk/python[dev,langchain]"
+      - run: pip install -r requirements/base.txt
+      - run: pip install -e sdk/python
       - env:
           E2E_API_KEY: ${{ secrets.E2E_API_KEY }}
           E2E_BASE_URL: ${{ secrets.E2E_BASE_URL }}
