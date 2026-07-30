@@ -289,10 +289,13 @@ class Reporter:
                     # P1-3: Don't requeue during shutdown. Requeuing makes the
                     # stop() drain loop spin until shutdown_timeout when the
                     # endpoint is unreachable, delaying every shutdown by ~10s.
+                    # Count as dropped so records aren't silently lost.
                     if not self._stop:
                         for item in reversed(good_records):
                             if len(self._queue) < self.max_queue_size:
                                 self._queue.appendleft(item)
+                    else:
+                        self._dropped_count += len(good_records)
         except Exception as e:
             self._fail_count += len(good_records)
             logger.error("SDK report error: %s", e)
@@ -300,3 +303,5 @@ class Reporter:
                 for item in reversed(good_records):
                     if len(self._queue) < self.max_queue_size:
                         self._queue.appendleft(item)
+            else:
+                self._dropped_count += len(good_records)
