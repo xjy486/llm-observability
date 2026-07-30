@@ -286,12 +286,17 @@ class Reporter:
                 else:
                     self._fail_count += len(good_records)
                     logger.error("SDK ingest failed: status=%d", resp.status)
-                    for item in reversed(good_records):
-                        if len(self._queue) < self.max_queue_size:
-                            self._queue.appendleft(item)
+                    # P1-3: Don't requeue during shutdown. Requeuing makes the
+                    # stop() drain loop spin until shutdown_timeout when the
+                    # endpoint is unreachable, delaying every shutdown by ~10s.
+                    if not self._stop:
+                        for item in reversed(good_records):
+                            if len(self._queue) < self.max_queue_size:
+                                self._queue.appendleft(item)
         except Exception as e:
             self._fail_count += len(good_records)
             logger.error("SDK report error: %s", e)
-            for item in reversed(good_records):
-                if len(self._queue) < self.max_queue_size:
-                    self._queue.appendleft(item)
+            if not self._stop:
+                for item in reversed(good_records):
+                    if len(self._queue) < self.max_queue_size:
+                        self._queue.appendleft(item)
