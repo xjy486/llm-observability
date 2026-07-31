@@ -224,11 +224,9 @@ def test_observe_runnable_with_auto_no_duplicate_agent():
     recs = _records()
     Observability.shutdown()
     agent_recs = _agent_recs_from(recs)
-    # observe_runnable creates its own AGENT; auto should NOT create a second
-    assert len(agent_recs) >= 1
-    # No more than 2 (one from observe_runnable, at most one from auto if it
-    # doesn't detect the existing trace — but ideally just 1)
-    assert len(agent_recs) <= 2, f"too many AGENT spans: {len(agent_recs)}"
+    # observe_runnable creates its own AGENT; auto should detect the existing
+    # trace and NOT create a second AGENT (dedup).
+    assert len(agent_recs) == 1, f"expected exactly 1 AGENT (dedup), got {len(agent_recs)}"
 
 
 # ── P1-2: depth race protection ──

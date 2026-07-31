@@ -41,110 +41,112 @@ def test_pregel_is_collected_as_candidate():
     assert "Pregel" in names, f"Pregel not in candidates: {names}"
 
 
-def test_create_agent_invoke_auto_instrumented():
-    """create_agent().invoke() produces an AGENT (auto-root) via Pregel patch."""
-    _clean_init(auto_instrument_langchain=True)
-    try:
-        from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
-        from langchain_core.messages import AIMessage
-        from langgraph.prebuilt import create_agent
+# Minimal fake chat model that supports bind_tools (required by create_agent).
+# GenericFakeChatModel.bind_tools raises NotImplementedError.
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 
-        model = GenericFakeChatModel(messages=iter([AIMessage(content="done")]))
-        agent_obj = create_agent(model=model, tools=[], prompt="answer")
-        result = agent_obj.invoke({"messages": [{"role": "user", "content": "hi"}]})
-        # Drain
-        if Observability._initialized:
-            Observability.shutdown()
-        recs = _records()
-        kinds = [r["span_kind"] for r in recs]
-        assert "AGENT" in kinds, f"missing AGENT (auto-root) in {kinds}"
-    except ImportError:
-        pytest.skip("langgraph create_agent not available")
-    finally:
-        if Observability._initialized:
-            Observability.shutdown()
+
+class _FakeToolCallingModel(BaseChatModel):
+    """Minimal fake chat model supporting bind_tools for create_agent tests."""
+    response: str = "done"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        message = AIMessage(content=self.response)
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    @property
+    def _llm_type(self):
+        return "fake-tool-calling"
+
+
+def _build_agent():
+    """Create a create_agent instance with a fake model (no real API needed)."""
+    from langchain.agents import create_agent
+    model = _FakeToolCallingModel()
+    return create_agent(model=model, tools=[], system_prompt="answer")
+
+
+def test_create_agent_invoke_auto_instrumented():
+    """create_agent().invoke() produces AGENT + LLM via Pregel patch."""
+    _clean_init(auto_instrument_langchain=True)
+    agent_obj = _build_agent()
+    result = agent_obj.invoke({"messages": [{"role": "user", "content": "hi"}]})
+    assert result is not None
+    recs = _records()
+    Observability.shutdown()
+    agent_recs = [r for r in recs if r["span_kind"] == "AGENT"]
+    llm_recs = [r for r in recs if r["span_kind"] == "LLM"]
+    assert len(agent_recs) == 1, f"expected 1 AGENT, got {len(agent_recs)}"
+    assert len(llm_recs) >= 1, f"expected >=1 LLM, got {len(llm_recs)}"
+    # No duplicate LLM
+    assert len(llm_recs) == 1, f"expected exactly 1 LLM (no dup), got {len(llm_recs)}"
+    # All spans share the same trace
+    trace_ids = {r["trace_id"] for r in recs}
+    assert len(trace_ids) == 1, f"expected 1 trace_id, got {trace_ids}"
 
 
 def test_create_agent_ainvoke_auto_instrumented():
-    """create_agent().ainvoke() produces an AGENT (auto-root) async."""
+    """create_agent().ainvoke() produces AGENT + LLM async."""
     _clean_init(auto_instrument_langchain=True)
-    try:
-        from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
-        from langchain_core.messages import AIMessage
-        from langgraph.prebuilt import create_agent
+    agent_obj = _build_agent()
 
-        model = GenericFakeChatModel(messages=iter([AIMessage(content="done")]))
-        agent_obj = create_agent(model=model, tools=[], prompt="answer")
+    async def run():
+        return await agent_obj.ainvoke({"messages": [{"role": "user", "content": "hi"}]})
 
-        async def run():
-            return await agent_obj.ainvoke({"messages": [{"role": "user", "content": "hi"}]})
-
-        asyncio.run(run())
-        if Observability._initialized:
-            Observability.shutdown()
-        recs = _records()
-        kinds = [r["span_kind"] for r in recs]
-        assert "AGENT" in kinds, f"missing AGENT (auto-root) in {kinds}"
-    except ImportError:
-        pytest.skip("langgraph create_agent not available")
-    finally:
-        if Observability._initialized:
-            Observability.shutdown()
+    result = asyncio.run(run())
+    assert result is not None
+    recs = _records()
+    Observability.shutdown()
+    agent_recs = [r for r in recs if r["span_kind"] == "AGENT"]
+    llm_recs = [r for r in recs if r["span_kind"] == "LLM"]
+    assert len(agent_recs) == 1, f"expected 1 AGENT, got {len(agent_recs)}"
+    assert len(llm_recs) == 1, f"expected exactly 1 LLM (no dup), got {len(llm_recs)}"
+    trace_ids = {r["trace_id"] for r in recs}
+    assert len(trace_ids) == 1, f"expected 1 trace_id, got {trace_ids}"
 
 
 def test_create_agent_stream_auto_instrumented():
-    """create_agent().stream() produces an AGENT (auto-root) via Pregel patch."""
+    """create_agent().stream() produces AGENT + LLM via Pregel patch."""
     _clean_init(auto_instrument_langchain=True)
-    try:
-        from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
-        from langchain_core.messages import AIMessage
-        from langgraph.prebuilt import create_agent
-
-        model = GenericFakeChatModel(messages=iter([AIMessage(content="done")]))
-        agent_obj = create_agent(model=model, tools=[], prompt="answer")
-        chunks = list(agent_obj.stream({"messages": [{"role": "user", "content": "hi"}]}))
-        assert chunks, "expected at least one stream chunk"
-        if Observability._initialized:
-            Observability.shutdown()
-        recs = _records()
-        kinds = [r["span_kind"] for r in recs]
-        assert "AGENT" in kinds, f"missing AGENT (auto-root) in {kinds}"
-    except ImportError:
-        pytest.skip("langgraph create_agent not available")
-    finally:
-        if Observability._initialized:
-            Observability.shutdown()
+    agent_obj = _build_agent()
+    chunks = list(agent_obj.stream({"messages": [{"role": "user", "content": "hi"}]}))
+    assert chunks, "expected at least one stream chunk"
+    recs = _records()
+    Observability.shutdown()
+    agent_recs = [r for r in recs if r["span_kind"] == "AGENT"]
+    llm_recs = [r for r in recs if r["span_kind"] == "LLM"]
+    assert len(agent_recs) == 1, f"expected 1 AGENT, got {len(agent_recs)}"
+    assert len(llm_recs) >= 1, f"expected >=1 LLM, got {len(llm_recs)}"
+    trace_ids = {r["trace_id"] for r in recs}
+    assert len(trace_ids) == 1, f"expected 1 trace_id, got {trace_ids}"
 
 
 def test_create_agent_astream_auto_instrumented():
-    """create_agent().astream() produces an AGENT (auto-root) async."""
+    """create_agent().astream() produces AGENT + LLM async."""
     _clean_init(auto_instrument_langchain=True)
-    try:
-        from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
-        from langchain_core.messages import AIMessage
-        from langgraph.prebuilt import create_agent
+    agent_obj = _build_agent()
 
-        model = GenericFakeChatModel(messages=iter([AIMessage(content="done")]))
-        agent_obj = create_agent(model=model, tools=[], prompt="answer")
+    async def run():
+        chunks = []
+        async for chunk in agent_obj.astream({"messages": [{"role": "user", "content": "hi"}]}):
+            chunks.append(chunk)
+        return chunks
 
-        async def run():
-            chunks = []
-            async for chunk in agent_obj.astream({"messages": [{"role": "user", "content": "hi"}]}):
-                chunks.append(chunk)
-            return chunks
-
-        chunks = asyncio.run(run())
-        assert chunks, "expected at least one stream chunk"
-        if Observability._initialized:
-            Observability.shutdown()
-        recs = _records()
-        kinds = [r["span_kind"] for r in recs]
-        assert "AGENT" in kinds, f"missing AGENT (auto-root) in {kinds}"
-    except ImportError:
-        pytest.skip("langgraph create_agent not available")
-    finally:
-        if Observability._initialized:
-            Observability.shutdown()
+    chunks = asyncio.run(run())
+    assert chunks, "expected at least one stream chunk"
+    recs = _records()
+    Observability.shutdown()
+    agent_recs = [r for r in recs if r["span_kind"] == "AGENT"]
+    llm_recs = [r for r in recs if r["span_kind"] == "LLM"]
+    assert len(agent_recs) == 1, f"expected 1 AGENT, got {len(agent_recs)}"
+    assert len(llm_recs) >= 1, f"expected >=1 LLM, got {len(llm_recs)}"
+    trace_ids = {r["trace_id"] for r in recs}
+    assert len(trace_ids) == 1, f"expected 1 trace_id, got {trace_ids}"
 
 
 # ── Blocker 2: user callback identity + CallbackManager ──
@@ -258,6 +260,149 @@ def test_callback_manager_inheritable_handlers_preserved():
     assert inheritable_h in mgr.inheritable_handlers
     assert mgr.inheritable_tags == ["it1"]
     assert mgr.inheritable_metadata.get("ik") == "iv"
+
+
+# ── Blocker 1: CallbackManager observability handler inherited by child runs ──
+
+def test_callback_manager_observability_inherited_by_child_model():
+    """Observability handler is inherited by child model runs via inherit=True.
+
+    When a user passes a CallbackManager, the auto wrapper clones it and adds
+    the Observability handler with inherit=True. Child model runs should
+    receive the handler and create LLM spans.
+
+    The user handler (non-inheritable) is called for the root run.
+    The Observability handler (inheritable) is inherited to child model runs.
+    """
+    _clean_init(auto_instrument_langchain=True)
+    from langchain_core.runnables import RunnableLambda
+    from langchain_core.callbacks import BaseCallbackHandler
+    from langchain_core.callbacks.manager import CallbackManager
+
+    user_events = {"chain_start": 0}
+
+    class UserRootHandler(BaseCallbackHandler):
+        def on_chain_start(self, serialized, inputs, **kwargs):
+            user_events["chain_start"] += 1
+
+    mgr = CallbackManager(handlers=[UserRootHandler()], tags=["utag"])
+    # Chain: model is a child run of the sequence
+    chain = _FakeToolCallingModel() | RunnableLambda(lambda x: str(x))
+    chain.invoke("hi", config={"callbacks": mgr})
+    recs = _records()
+    Observability.shutdown()
+    # User handler called for root run (preserved in cloned manager)
+    assert user_events["chain_start"] >= 1, "user handler not called for root run"
+    # LLM span created (Observability handler inherited to child model)
+    llm_recs = [r for r in recs if r["span_kind"] == "LLM"]
+    assert len(llm_recs) == 1, f"expected 1 LLM (handler inherited to child model), got {len(llm_recs)}"
+    # Original manager not mutated
+    assert len(mgr.handlers) == 1, "original manager handlers mutated"
+    assert "utag" in mgr.tags
+
+
+def test_callback_manager_observability_inherited_by_child_tool():
+    """Observability handler is inherited by child tool runs via inherit=True."""
+    _clean_init(auto_instrument_langchain=True)
+    from langchain_core.runnables import RunnableLambda
+    from langchain_core.callbacks import BaseCallbackHandler
+    from langchain_core.callbacks.manager import CallbackManager
+    from langchain_core.tools import tool as langchain_tool
+
+    user_events = {"chain_start": 0}
+
+    class UserRootHandler(BaseCallbackHandler):
+        def on_chain_start(self, serialized, inputs, **kwargs):
+            user_events["chain_start"] += 1
+
+    @langchain_tool
+    def search(query: str) -> str:
+        """Search."""
+        return f"result:{query}"
+
+    mgr = CallbackManager(handlers=[UserRootHandler()], tags=["utag"])
+    chain = search | RunnableLambda(lambda x: str(x))
+    chain.invoke("hello", config={"callbacks": mgr})
+    recs = _records()
+    Observability.shutdown()
+    # User handler called for root run
+    assert user_events["chain_start"] >= 1, "user handler not called for root run"
+    # TOOL span created (Observability handler inherited to child tool)
+    tool_recs = [r for r in recs if r["span_kind"] == "TOOL"]
+    assert len(tool_recs) >= 1, f"expected >=1 TOOL (handler inherited to child tool), got {len(tool_recs)}"
+    # Original manager not mutated
+    assert len(mgr.handlers) == 1
+    assert "utag" in mgr.tags
+
+
+def test_callback_manager_observability_inherited_by_retriever():
+    """Observability handler is inherited by child retriever runs."""
+    _clean_init(auto_instrument_langchain=True)
+    from langchain_core.runnables import RunnableLambda
+    from langchain_core.callbacks import BaseCallbackHandler
+    from langchain_core.callbacks.manager import CallbackManager
+    from langchain_core.retrievers import BaseRetriever
+    from langchain_core.documents import Document
+
+    user_events = {"chain_start": 0}
+
+    class UserRootHandler(BaseCallbackHandler):
+        def on_chain_start(self, serialized, inputs, **kwargs):
+            user_events["chain_start"] += 1
+
+    class FakeRetriever(BaseRetriever):
+        def _get_relevant_documents(self, query, *, run_manager):
+            return [Document(page_content="doc1"), Document(page_content="doc2")]
+
+    mgr = CallbackManager(handlers=[UserRootHandler()], tags=["utag"])
+    # Retriever as child run of a sequence
+    retriever = FakeRetriever()
+    chain = retriever | RunnableLambda(lambda docs: str(len(docs)))
+    chain.invoke("query", config={"callbacks": mgr})
+    recs = _records()
+    Observability.shutdown()
+    # User handler called for root run
+    assert user_events["chain_start"] >= 1, "user handler not called for root run"
+    # Original manager not mutated
+    assert len(mgr.handlers) == 1
+    assert "utag" in mgr.tags
+
+
+def test_async_callback_manager_observability_inherited():
+    """AsyncCallbackManager: Observability handler inherited by child model runs."""
+    _clean_init(auto_instrument_langchain=True)
+    from langchain_core.runnables import RunnableLambda
+    from langchain_core.callbacks import BaseCallbackHandler
+    from langchain_core.callbacks.manager import AsyncCallbackManager
+
+    user_events = {"chain_start": 0}
+
+    class UserRootAsyncHandler(BaseCallbackHandler):
+        async def on_chain_start(self, serialized, inputs, **kwargs):
+            user_events["chain_start"] += 1
+
+    mgr = AsyncCallbackManager(handlers=[UserRootAsyncHandler()], tags=["atag"])
+
+    async def echo(x):
+        return str(x)
+
+    chain = _FakeToolCallingModel() | RunnableLambda(echo)
+
+    async def run():
+        return await chain.ainvoke("hi", config={"callbacks": mgr})
+
+    result = asyncio.run(run())
+    assert result is not None
+    recs = _records()
+    Observability.shutdown()
+    # User handler called for root run
+    assert user_events["chain_start"] >= 1, "async user handler not called for root run"
+    # LLM span created (Observability handler inherited to child model)
+    llm_recs = [r for r in recs if r["span_kind"] == "LLM"]
+    assert len(llm_recs) == 1, f"expected 1 LLM (handler inherited to child model), got {len(llm_recs)}"
+    # Original manager not mutated
+    assert len(mgr.handlers) == 1
+    assert "atag" in mgr.tags
 
 
 # ── Blocker 3: generator init fail-open ──

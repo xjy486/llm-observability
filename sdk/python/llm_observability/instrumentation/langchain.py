@@ -330,7 +330,7 @@ class LangChainInstrumentor(BaseInstrumentor):
         if hasattr(existing, "handlers") and hasattr(existing, "copy") and not isinstance(existing, list):
             try:
                 cloned = existing.copy()
-                cloned.add_handler(handler, inherit=False)
+                cloned.add_handler(handler, inherit=True)
                 config_copy["callbacks"] = cloned
                 return
             except Exception:

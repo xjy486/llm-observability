@@ -9,6 +9,7 @@ Otherwise, generate a new trace_id and root span_id.
 """
 import uuid
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Optional
 
@@ -161,16 +162,21 @@ def _proxy_parse_association_baggage(header: str) -> dict:
 def _proxy_sanitize_value(value: str, max_length: int = 256) -> str:
     """Fail-closed sanitization matching the SDK association_propagation contract.
 
-    Strips control characters, truncates to max_length. Masking failures return
-    '<redacted>'.
+    Strips ALL control characters (Unicode category C* — includes Cc, Cf, Cn,
+    Co, Cs) to prevent log/header injection. This covers U+0000-U+001F,
+    U+007F (DEL), U+0080-U+009F (C1 controls), and other format/surrogate
+    characters. Truncates to max_length. Masking failures return '<redacted>'.
     """
     if value is None:
         return None
     try:
         text = str(value)
-        # P1-4: strip ALL control characters including CR/LF/tab to prevent
-        # log injection / header injection / UI display issues.
-        text = "".join(ch for ch in text if ord(ch) >= 0x20 or ch == " ")
+        # P1-4: strip ALL Unicode control characters (category C*) including
+        # DEL (U+007F) and C1 controls (U+0080-U+009F), not just C0.
+        text = "".join(
+            ch for ch in text
+            if not unicodedata.category(ch).startswith("C")
+        )
         return text[:max_length]
     except Exception:
         return "<redacted>"

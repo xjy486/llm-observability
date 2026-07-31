@@ -55,6 +55,47 @@ def test_sanitize_none_returns_none():
     assert _proxy_sanitize_value(None) is None
 
 
+# ── P1: Strips DEL and C1 control characters (not just C0) ──
+
+def test_sanitize_strips_del():
+    """DEL (U+007F) is a control character and must be stripped."""
+    assert "\x7f" not in _proxy_sanitize_value("hello\x7fworld")
+
+
+def test_sanitize_strips_c1_control_chars():
+    """C1 control characters (U+0080-U+009F) must be stripped."""
+    for codepoint in range(0x80, 0xA0):
+        ch = chr(codepoint)
+        result = _proxy_sanitize_value(f"a{ch}b")
+        assert ch not in result, f"C1 char U+{codepoint:04X} survived sanitization"
+
+
+def test_sanitize_strips_all_control_categories():
+    """All Unicode C* category characters are stripped."""
+    import unicodedata
+    # Sample characters from each C* subcategory
+    test_chars = [
+        "\x00",      # Cc: NUL
+        "\x07",      # Cc: BEL
+        "\x1f",      # Cc: US
+        "\x7f",      # Cc: DEL
+        "\x9f",      # Cc: C1 control
+        "\u200b",    # Cf: zero-width space
+        "\u200e",    # Cf: left-to-right mark
+        "\ufeff",    # Cf: BOM / zero-width no-break space
+    ]
+    for ch in test_chars:
+        result = _proxy_sanitize_value(f"text{ch}more")
+        assert ch not in result, f"control char {repr(ch)} (category {unicodedata.category(ch)}) survived"
+
+
+def test_sanitize_preserves_unicode_letters():
+    """Non-ASCII printable characters (letters, numbers, punctuation) are preserved."""
+    assert _proxy_sanitize_value("用户alice") == "用户alice"
+    assert _proxy_sanitize_value("session-セッション") == "session-セッション"
+    assert _proxy_sanitize_value("emoji_test") == "emoji_test"
+
+
 # ── extract_metadata_headers sanitizes X-* header values ──
 
 def test_x_user_id_strips_control_chars():
