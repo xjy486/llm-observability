@@ -58,7 +58,7 @@ jobs:
           npx tsc --noEmit
 
   phase2-regression:
-    name: Phase 2.1-2.4 Regression
+    name: Phase 2.1-2.5 Regression
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -68,7 +68,60 @@ jobs:
       - run: pip install -r requirements/base.txt
       - run: pip install -e sdk/python
       - run: |
-          python -m pytest tests/test_phase2_2_final_fixes.py sdk/tests/test_phase2_3_regression.py -q --tb=short
+          python -m pytest tests/test_phase2_2_final_fixes.py sdk/tests/test_phase2_3_regression.py sdk/tests/test_phase2_5_fixes.py -q --tb=short
+
+  # ── Phase 3 Gateway Observability (task 9.1) ──
+  gateway-runtime-tests:
+    name: Gateway Runtime Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements/base.txt
+      - run: pip install -e sdk/python
+      - run: |
+          python -m pytest sdk/tests/gateway_observability/test_router_span.py \
+            sdk/tests/gateway_observability/test_attempt_span.py \
+            sdk/tests/gateway_observability/test_retry.py \
+            sdk/tests/gateway_observability/test_fallback.py \
+            sdk/tests/gateway_observability/test_cache_rate_limit.py \
+            sdk/tests/gateway_observability/test_usage.py \
+            sdk/tests/gateway_observability/test_cost.py \
+            sdk/tests/gateway_observability/test_privacy.py \
+            sdk/tests/gateway_observability/test_sampling.py \
+            sdk/tests/gateway_observability/test_fail_open.py \
+            sdk/tests/gateway_observability/test_registry_cleanup.py \
+            -q --tb=short
+
+  oneapi-adapter-tests:
+    name: One-API Adapter Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements/base.txt
+      - run: pip install -e sdk/python
+      - run: |
+          python -m pytest sdk/tests/gateway_observability/test_oneapi_adapter.py \
+            sdk/tests/gateway_observability/test_e2e_scenarios.py \
+            -q --tb=short
+
+  gateway-streaming-tests:
+    name: Gateway Streaming Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements/base.txt
+      - run: pip install -e sdk/python
+      - run: |
+          python -m pytest sdk/tests/gateway_observability/test_streaming.py -q --tb=short
 
   real-e2e:
     name: Real E2E (Live Endpoint)
@@ -92,3 +145,26 @@ jobs:
           test -n "$E2E_BASE_URL" || { echo "E2E_BASE_URL secret is required"; exit 1; }
           test -n "$E2E_MODEL" || { echo "E2E_MODEL secret is required"; exit 1; }
           python -m pytest sdk/tests/test_phase2_5_real_e2e.py -q --tb=short
+
+  # ── Phase 3 gateway real E2E (task 9.2): trusted-branch only, secret-gated,
+  #    fork PRs skip, logs redacted. ──
+  gateway-real-e2e:
+    name: Gateway Real E2E
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements/base.txt
+      - run: pip install -e sdk/python
+      - env:
+          GATEWAY_E2E_API_KEY: ${{ secrets.GATEWAY_E2E_API_KEY }}
+          GATEWAY_E2E_BASE_URL: ${{ secrets.GATEWAY_E2E_BASE_URL }}
+        run: |
+          # Secret-gated: missing secrets FAIL (not skip) on trusted branches.
+          test -n "$GATEWAY_E2E_API_KEY" || { echo "GATEWAY_E2E_API_KEY secret is required"; exit 1; }
+          test -n "$GATEWAY_E2E_BASE_URL" || { echo "GATEWAY_E2E_BASE_URL secret is required"; exit 1; }
+          # Logs redacted: never echo secret values; only assert presence.
+          python -m pytest sdk/tests/test_phase2_5_real_e2e.py -q --tb=short 2>&1 | sed 's/$GATEWAY_E2E_API_KEY/<redacted>/g'

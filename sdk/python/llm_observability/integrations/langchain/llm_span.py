@@ -36,6 +36,15 @@ class LLMSpanHandle:
             for k, v in usage.items():
                 self._span.set_attribute(k, v)
 
+            # Phase 3 (langchain-observability delta): when a Gateway Router
+            # exists, the LLM span's final Usage equals the Router aggregate —
+            # never just the final successful attempt's usage.
+            try:
+                from ...gateway_observability.aggregation import apply_router_usage_to_span
+                apply_router_usage_to_span(self._span)
+            except Exception:
+                pass
+
             # Store response payload (masked)
             strategy = self._tracer.config.payload_strategy if self._tracer else "off"
             if strategy != "off":

@@ -242,6 +242,14 @@ class OpenAIInstrumentor(BaseInstrumentor):
                 span.set_attribute("gen_ai.usage.output_tokens", usage.completion_tokens)
             if hasattr(usage, "total_tokens") and usage.total_tokens is not None:
                 span.set_attribute("gen_ai.usage.total_tokens", usage.total_tokens)
+        # Phase 3 (langchain-observability delta): when a Gateway Router exists,
+        # the LLM span's final Usage equals the Router aggregate — never just
+        # the final successful attempt's usage (retry cost preserved).
+        try:
+            from ..gateway_observability.aggregation import apply_router_usage_to_span
+            apply_router_usage_to_span(span)
+        except Exception:
+            pass
 
     def _finalize_span(self, span: Span, token, sampled: bool = True):
         """End and report a span, then reset context. Used for error path only.
@@ -432,6 +440,13 @@ class ObservedStream:
         # Try to extract usage from the stream's last chunk
         self._try_extract_stream_usage()
 
+        # Phase 3: LLM final Usage = Router aggregate when a Router exists.
+        try:
+            from ..gateway_observability.aggregation import apply_router_usage_to_span
+            apply_router_usage_to_span(self._span)
+        except Exception:
+            pass
+
         # Store aggregated content if available
         if self._tracer.config.payload_strategy != "off" and self._collected_content:
             from ..utils.masking import mask_payload
@@ -578,6 +593,13 @@ class AsyncObservedStream:
             self._span.set_status("OK")
 
         self._span.end()
+
+        # Phase 3: LLM final Usage = Router aggregate when a Router exists.
+        try:
+            from ..gateway_observability.aggregation import apply_router_usage_to_span
+            apply_router_usage_to_span(self._span)
+        except Exception:
+            pass
 
         if self._sampled:
             try:
