@@ -146,25 +146,9 @@ jobs:
           test -n "$E2E_MODEL" || { echo "E2E_MODEL secret is required"; exit 1; }
           python -m pytest sdk/tests/test_phase2_5_real_e2e.py -q --tb=short
 
-  # ── Phase 3 gateway real E2E (task 9.2): trusted-branch only, secret-gated,
-  #    fork PRs skip, logs redacted. ──
-  gateway-real-e2e:
-    name: Gateway Real E2E
-    runs-on: ubuntu-latest
-    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install -r requirements/base.txt
-      - run: pip install -e sdk/python
-      - env:
-          GATEWAY_E2E_API_KEY: ${{ secrets.GATEWAY_E2E_API_KEY }}
-          GATEWAY_E2E_BASE_URL: ${{ secrets.GATEWAY_E2E_BASE_URL }}
-        run: |
-          # Secret-gated: missing secrets FAIL (not skip) on trusted branches.
-          test -n "$GATEWAY_E2E_API_KEY" || { echo "GATEWAY_E2E_API_KEY secret is required"; exit 1; }
-          test -n "$GATEWAY_E2E_BASE_URL" || { echo "GATEWAY_E2E_BASE_URL secret is required"; exit 1; }
-          # Logs redacted: never echo secret values; only assert presence.
-          python -m pytest sdk/tests/test_phase2_5_real_e2e.py -q --tb=short 2>&1 | sed 's/$GATEWAY_E2E_API_KEY/<redacted>/g'
+  # ── NOTE: gateway-real-e2e (task 9.2) is deferred to Phase 3.1. ──
+  # Round one ships the Gateway contract + runtime validated by the OFFLINE mock
+  # harness E2E (Scenario A–J) in oneapi-adapter-tests — no real gateway key is
+  # needed. A real One-API gateway E2E (One-API instance + a One-API token, NOT
+  # a single-vendor model key) is added when the One-API adapter is wired into
+  # the gateway server (Phase 3.1). See design.md D12 + spec §23/§30.

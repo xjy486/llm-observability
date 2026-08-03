@@ -60,5 +60,6 @@
 ## 9. CI
 
 - [x] 9.1 Add CI jobs `gateway-runtime-tests`, `oneapi-adapter-tests`, `gateway-streaming-tests`.
-- [x] 9.2 Add `gateway-real-e2e` job: trusted-branch-only, secret-gated (missing secret fails), Fork PRs skip secret job, logs redacted.
+- [x] 9.1 Add CI jobs `gateway-runtime-tests`, `oneapi-adapter-tests`, `gateway-streaming-tests`.
+- [x] 9.2 Add `gateway-real-e2e` job: trusted-branch-only, secret-gated (missing secret fails), Fork PRs skip secret job, logs redacted. **NOTE (2026-08-03): deferred to Phase 3.1** — round one validates the gateway runtime via the OFFLINE Scenario A–J mock harness in `oneapi-adapter-tests`; a real One-API gateway E2E (needs a One-API instance + One-API token, not a single-vendor model key) is added when the One-API adapter is wired into the gateway server (design D12, spec §23/§30).
 - [x] 9.3 Add `phase2-regression` job to the change's CI wiring.
