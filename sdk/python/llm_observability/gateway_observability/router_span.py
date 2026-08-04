@@ -11,12 +11,13 @@ Data models: ``RouteDecision`` (spec §8.2), ``AttemptContext`` (spec §8.3),
 and ``AttemptResult`` (internal aggregation unit).
 """
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
 
 from ..spans import Span, SpanKind
-from ..utils.ids import generate_span_id
+from ..utils.ids import generate_span_id, generate_trace_id
 from .attributes import ATTR_GATEWAY, ATTR_ROUTER, ATTR_USAGE, ATTR_COST, ROUTER
 from .attempt_span import AttemptSpan
 from .context import GatewayContext
@@ -114,6 +115,60 @@ _INTERNAL_STATE = {
     "request": None, "route_decision": None,
 }
 
+# Frozen trace origins (spec: trace origin three-value semantics).
+ORIGIN_SDK_CONTEXT = "sdk_context"
+ORIGIN_REMOTE_TRACEPARENT = "remote_traceparent"
+ORIGIN_GATEWAY_ROOT = "gateway_root"
+
+_ALL_ZERO_TRACE_ID = "0" * 32
+
+
+@dataclass(frozen=True)
+class ResolvedGatewayParent:
+    """Explicit result of Router parent resolution (never inferred indirectly).
+
+    Attributes:
+        trace_id: Always a valid W3C TraceID — 32 lowercase hex, never all zero.
+        parent_span_id: Parent span ID for sdk/remote origins; None for a root.
+        origin: One of ``sdk_context`` / ``remote_traceparent`` / ``gateway_root``.
+        upstream_trace_present: True iff origin is sdk_context or remote_traceparent.
+    """
+    trace_id: str
+    parent_span_id: Optional[str]
+    origin: str
+    upstream_trace_present: bool
+
+    @property
+    def trace_origin_attribute(self) -> str:
+        """The frozen ``gateway.trace_origin`` value for this origin."""
+        return {
+            ORIGIN_SDK_CONTEXT: "sdk",
+            ORIGIN_REMOTE_TRACEPARENT: "remote",
+            ORIGIN_GATEWAY_ROOT: "gateway",
+        }.get(self.origin, "gateway")
+
+
+def _new_valid_trace_id() -> str:
+    """Generate a valid W3C TraceID: 32 lowercase hex, never all zeros."""
+    trace_id = generate_trace_id()
+    if not trace_id or len(trace_id) != 32 or trace_id == _ALL_ZERO_TRACE_ID:
+        # Regenerate once; uuid4 hex is never all-zero in practice, but the
+        # contract forbids ever reporting one.
+        trace_id = generate_trace_id()
+        if not trace_id or len(trace_id) != 32 or trace_id == _ALL_ZERO_TRACE_ID:
+            trace_id = "1" + (trace_id or "0" * 32)[1:]
+    return trace_id.lower()
+
+
+def _is_valid_trace_id(trace_id: Optional[str]) -> bool:
+    """True iff trace_id is 32 hex chars and not all zeros."""
+    if not trace_id or not isinstance(trace_id, str):
+        return False
+    tid = trace_id.lower()
+    if len(tid) != 32 or tid == _ALL_ZERO_TRACE_ID:
+        return False
+    return all(c in "0123456789abcdef" for c in tid)
+
 
 class RouterSpan:
     """Context manager for a Router GATEWAY span (spec §4, §9.2).
@@ -161,8 +216,12 @@ class RouterSpan:
         self._closed = False
         self._started_at: float = 0.0
         self._ended_at: float = 0.0
+        self._resolved_parent: Optional[ResolvedGatewayParent] = None
 
         self._attempts: list[AttemptSpan] = []
+        self._open_attempts: dict[str, AttemptSpan] = {}
+        self._index_lock = threading.Lock()
+        self._used_attempt_indices: set[int] = set()
         self._attempt_count = 0
         self._success_count = 0
         self._fail_count = 0
@@ -187,7 +246,10 @@ class RouterSpan:
     def start(self) -> "RouterSpan":
         """Create and start the Router span (fail-open)."""
         try:
-            trace_id, parent_span_id, root_parent = self._resolve_parents()
+            resolved = self._resolve_parent()
+            self._resolved_parent = resolved
+            trace_id = resolved.trace_id
+            parent_span_id = resolved.parent_span_id
             span_id = generate_span_id()
             span = Span(
                 trace_id=trace_id,
@@ -206,14 +268,25 @@ class RouterSpan:
                 span.set_attribute(ATTR_GATEWAY["protocol"], rc.protocol or "openai-compatible")
                 if rc.route:
                     span.set_attribute(ATTR_GATEWAY["route"], rc.route)
-                span.set_attribute(ATTR_GATEWAY["trace_origin"], "gateway" if root_parent is None else "sdk")
-                span.set_attribute(ATTR_GATEWAY["upstream_trace_present"], root_parent is not None)
                 if rc.requested_model:
                     span.set_attribute(ATTR_ROUTER["requested_model"], rc.requested_model)
+                # Full association field set — written to the Span top-level
+                # fields using the EXISTING Span Record naming (``business_scene``,
+                # never a second ``business_scenario`` spelling), sanitized.
                 if rc.user_id:
-                    span.set_attribute("user_id", rc.user_id)
+                    span.user_id = self._privacy.sanitize_string(rc.user_id)
                 if rc.session_id:
-                    span.set_attribute("session_id", rc.session_id)
+                    span.session_id = self._privacy.sanitize_string(rc.session_id)
+                if rc.message_id:
+                    span.message_id = self._privacy.sanitize_string(rc.message_id)
+                if rc.app_name:
+                    span.app_name = self._privacy.sanitize_string(rc.app_name)
+                if rc.business_scenario:
+                    span.business_scene = self._privacy.sanitize_string(rc.business_scenario)
+            # Frozen trace-origin semantics, derived from the explicit
+            # resolution — never inferred from "whether a parent exists".
+            span.set_attribute(ATTR_GATEWAY["trace_origin"], resolved.trace_origin_attribute)
+            span.set_attribute(ATTR_GATEWAY["upstream_trace_present"], resolved.upstream_trace_present)
             span.set_attribute(ATTR_GATEWAY["span_role"], ROUTER)
 
             rd = self._route_decision
@@ -248,42 +321,72 @@ class RouterSpan:
                 self._router_registry.register(trace_id, span_id, self)
             self._token, _ = GatewayContext.enter_router(self)
             self._ctx_token = self._token
+
+            # Route lifecycle events (gateway.route.started → route.selected).
+            if rd is not None:
+                self.recorder.record("gateway.route.started", {})
+                self.recorder.route_selected(
+                    channel_id=rd.channel_id,
+                    provider=rd.provider,
+                    resolved_model=rd.resolved_model,
+                    reason=rd.route_reason,
+                )
         except Exception as e:
             logger.error("Router span start failed: %s", e)
         return self
 
-    def _resolve_parents(self):
-        """Return (trace_id, parent_span_id, root_parent_object).
+    def _resolve_parent(self) -> ResolvedGatewayParent:
+        """Resolve the Router's parent into an explicit, frozen result.
 
-        Parent = active SDK LLM span when present; else the upstream trace
-        (inherited traceparent) with the Router as a child of the upstream
-        parent span; else the Router is the Root (no fabricated LLM/AGENT).
-        root_parent_object is None when no SDK context is active.
+        Order: in-process SDK context → upstream ``traceparent`` → local root.
+        A local root always gets a freshly generated, valid (non-zero, 32-hex)
+        TraceID — a Router NEVER reports a null or all-zero TraceID.
         """
         try:
             from ..context import get_current_context
             ctx = get_current_context()
             if ctx is not None:
-                return ctx.trace_id, ctx.span_id, ctx
+                trace_id = getattr(ctx, "trace_id", None)
+                if _is_valid_trace_id(trace_id):
+                    return ResolvedGatewayParent(
+                        trace_id=trace_id.lower(),
+                        parent_span_id=getattr(ctx, "span_id", None),
+                        origin=ORIGIN_SDK_CONTEXT,
+                        upstream_trace_present=True,
+                    )
         except Exception:
             pass
-        if self._upstream_trace_id:
-            return self._upstream_trace_id, self._upstream_parent_span_id, None
-        return None, None, None
+        if _is_valid_trace_id(self._upstream_trace_id):
+            return ResolvedGatewayParent(
+                trace_id=self._upstream_trace_id.lower(),
+                parent_span_id=self._upstream_parent_span_id,
+                origin=ORIGIN_REMOTE_TRACEPARENT,
+                upstream_trace_present=True,
+            )
+        return ResolvedGatewayParent(
+            trace_id=_new_valid_trace_id(),
+            parent_span_id=None,
+            origin=ORIGIN_GATEWAY_ROOT,
+            upstream_trace_present=False,
+        )
 
     def close(self):
         """End the Router span at a terminal state (fail-open).
 
-        Final status reflects the last attempt or a route-level decision
-        (cache hit / rate-limit rejection). Usage/Cost aggregate and all
-        counters are recorded before end. Registry + ContextVar always cleaned.
+        Any still-open Attempt is force-closed first (never just dropped from
+        the registry). Final status reflects the last attempt or a route-level
+        decision (cache hit / rate-limit rejection). Usage/Cost aggregate and
+        all counters are recorded before end. Registry + ContextVar always
+        cleaned.
         """
         if self._closed:
             return
         self._closed = True
         try:
+            self._force_close_open_attempts()
             try:
                 if self._span is not None:
+                    self._record_terminal_event()
                     self._span.end()
                     self._ended_at = self._span.end_time
                     self._apply_aggregates()
@@ -297,6 +400,70 @@ class RouterSpan:
                 logger.error("Router span end failed: %s", e)
         finally:
             self._cleanup()
+
+    def _force_close_open_attempts(self):
+        """Force-close every Attempt still open when the Router finalizes.
+
+        A business exception between Attempt start and close must not leak an
+        open span / registry entry / active-attempt ContextVar.
+        """
+        try:
+            open_attempts = list(self._open_attempts.values())
+        except Exception:
+            open_attempts = []
+        for attempt in open_attempts:
+            try:
+                attempt.force_close(
+                    category=ErrorCategory.GATEWAY_INTERNAL,
+                    reason="router_finalized_with_open_attempt",
+                )
+            except Exception as e:
+                logger.error("Router force-close of open attempt failed: %s", e)
+        try:
+            self._open_attempts.clear()
+        except Exception:
+            pass
+
+    # ── open-attempt registry ──
+
+    def register_open_attempt(self, attempt: AttemptSpan):
+        """Track an Attempt as open (called on Attempt start)."""
+        try:
+            key = attempt.span.span_id if attempt.span is not None else str(id(attempt))
+            self._open_attempts[key] = attempt
+        except Exception as e:
+            logger.error("Router open-attempt register failed: %s", e)
+
+    def unregister_open_attempt(self, attempt: AttemptSpan):
+        """Stop tracking an Attempt (called on Attempt close/force_close)."""
+        try:
+            key = attempt.span.span_id if attempt.span is not None else str(id(attempt))
+            self._open_attempts.pop(key, None)
+        except Exception as e:
+            logger.error("Router open-attempt unregister failed: %s", e)
+
+    @property
+    def open_attempt_count(self) -> int:
+        try:
+            return len(self._open_attempts)
+        except Exception:
+            return 0
+
+    def _record_terminal_event(self):
+        """Record ``gateway.response.completed``/``gateway.response.failed``
+        exactly once, before the span ends (P1-3 lifecycle wiring)."""
+        try:
+            if self._span is None:
+                return
+            if self._final_error is not None:
+                self.recorder.response_failed(
+                    error_category=self._final_error.category,
+                    http_status_code=self._final_http_status,
+                )
+            else:
+                self.recorder.response_completed(http_status_code=self._final_http_status)
+        except Exception as e:
+            logger.error("Router terminal event failed: %s", e)
 
     def _apply_aggregates(self):
         try:
@@ -350,9 +517,14 @@ class RouterSpan:
                 self._span.set_status("ERROR")
                 return
             if self._final_error is not None:
+                # Router and Attempt terminal states must agree: a final
+                # classified error (incl. client_cancelled / timeout /
+                # stream_interrupted) makes the Router ERROR.
                 self._span.set_status("ERROR")
-            elif self._fail_count == 0 and self._success_count > 0:
-                self._span.set_status("OK")
+            elif self._fail_count > 0 and self._success_count == 0:
+                # Every attempt failed but no classified error survived —
+                # still an error, never OK.
+                self._span.set_status("ERROR")
             else:
                 self._span.set_status("OK")
         except Exception as e:
@@ -371,8 +543,9 @@ class RouterSpan:
                 self._token = None
         except Exception as e:
             logger.error("Router context cleanup failed: %s", e)
-        # Force-clear so no stale Router ContextVar survives even when the
-        # reset token belonged to another asyncio Context (streaming task).
+        # Clear the whole gateway context (both slots) only when this Router
+        # is the active one — Router terminal state is the ONLY place allowed
+        # to clear the Router slot.
         try:
             from .context import clear_gateway_context
             current = GatewayContext.get()
@@ -393,6 +566,43 @@ class RouterSpan:
 
     # ── Attempt lifecycle ──
 
+    def allocate_attempt_index(self, explicit_index: Optional[int] = None) -> int:
+        """Allocate the attempt index for a new Attempt (thread-safe).
+
+        Rules (frozen):
+        - No explicit value → next auto-allocated index.
+        - Explicit valid positive integer, unused → use it.
+        - Explicit duplicate → remap to the next available value + warning.
+        - Zero / negative / non-integer → fall back to auto-allocation.
+        """
+        with self._index_lock:
+            candidate: Optional[int] = None
+            if explicit_index is not None:
+                try:
+                    if isinstance(explicit_index, bool):
+                        raise ValueError("bool is not a valid attempt index")
+                    parsed = int(explicit_index)
+                    if parsed >= 1 and parsed == explicit_index:
+                        candidate = parsed
+                except (TypeError, ValueError):
+                    candidate = None
+            if candidate is not None:
+                if candidate not in self._used_attempt_indices:
+                    self._used_attempt_indices.add(candidate)
+                    self._attempt_count = len(self._used_attempt_indices)
+                    return candidate
+                logger.warning(
+                    "Duplicate explicit attempt_index %s — remapping to next available",
+                    candidate,
+                )
+            # Auto-allocate the smallest unused positive index.
+            next_index = 1
+            while next_index in self._used_attempt_indices:
+                next_index += 1
+            self._used_attempt_indices.add(next_index)
+            self._attempt_count = len(self._used_attempt_indices)
+            return next_index
+
     def attempt(
         self,
         attempt_index: Optional[int] = None,
@@ -404,9 +614,11 @@ class RouterSpan:
     ) -> AttemptSpan:
         """Create a fresh AttemptSpan under this Router (spec §13.2).
 
-        Each call produces a new, unique Attempt span — never reused.
+        Each call produces a new, unique Attempt span — never reused. The
+        index is allocated by the Router (default increments; duplicates are
+        remapped with a warning; invalid values fall back to auto-allocation).
         """
-        index = attempt_index if attempt_index is not None else self._attempt_count + 1
+        index = self.allocate_attempt_index(attempt_index)
         attempt = AttemptSpan(
             router=self,
             attempt_index=index,
@@ -420,7 +632,6 @@ class RouterSpan:
             tracer=self._tracer,
             sampled=self._sampled,
         )
-        self._attempt_count = max(self._attempt_count, index)
         self._attempts.append(attempt)
         return attempt
 
@@ -431,7 +642,6 @@ class RouterSpan:
         aggregate (spec §12.2).
         """
         try:
-            self._attempt_count = max(self._attempt_count, result.attempt_index or self._attempt_count)
             if result.success:
                 self._success_count += 1
                 if result.channel_id:
@@ -488,7 +698,9 @@ class RouterSpan:
         self._fallback_count += 1
         if to_channel_id is not None:
             self._final_channel_id = to_channel_id
-        return self.recorder.fallback_selected(channel_id=to_channel_id, reason=reason)
+        return self.recorder.fallback_selected(
+            from_channel_id=from_channel_id, to_channel_id=to_channel_id, reason=reason
+        )
 
     def set_cache_status(self, status: str):
         """Record a cache decision: hit → no attempt, cache_status=hit."""
@@ -536,6 +748,19 @@ class RouterSpan:
         self._route_duration_ms = route_duration_ms
 
     # ── properties ──
+
+    @property
+    def resolved_parent(self) -> Optional[ResolvedGatewayParent]:
+        """The explicit parent resolution (available after ``start()``)."""
+        return self._resolved_parent
+
+    @property
+    def open_attempts(self) -> list:
+        """Snapshot of currently open Attempts."""
+        try:
+            return list(self._open_attempts.values())
+        except Exception:
+            return []
 
     @property
     def span(self) -> Optional[Span]:

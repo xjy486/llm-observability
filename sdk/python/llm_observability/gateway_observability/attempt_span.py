@@ -84,9 +84,18 @@ class AttemptSpan:
         self._usage: Optional[NormalizedUsage] = None
         self._cost: Optional[NormalizedCost] = None
         self._upstream_request_id: Optional[str] = None
+        self._terminal_event_recorded = False
+        # True once this attempt's result has been aggregated into its Router
+        # (via runtime.finalize_attempt OR the stream terminal finalizer).
+        # Guards against double aggregation when a caller both finalizes an
+        # attempt and then lets a streaming wrapper terminate it.
+        self._aggregated_to_router = False
         # The raw (pre-hash) channel ID is only stored for aggregation, never
         # written to telemetry (the span carries the hashed value).
         self._raw_channel_id: Optional[str] = channel_id
+
+        from .recorder import GatewayEventRecorder
+        self.recorder = GatewayEventRecorder(span=None, privacy=self._privacy)
 
     # ── lifecycle ──
 
@@ -118,31 +127,51 @@ class AttemptSpan:
             span.start()
             self._span = span
             self._started_at = span.start_time
+            self.recorder.bind(span)
 
-            # Register + attach as the active attempt.
+            # Register + track as open on the Router + attach as active attempt.
             if self._registry is not None:
                 self._registry.register(trace_id, span_id, self)
+            try:
+                if self._router is not None:
+                    self._router.register_open_attempt(self)
+            except Exception as e:
+                logger.error("Attempt open-register on router failed: %s", e)
             self._ctx_token = GatewayContext.set_attempt(self)
+            # Lifecycle event: exactly one gateway.attempt.started per attempt.
+            self.recorder.attempt_started(
+                attempt_index=self._attempt_index,
+                channel_id=self._raw_channel_id,
+                provider=self._provider,
+                resolved_model=self._resolved_model,
+            )
         except Exception as e:
             logger.error("Attempt span start failed: %s", e)
         return self
 
     def _parent_ids(self):
+        """Return (trace_id, parent_span_id) — the Attempt's parent is always
+        its Router. When the Router span exists but somehow has no valid trace
+        ID, a fresh valid one is generated (never None)."""
         try:
             router_span = self._router.span if self._router is not None else None
             if router_span is not None:
-                return router_span.trace_id, router_span.span_id
+                trace_id = router_span.trace_id
+                if trace_id:
+                    return trace_id, router_span.span_id
         except Exception:
             pass
         # Fallback: current SDK context.
         try:
             from ..context import get_current_context
             ctx = get_current_context()
-            if ctx is not None:
+            if ctx is not None and getattr(ctx, "trace_id", None):
                 return ctx.trace_id, ctx.span_id
         except Exception:
             pass
-        return None, None
+        # Last resort: the Attempt still must belong to a valid trace.
+        from ..utils.ids import generate_trace_id
+        return generate_trace_id(), None
 
     def set_upstream_status(
         self,
@@ -228,6 +257,31 @@ class AttemptSpan:
             logger.error("Attempt cost failed: %s", e)
         return self
 
+    def _record_terminal_event(self):
+        """Fallback terminal event when none was recorded before span end.
+
+        ``GatewayRuntime.finalize_attempt`` records the canonical event; this
+        catches attempts closed without a finalize call (e.g. context-manager
+        exit with an exception).
+        """
+        try:
+            if self._terminal_event_recorded:
+                return
+            self._terminal_event_recorded = True
+            if self._error is not None:
+                self.recorder.attempt_failed(
+                    attempt_index=self._attempt_index,
+                    error_category=self._error.category,
+                    http_status_code=self._status,
+                )
+            else:
+                self.recorder.attempt_completed(
+                    attempt_index=self._attempt_index,
+                    http_status_code=self._status,
+                )
+        except Exception as e:
+            logger.error("Attempt terminal event failed: %s", e)
+
     def close(self):
         """End the Attempt span at a terminal state (fail-open).
 
@@ -248,6 +302,7 @@ class AttemptSpan:
                         self._span.set_status("OK")
                     if self._duration_ms is not None:
                         self._span.set_attribute(ATTR_ATTEMPT["upstream_duration_ms"], self._duration_ms)
+                    self._record_terminal_event()
                     self._span.end()
                     if self._sampled and self._tracer is not None:
                         try:
@@ -259,8 +314,38 @@ class AttemptSpan:
         finally:
             self._cleanup()
 
+    def force_close(self, category: str = "gateway_internal",
+                    reason: str = "router_finalized_with_open_attempt"):
+        """Force-close this Attempt when the Router finalizes with it open.
+
+        Idempotent (a closed Attempt is a no-op), fail-open, never overwrites
+        an already-recorded business error, cleans the registry/context, and
+        reports the final span.
+        """
+        if self._closed:
+            return
+        try:
+            if self._error is None:
+                from .errors import GatewayError
+                self.set_error(GatewayError(
+                    category=category,
+                    type="GatewayInternalError",
+                    message=reason,
+                    retryable=False,
+                ))
+        except Exception as e:
+            logger.error("Attempt force_close error-mark failed: %s", e)
+        self.close()
+
     def _cleanup(self):
-        """Unregister + clear the active-attempt ContextVar (fail-open)."""
+        """Unregister (Router open-attempts + registry) + clear ONLY the
+        active-attempt ContextVar slot — the Router slot always survives an
+        Attempt close (fail-open)."""
+        try:
+            if self._router is not None:
+                self._router.unregister_open_attempt(self)
+        except Exception as e:
+            logger.error("Attempt router unregister failed: %s", e)
         try:
             if self._registry is not None and self._span is not None:
                 self._registry.remove(self._span.trace_id, self._span.span_id)
@@ -272,12 +357,12 @@ class AttemptSpan:
                 self._ctx_token = None
         except Exception as e:
             logger.error("Attempt context cleanup failed: %s", e)
-        # Force-clear any stale active-attempt slot even cross-Context.
+        # Belt-and-braces: clear only the attempt slot if it still points at
+        # this attempt (e.g. the token belonged to another asyncio Context).
         try:
             current = GatewayContext.get()
-            if current.active_attempt is self or current.active_attempt is None:
-                from .context import clear_gateway_context
-                clear_gateway_context()
+            if current.active_attempt is self:
+                GatewayContext.clear_attempt_only()
         except Exception:
             pass
 

@@ -58,6 +58,8 @@ ALLOWED_EVENT_ATTRIBUTES: Final[FrozenSet[str]] = frozenset({
     "reason",
     "attempt_index",
     "channel_id",
+    "from_channel_id",
+    "to_channel_id",
     "provider",
     "resolved_model",
     "delay_ms",

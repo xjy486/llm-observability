@@ -44,9 +44,12 @@ def test_fallback_records_single_event_with_from_to(clean_sdk):
     events = _event(router.span, EVENT_FALLBACK_SELECTED)
     assert len(events) == 1
     attrs = events[0]["attributes"]
-    # From-channel differs from to-channel; event carries the to-channel + reason.
+    # From/to channels differ; both are recorded — hashed (rework P0-8).
     assert router.fallback_count == 1
-    assert attrs["channel_id"] == "ch-b"
+    assert attrs["from_channel_id"] == router._privacy.hash_channel_id("ch-a")
+    assert attrs["to_channel_id"] == router._privacy.hash_channel_id("ch-b")
+    assert "ch-a" not in str(attrs.values())
+    assert "ch-b" not in str(attrs.values())
     assert attrs["reason"] == "timeout"
     assert router.final_channel_id == "ch-b"
     assert router.span.attributes["gateway.fallback_count"] == 1

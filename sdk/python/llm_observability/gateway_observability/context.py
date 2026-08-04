@@ -43,14 +43,19 @@ class GatewayRequestContext:
     business_scenario: Optional[str] = None
 
 
-@dataclass
-class _GatewayContextState:
-    """Runtime tuple held in the ContextVar."""
+@dataclass(frozen=True)
+class GatewayContextState:
+    """Runtime tuple held in the ContextVar (router slot + attempt slot).
+
+    The two slots are managed independently: closing an Attempt MUST only
+    touch the attempt slot; only a Router terminal state may clear the router
+    slot (spec: context slot semantics).
+    """
     router: Optional[object] = None
     active_attempt: Optional[object] = None
 
 
-_gateway_context_var: ContextVar[Optional[_GatewayContextState]] = ContextVar(
+_gateway_context_var: ContextVar[Optional[GatewayContextState]] = ContextVar(
     "llm_obs_gateway_context", default=None
 )
 
@@ -64,11 +69,11 @@ class GatewayContext:
     """
 
     @staticmethod
-    def get() -> _GatewayContextState:
+    def get() -> GatewayContextState:
         """Get the current gateway context state (never raises)."""
         state = _gateway_context_var.get()
         if state is None:
-            state = _GatewayContextState()
+            state = GatewayContextState()
         return state
 
     @staticmethod
@@ -77,7 +82,7 @@ class GatewayContext:
         prev = _gateway_context_var.get()
         prev_router = prev.router if prev is not None else None
         token = _gateway_context_var.set(
-            _GatewayContextState(router=router)
+            GatewayContextState(router=router)
         )
         return token, prev_router
 
@@ -98,7 +103,7 @@ class GatewayContext:
         except ValueError:
             # Cross-Context token — clear the current context's router slot.
             try:
-                _gateway_context_var.set(_GatewayContextState())
+                _gateway_context_var.set(GatewayContextState())
             except Exception as e:
                 logger.error("Gateway context cross-context clear failed: %s", e)
         except Exception as e:
@@ -114,33 +119,50 @@ class GatewayContext:
         """
         state = _gateway_context_var.get()
         if state is None:
-            state = _GatewayContextState()
+            state = GatewayContextState()
         token = _gateway_context_var.set(
-            _GatewayContextState(router=state.router, active_attempt=attempt)
+            GatewayContextState(router=state.router, active_attempt=attempt)
         )
         return token
 
     @staticmethod
     def clear_attempt(token: Token):
-        """Detach the active attempt. Fail-open on reset failure."""
+        """Detach the active attempt — clears ONLY the attempt slot.
+
+        The router slot is always preserved: attempt close (normal, error,
+        async, or cross-context reset) must never clear the Router context.
+        Fail-open on reset failure.
+        """
         try:
             state = _gateway_context_var.get()
-            if state is not None and state.active_attempt is not None:
-                _gateway_context_var.set(
-                    _GatewayContextState(router=state.router, active_attempt=None)
-                )
-            _gateway_context_var.reset(token)
-        except ValueError:
-            # Cross-Context token — clear the attempt slot in this context.
+            router = state.router if state is not None else None
+            # Clear only the attempt slot, keeping the router slot intact.
+            _gateway_context_var.set(
+                GatewayContextState(router=router, active_attempt=None)
+            )
             try:
-                state = _gateway_context_var.get()
-                _gateway_context_var.set(
-                    _GatewayContextState(router=state.router if state else None, active_attempt=None)
-                )
-            except Exception as e:
-                logger.error("Gateway attempt cross-context clear failed: %s", e)
+                _gateway_context_var.reset(token)
+            except ValueError:
+                # Cross-Context token — the slot clear above already applied.
+                pass
         except Exception as e:
             logger.error("Gateway attempt clear failed: %s", e)
+
+    @staticmethod
+    def clear_attempt_only():
+        """Clear only the attempt slot in the current context (no token).
+
+        Used when the reset token belongs to another asyncio Context. The
+        router slot is always preserved. Fail-open.
+        """
+        try:
+            state = _gateway_context_var.get()
+            router = state.router if state is not None else None
+            _gateway_context_var.set(
+                GatewayContextState(router=router, active_attempt=None)
+            )
+        except Exception as e:
+            logger.error("Gateway attempt-only clear failed: %s", e)
 
     @staticmethod
     def clear():
@@ -152,13 +174,15 @@ class GatewayContext:
 
 
 def clear_gateway_context():
-    """Force-clear the gateway context. Used by the streaming wrapper on every
-    terminal path so no stale Router/Attempt ContextVar remains even when the
-    reset token belongs to another asyncio Context."""
+    """Force-clear the whole gateway context (both slots).
+
+    Router-terminal-state use only — Attempt cleanup must go through
+    ``GatewayContext.clear_attempt`` so the Router slot survives.
+    """
     GatewayContext.clear()
 
 
-def get_gateway_context() -> _GatewayContextState:
+def get_gateway_context() -> GatewayContextState:
     """Convenience: current gateway context state (never raises)."""
     return GatewayContext.get()
 
