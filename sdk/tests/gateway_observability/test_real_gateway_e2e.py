@@ -56,6 +56,20 @@ def _live_config():
     return {name: os.environ.get(name) for name in _LIVE_ENV}
 
 
+def _chat_completions_url(base_url: str) -> str:
+    """Build the chat-completions URL from a base_url that may or may not end
+    in ``/v1``.
+
+    The OpenAI SDK appends ``/chat/completions`` to its ``base_url``, so
+    existing ``E2E_BASE_URL`` secrets typically already include a trailing
+    ``/v1``. Normalizing here avoids a double ``/v1/v1`` (HTTP 404).
+    """
+    trimmed = (base_url or "").rstrip("/")
+    if trimmed.endswith("/v1"):
+        trimmed = trimmed[:-3]
+    return trimmed.rstrip("/") + "/v1/chat/completions"
+
+
 def _live_secrets_present() -> bool:
     return all(os.environ.get(name) for name in _LIVE_ENV)
 
@@ -379,7 +393,7 @@ class TestLiveGatewayEndpoint:
             "stream": False,
         }).encode("utf-8")
         request = urllib.request.Request(
-            config["GATEWAY_E2E_BASE_URL"].rstrip("/") + "/v1/chat/completions",
+            _chat_completions_url(config["GATEWAY_E2E_BASE_URL"]),
             data=body, headers=headers, method="POST",
         )
         started = time.time()
