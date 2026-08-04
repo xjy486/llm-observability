@@ -227,3 +227,105 @@ class TestOpenAttemptRegistryConcurrency:
         for sid in attempt_span_ids:
             reports = [r for r in reported if isinstance(r, dict) and r.get("span_id") == sid]
             assert len(reports) == 1, f"attempt {sid} reported {len(reports)} times"
+
+
+class TestClosedRouterRejectsRegistration:
+    """Blocker 2 (follow-up): a closed Router rejects new Attempt registration."""
+
+    def test_attempt_start_after_router_close_is_noop(self, tracer):
+        runtime = GatewayRuntime(tracer=tracer)
+        handle = runtime.handle_request({})
+        handle.finalize()  # Router is now closed
+        assert handle.router._closed is True
+
+        # Starting an attempt after close is a fail-open no-op.
+        attempt = handle.start_attempt()
+        attempt.start()
+
+        assert attempt._no_op is True
+        # The span (if created) is never ended (end_time == 0 sentinel).
+        if attempt.span is not None:
+            assert attempt.span.end_time == 0
+        # No registry entry, no active attempt.
+        assert handle.router.open_attempt_count == 0
+        assert runtime.attempt_registry.size() == 0
+        from llm_observability.gateway_observability.context import GatewayContext
+        state = GatewayContext.get()
+        assert state.active_attempt is None
+        # Closing the no-op attempt does not report or raise.
+        attempt.close()
+        if attempt.span is not None:
+            assert attempt.span.end_time == 0, "no-op span must not be ended"
+
+    def test_router_finalize_blocks_post_snapshot_registration(self, tracer):
+        runtime = GatewayRuntime(tracer=tracer)
+        handle = runtime.handle_request({})
+        # Finalize closes the Router; a later register must be rejected.
+        handle.finalize()
+        assert handle.router.register_open_attempt.__call__  # method exists
+        # A direct register call returns False (rejected).
+        class _FakeAttempt:
+            class _span:
+                span_id = "fake-span-id"
+            span = _span()
+        ok = handle.router.register_open_attempt(_FakeAttempt())
+        assert ok is False
+        assert handle.router.open_attempt_count == 0
+
+    def test_attempt_register_racing_router_finalize_no_leak(self, tracer):
+        import threading
+
+        runtime = GatewayRuntime(tracer=tracer)
+        handle = runtime.handle_request({})
+        barrier = threading.Barrier(2)
+        registered_after_close = {"count": 0}
+
+        def starter():
+            barrier.wait()
+            for _ in range(50):
+                a = handle.start_attempt()
+                a.start()
+                if a._no_op:
+                    registered_after_close["count"] += 1
+                else:
+                    a.close()
+
+        starter_t = threading.Thread(target=starter)
+        starter_t.start()
+        barrier.wait()
+        handle.finalize()
+        starter_t.join()
+
+        # After finalize the registry is empty regardless of the race.
+        assert handle.router.open_attempt_count == 0
+        assert runtime.attempt_registry.size() == 0
+
+    def test_concurrent_attempt_start_and_finalize_registry_zero(self, tracer):
+        import threading
+
+        runtime = GatewayRuntime(tracer=tracer)
+        handle = runtime.handle_request({})
+        stop = threading.Event()
+        started_any = {"count": 0}
+
+        def starter():
+            while not stop.is_set():
+                a = handle.start_attempt()
+                a.start()
+                if not a._no_op:
+                    started_any["count"] += 1
+                    a.close()
+
+        threads = [threading.Thread(target=starter) for _ in range(6)]
+        for t in threads:
+            t.start()
+        import time as _time
+        _time.sleep(0.1)
+        handle.finalize()
+        stop.set()
+        for t in threads:
+            t.join()
+
+        # No leaked open entries after finalize.
+        assert handle.router.open_attempt_count == 0
+        assert runtime.attempt_registry.size() == 0

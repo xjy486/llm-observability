@@ -111,3 +111,31 @@ class TestRuntimePrivacyIntegration:
         assert "evil-value" not in str(attempt.span.attributes)
         attempt.close()
         handle.finalize()
+
+
+class TestAssociationFieldHardening:
+    """Non-blocking: association top-level fields are length-limited +
+    control-char-stripped + secret-masked (not just pattern-masked)."""
+
+    def test_association_fields_size_limited_and_control_stripped(self, tracer):
+        runtime = _router(tracer)
+        handle = runtime.handle_request({
+            "gateway_name": "gw",
+            "user_id": "u-" + "x" * 10000 + "\x00\x07tab\there",
+            "session_id": "s-" + "y" * 10000,
+            "message_id": "m-\x1b[31mESC",
+            "app_name": "a-" + "z" * 10000,
+            "business_scenario": "b-" + _SK,
+        })
+        rec = handle.router.span
+        assert len(rec.user_id.encode("utf-8")) <= 256
+        assert len(rec.session_id.encode("utf-8")) <= 256
+        assert len(rec.app_name.encode("utf-8")) <= 256
+        # Control chars stripped.
+        assert "\x00" not in rec.user_id and "\x07" not in rec.user_id
+        assert "\t" not in rec.user_id  # tab stripped
+        assert "\x1b" not in rec.message_id
+        # Secret masked in business_scenario.
+        assert _SK not in rec.business_scene
+        assert "<redacted>" in rec.business_scene
+        handle.finalize()

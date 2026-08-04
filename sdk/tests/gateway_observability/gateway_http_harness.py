@@ -148,18 +148,29 @@ def mock_response(scenario: str, model: str):
     }, 200
 
 
+# Server-side synchronisation event for the deterministic streaming-cancel
+# scenario. The test sets it after reading the first chunk; the upstream
+# generator blocks on it (no sleep) so the client can disconnect mid-stream
+# deterministically.
+streaming_cancel_gate = threading.Event()
+# Set by the harness when the wrapper's cancel finalize fired.
+streaming_cancel_fired = threading.Event()
+
+
 def mock_stream(scenario: str, model: str):
     """Yield SSE-style content chunks (deterministic).
 
-    ``streaming_cancel`` yields one chunk then a brief pause so a client can
-    disconnect before the stream completes (exercises the mid-stream exit
-    path); the exact cancel-vs-complete outcome is timing-dependent and is
-    asserted only for observable consistency in the HTTP E2E test.
+    ``streaming_cancel`` yields one chunk then blocks on
+    ``streaming_cancel_gate`` (set by the test after reading the first chunk)
+    so the client can disconnect mid-stream deterministically; the generator
+    never yields the rest, forcing the wrapper onto its cancel finalize path.
     """
-    import time as _time
     if scenario == "streaming_cancel":
         yield {"choices": [{"delta": {"content": "partial"}}]}
-        _time.sleep(0.3)  # window for the client to disconnect
+        # Block until the test signals (client about to disconnect). Timeout
+        # guards against a hang if the test never sets the gate.
+        streaming_cancel_gate.wait(timeout=5.0)
+        # If we get here the client stayed — emit the rest cleanly.
         yield {"choices": [{"delta": {"content": "rest"}}]}
         yield {"choices": [], "usage": _usage(10, 5)}
         return
@@ -314,6 +325,7 @@ class GatewayHarness:
             # (client_cancelled on Attempt + Router), then stop writing.
             try:
                 wrapped.close()
+                streaming_cancel_fired.set()
             except Exception:
                 pass
         try:

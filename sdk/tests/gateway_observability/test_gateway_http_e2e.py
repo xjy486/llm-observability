@@ -26,6 +26,8 @@ from gateway_http_harness import (
     MockCoreServer,
     make_tracer,
     stop_tracer,
+    streaming_cancel_gate,
+    streaming_cancel_fired,
 )
 
 
@@ -161,15 +163,17 @@ class TestGatewayHttpE2E:
         assert routers[0]["attributes"].get("usage.total_tokens") == 15
 
     def test_streaming_cancel_terminal_consistency_over_http(self, harness):
-        # Client opens the stream, consumes one chunk, then disconnects.
-        # The exact mid-stream cancel-vs-clean-completion outcome depends on
-        # OS/library reset timing and is non-deterministic over real HTTP;
-        # the contract we assert at the HTTP layer is the *observable* one:
-        # the stream terminates, both spans end with consistent status, and
-        # records reach Core over HTTP. (The frozen client_cancelled
-        # terminal-state semantics themselves are unit-tested in
-        # test_stream_terminal_state.py::test_stream_cancel_* and
-        # test_async_stream_cancelled_error_finalizes_once.)
+        # Client opens the stream, consumes one chunk, then disconnects. Over
+        # real HTTP the server's write-error detection is buffered and
+        # timing-dependent (aiohttp absorbs writes into its send buffer), so
+        # the mid-stream cancel-vs-clean-completion outcome is not
+        # deterministic at the HTTP layer. The observable contract asserted
+        # here: the stream terminates, both spans end with consistent status,
+        # records reach Core over HTTP, and registries/contexts are clean.
+        # The frozen client_cancelled terminal-state semantics are unit-tested
+        # deterministically in test_stream_terminal_state.py.
+        streaming_cancel_gate.clear()
+        streaming_cancel_fired.clear()
         with httpx.stream(
             "POST", harness.url + "/v1/chat/completions",
             json={"model": "mock-model", "messages": [{"role": "user", "content": "hi"}], "stream": True},
@@ -181,6 +185,7 @@ class TestGatewayHttpE2E:
                 next(it)  # consume the first chunk
             except StopIteration:
                 pass
+            streaming_cancel_gate.set()
             # Exiting the context closes the connection (possibly mid-stream).
         records = _wait_for_records(harness.core, 2, timeout=6.0)
         routers, attempts = _routers(records), _attempts(records)

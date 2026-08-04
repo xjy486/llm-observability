@@ -162,6 +162,29 @@ class PrivacyGuard:
         except Exception:
             return self._mask
 
+    # ── association top-level fields ──
+
+    def sanitize_association(self, text: Optional[str]) -> str:
+        """Sanitize a Router association top-level field (user_id / session_id
+        / message_id / app_name / business_scene).
+
+        Applies secret-pattern masking, control-character stripping, and a
+        256-byte length limit — the same hardening the guarded span-attribute
+        path applies, since these fields are external strings written to the
+        Span record top-level (not via ``set_gateway_attribute``). Fail-closed.
+        """
+        if not isinstance(text, str) or not text:
+            return text if isinstance(text, str) else ""
+        try:
+            masked = text
+            for pattern, replacement in _SECRET_PATTERNS:
+                masked = pattern.sub(replacement, masked)
+            # Strip control chars (keep tab/newline out of telemetry fields).
+            masked = "".join(ch for ch in masked if ch == " " or (ord(ch) >= 0x20 and ord(ch) != 0x7F))
+            return _truncate_bytes(masked, _ASSOCIATION_MAX_BYTES)
+        except Exception:
+            return self._mask
+
     # ── channel ID hashing ──
 
     def hash_channel_id(self, raw_id: Optional[str]) -> Optional[str]:
@@ -205,6 +228,10 @@ class PrivacyGuard:
 
 # Per-key byte limits for external string values.
 _MAX_STRING_BYTES = 512
+# Byte limit for Router association top-level fields (user_id / session_id /
+# message_id / app_name / business_scene) — written to the Span record, not via
+# set_gateway_attribute, so the bound is applied in sanitize_association.
+_ASSOCIATION_MAX_BYTES = 256
 _PER_KEY_LIMITS = {
     "gateway.request_id": 256,
     "gateway.upstream_request_id": 256,

@@ -289,17 +289,18 @@ class RouterSpan:
                     self._set_attr(span, ATTR_ROUTER["requested_model"], rc.requested_model)
                 # Full association field set — written to the Span top-level
                 # fields using the EXISTING Span Record naming (``business_scene``,
-                # never a second ``business_scenario`` spelling), sanitized.
+                # never a second ``business_scenario`` spelling), sanitized +
+                # length-limited + control-char-stripped.
                 if rc.user_id:
-                    span.user_id = self._privacy.sanitize_string(rc.user_id)
+                    span.user_id = self._privacy.sanitize_association(rc.user_id)
                 if rc.session_id:
-                    span.session_id = self._privacy.sanitize_string(rc.session_id)
+                    span.session_id = self._privacy.sanitize_association(rc.session_id)
                 if rc.message_id:
-                    span.message_id = self._privacy.sanitize_string(rc.message_id)
+                    span.message_id = self._privacy.sanitize_association(rc.message_id)
                 if rc.app_name:
-                    span.app_name = self._privacy.sanitize_string(rc.app_name)
+                    span.app_name = self._privacy.sanitize_association(rc.app_name)
                 if rc.business_scenario:
-                    span.business_scene = self._privacy.sanitize_string(rc.business_scenario)
+                    span.business_scene = self._privacy.sanitize_association(rc.business_scenario)
             # Frozen trace-origin semantics, derived from the explicit
             # resolution — never inferred from "whether a parent exists".
             span.set_attribute(ATTR_GATEWAY["trace_origin"], resolved.trace_origin_attribute)
@@ -398,7 +399,17 @@ class RouterSpan:
         """
         if self._closed:
             return
-        self._closed = True
+        # Enter the terminal state atomically with the open-attempt snapshot
+        # so a concurrent register either is captured in the snapshot or
+        # observes _closed and is rejected (Blocker 2: no post-finalize
+        # registration / orphan span leak).
+        try:
+            with self._open_attempts_lock:
+                if self._closed:
+                    return
+                self._closed = True
+        except Exception:
+            self._closed = True
         try:
             self._force_close_open_attempts()
             try:
@@ -443,14 +454,24 @@ class RouterSpan:
 
     # ── open-attempt registry ──
 
-    def register_open_attempt(self, attempt: AttemptSpan):
-        """Track an Attempt as open (called on Attempt start)."""
+    def register_open_attempt(self, attempt: AttemptSpan) -> bool:
+        """Track an Attempt as open (called on Attempt start).
+
+        Returns True if registered, False if the Router is already closed
+        (terminal) — in which case registration is a no-op and the caller
+        (Attempt.start) must take the fail-open no-op telemetry path so no
+        orphan span / registry entry / active-attempt ContextVar is created.
+        """
         try:
             key = attempt.span.span_id if attempt.span is not None else str(id(attempt))
             with self._open_attempts_lock:
+                if self._closed:
+                    return False
                 self._open_attempts[key] = attempt
+                return True
         except Exception as e:
             logger.error("Router open-attempt register failed: %s", e)
+            return False
 
     def unregister_open_attempt(self, attempt: AttemptSpan):
         """Stop tracking an Attempt (called on Attempt close/force_close)."""
@@ -637,7 +658,17 @@ class RouterSpan:
         Each call produces a new, unique Attempt span — never reused. The
         index is allocated by the Router (default increments; duplicates are
         remapped with a warning; invalid values fall back to auto-allocation).
+        When the Router is already closed (terminal), returns a no-op
+        AttemptSpan (no index allocated, not tracked) so callers that never
+        start() are also safe; Attempt.start() independently re-checks.
         """
+        if self._closed:
+            return AttemptSpan(
+                router=self, attempt_index=0, provider=provider,
+                channel_id=channel_id, channel_type=channel_type,
+                resolved_model=resolved_model, timeout_ms=timeout_ms,
+                privacy=self._privacy, registry=None, tracer=None, sampled=False,
+            )
         index = self.allocate_attempt_index(attempt_index)
         attempt = AttemptSpan(
             router=self,

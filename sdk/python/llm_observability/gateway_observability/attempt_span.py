@@ -90,6 +90,9 @@ class AttemptSpan:
         # Guards against double aggregation when a caller both finalizes an
         # attempt and then lets a streaming wrapper terminate it.
         self._aggregated_to_router = False
+        # A no-op attempt (Router was already closed at start) is never
+        # registered, never set as the active attempt, and never reported.
+        self._no_op = False
         # The raw (pre-hash) channel ID is only stored for aggregation, never
         # written to telemetry (the span carries the hashed value).
         self._raw_channel_id: Optional[str] = channel_id
@@ -143,11 +146,25 @@ class AttemptSpan:
             # Register + track as open on the Router + attach as active attempt.
             if self._registry is not None:
                 self._registry.register(trace_id, span_id, self)
+            registered = True
             try:
                 if self._router is not None:
-                    self._router.register_open_attempt(self)
+                    registered = self._router.register_open_attempt(self)
             except Exception as e:
                 logger.error("Attempt open-register on router failed: %s", e)
+                registered = False
+            if not registered:
+                # The Router is already closed (terminal). Take the fail-open
+                # no-op path: do NOT set the active-attempt ContextVar, do NOT
+                # emit lifecycle events, mark this span as not-for-report, and
+                # remove the registry entry just added. Business continues.
+                self._no_op = True
+                try:
+                    if self._registry is not None:
+                        self._registry.remove(trace_id, span_id)
+                except Exception:
+                    pass
+                return self
             self._ctx_token = GatewayContext.set_attempt(self)
             # Lifecycle event: exactly one gateway.attempt.started per attempt.
             self.recorder.attempt_started(
@@ -298,11 +315,16 @@ class AttemptSpan:
         """End the Attempt span at a terminal state (fail-open).
 
         Registry entry + active-attempt ContextVar are always cleaned, even if
-        span end or report raises.
+        span end or report raises. A no-op attempt (Router was closed at start)
+        is neither ended nor reported — it is simply discarded.
         """
         if self._closed:
             return
         self._closed = True
+        if self._no_op:
+            # Never registered / never started as a real span: nothing to end
+            # or report, no ContextVar to clear.
+            return
         try:
             try:
                 if self._span is not None:
@@ -332,16 +354,28 @@ class AttemptSpan:
 
         Idempotent (a closed Attempt is a no-op), fail-open, never overwrites
         an already-recorded business error, cleans the registry/context, and
-        reports the final span. The force-close is the single funnel that also
-        constructs the terminal ``AttemptResult`` and aggregates it into the
-        Router exactly once (via ``_aggregated_to_router``) — so a Router that
-        finalizes with an open Attempt ends ERROR with the right
-        ``final_error_category`` and ``fail_count``, never OK while its child
-        Attempt is ERROR.
+        reports the final span.
+
+        State-machine aware:
+        - Already closed → no-op.
+        - Already aggregated (`_aggregated_to_router` True — e.g. ``finish_attempt``
+          ran but the caller forgot ``close()``) → only close the span, preserving
+          the already-recorded OK or business-ERROR status. No ``gateway_internal``
+          error is written, no re-aggregation — so Router and Attempt terminal
+          states stay consistent (Router OK ⟺ Attempt OK).
+        - Never aggregated → set ``gateway_internal`` ERROR, aggregate the failure
+          result exactly once, then close — so the Router ends ERROR.
         """
         if self._closed:
             # Already closed (possibly already aggregated by finalize_attempt /
             # the streaming finalizer). Idempotent — do not re-aggregate.
+            return
+        if self._aggregated_to_router:
+            # The outcome is already in the Router (success or business error).
+            # Just close the span with its existing status; do NOT fabricate a
+            # gateway_internal error or re-aggregate — that would create a
+            # Router-OK / Attempt-ERROR contradiction.
+            self.close()
             return
         try:
             if self._error is None:
