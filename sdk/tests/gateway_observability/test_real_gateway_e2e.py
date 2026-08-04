@@ -1,31 +1,25 @@
-"""P0-6: REAL gateway E2E — full chain into a mock Core ingest.
+"""P0-6: gateway E2E — two layers of coverage.
 
-Chain under test:
+1. Mock-chain scenarios (always run): client → adapter → GatewayRuntime →
+   Router/Attempt → mock upstream → Reporter → mock Core ingest (in-memory
+   capture). Hard assertions on records, parent links, hashed channels,
+   streaming consistency, registry cleanup.
 
-    Client request
-    → GatewayAdapter (request/route/attempt extraction)
-    → GatewayRuntime → RouterSpan → AttemptSpan(s)
-    → mock upstream (success / retryable failure / fallback / stream / cancel)
-    → Reporter (sync capture)
-    → mock Core ingest (records validated like Core would store them)
+2. Live-upstream test (secret-gated): drives the GatewayRuntime against a real
+   OpenAI-compatible endpoint to prove the runtime main path + real upstream
+   + real Usage. This is NOT a server-level E2E (no real gateway HTTP
+   middleware / Core ingest HTTP); the full HTTP server chain is covered by
+   ``test_gateway_http_e2e.py`` (mock upstream, real HTTP client → aiohttp
+   gateway → Reporter HTTP → Core HTTP). The live-upstream test reads
+   ``GATEWAY_E2E_API_KEY`` / ``GATEWAY_E2E_BASE_URL`` / ``GATEWAY_E2E_MODEL``
+   and FAILS when they are absent on a trusted branch (the CI job's ``test -n``
+   guards); the whole job is skipped on fork PRs.
 
-Hard assertions (rework doc §7.2):
-- Router/Attempt records actually reach Core ingest.
-- TraceIDs are valid (32-hex, non-zero).
-- Attempt.parent == Router; Router.parent == SDK LLM or remote parent.
-- Retry produces multiple unique Attempts; fallback from/to present + hashed.
-- Streaming terminal states consistent (Router/Attempt agree).
-- Registries/contexts are empty at the end.
-
-Secrets: the mock-chain scenarios always run. The additional LIVE test below
-(against a real gateway endpoint) reads ``GATEWAY_E2E_API_KEY`` /
-``GATEWAY_E2E_BASE_URL`` / ``GATEWAY_E2E_MODEL`` and FAILS when they are
-absent, so a trusted-branch CI run can never go green on silent skips; the
-CI job itself is skipped wholesale on fork PRs. Locally, set the three
-variables to run the live test, or leave them unset and deselect it:
+Secrets: locally set the three variables to run the live test, or leave them
+unset and deselect it:
 
     pytest .../test_real_gateway_e2e.py --deselect \
-        sdk/tests/gateway_observability/test_real_gateway_e2e.py::TestLiveGatewayEndpoint
+        sdk/tests/gateway_observability/test_real_gateway_e2e.py::TestLiveUpstreamRuntimeE2E
 """
 import os
 import sys
@@ -338,13 +332,15 @@ class TestRealGatewayE2E:
         _assert_clean_teardown(runtime, handle.router)
 
 
-@pytest.mark.skipif(_live_skip, reason="GATEWAY_E2E_* secrets not set (live endpoint test)")
-class TestLiveGatewayEndpoint:
-    """Live HTTP E2E against a real gateway endpoint (CI trusted branches).
+@pytest.mark.skipif(_live_skip, reason="GATEWAY_E2E_* secrets not set (live upstream test)")
+class TestLiveUpstreamRuntimeE2E:
+    """Live E2E against a real OpenAI-compatible endpoint (runtime main path).
 
-    Missing secrets FAIL the CI job upstream (the ``gateway-real-e2e`` job's
-    ``test -n`` guards), never silently skip — the whole job is skipped on fork
-    PRs, so a trusted-branch run reaching pytest always has secrets set.
+    Verifies the GatewayRuntime + real upstream + real Usage (NOT the full
+    HTTP server chain — that is ``test_gateway_http_e2e.py``). Missing secrets
+    FAIL the CI job upstream (the ``gateway-real-e2e`` job's ``test -n``
+    guards), never silently skip; the whole job is skipped on fork PRs, so a
+    trusted-branch run reaching pytest always has secrets set.
     """
 
     def test_live_non_streaming_success(self, tracer, ingest):

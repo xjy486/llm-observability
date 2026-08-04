@@ -14,7 +14,7 @@ from ..utils.ids import generate_span_id
 from .attributes import ATTR_ATTEMPT, ATTR_GATEWAY, ATTR_USAGE, ATTR_COST, PROVIDER_ATTEMPT
 from .context import GatewayContext
 from .errors import GatewayError
-from .privacy import PrivacyGuard
+from .privacy import PrivacyGuard, set_gateway_attribute
 from .registry import AttemptRegistry
 from .usage import NormalizedUsage, usage_to_attributes
 from .cost import NormalizedCost, cost_to_attributes
@@ -97,6 +97,17 @@ class AttemptSpan:
         from .recorder import GatewayEventRecorder
         self.recorder = GatewayEventRecorder(span=None, privacy=self._privacy)
 
+    def _set_attr(self, span, key, value):
+        """Write an external-string span attribute through the unified guard.
+
+        External strings (provider, resolved_model, channel_type,
+        upstream_request_id, error_type, error_message, finish_reason) MUST go
+        through this so the PrivacyGuard applies whitelist + secret masking +
+        length limits. Internal counters, booleans, hashed channel IDs, and
+        numeric metrics are written directly elsewhere.
+        """
+        return set_gateway_attribute(span, key, value, self._privacy)
+
     # ── lifecycle ──
 
     def start(self) -> "AttemptSpan":
@@ -114,14 +125,14 @@ class AttemptSpan:
             span.set_attribute(ATTR_GATEWAY["span_role"], PROVIDER_ATTEMPT)
             span.set_attribute(ATTR_ATTEMPT["attempt_index"], self._attempt_index)
             if self._provider:
-                span.set_attribute(ATTR_ATTEMPT["provider"], self._provider)
+                self._set_attr(span, ATTR_ATTEMPT["provider"], self._provider)
             hashed = self._privacy.hash_channel_id(self._channel_id)
             if hashed:
                 span.set_attribute(ATTR_ATTEMPT["channel_id"], hashed)
             if self._channel_type:
-                span.set_attribute(ATTR_ATTEMPT["channel_type"], self._channel_type)
+                self._set_attr(span, ATTR_ATTEMPT["channel_type"], self._channel_type)
             if self._resolved_model:
-                span.set_attribute(ATTR_ATTEMPT["resolved_model"], self._resolved_model)
+                self._set_attr(span, ATTR_ATTEMPT["resolved_model"], self._resolved_model)
             if self._timeout_ms is not None:
                 span.set_attribute(ATTR_ATTEMPT["timeout_ms"], self._timeout_ms)
             span.start()
@@ -204,7 +215,7 @@ class AttemptSpan:
         self._upstream_request_id = request_id
         try:
             if self._span is not None and request_id:
-                self._span.set_attribute(ATTR_ATTEMPT["upstream_request_id"], request_id)
+                self._set_attr(span=self._span, key=ATTR_ATTEMPT["upstream_request_id"], value=request_id)
         except Exception as e:
             logger.error("Attempt upstream request id failed: %s", e)
         return self
@@ -215,12 +226,13 @@ class AttemptSpan:
         self._retryable = bool(error.retryable)
         try:
             if self._span is not None:
-                self._span.set_attribute(ATTR_ATTEMPT["error_category"], error.category)
-                self._span.set_attribute(ATTR_ATTEMPT["retryable"], bool(error.retryable))
+                span = self._span
+                span.set_attribute(ATTR_ATTEMPT["error_category"], error.category)
+                span.set_attribute(ATTR_ATTEMPT["retryable"], bool(error.retryable))
                 if error.type:
-                    self._span.set_attribute(ATTR_ATTEMPT["error_type"], error.type)
+                    self._set_attr(span, ATTR_ATTEMPT["error_type"], error.type)
                 if error.message:
-                    self._span.set_attribute(ATTR_ATTEMPT["error_message"], error.message)
+                    self._set_attr(span, ATTR_ATTEMPT["error_message"], error.message)
         except Exception as e:
             logger.error("Attempt set_error failed: %s", e)
         return self
@@ -230,7 +242,7 @@ class AttemptSpan:
         self._finish_reason = finish_reason
         try:
             if self._span is not None and finish_reason:
-                self._span.set_attribute(ATTR_ATTEMPT["finish_reason"], finish_reason)
+                self._set_attr(span=self._span, key=ATTR_ATTEMPT["finish_reason"], value=finish_reason)
         except Exception as e:
             logger.error("Attempt finish reason failed: %s", e)
         return self
@@ -320,9 +332,16 @@ class AttemptSpan:
 
         Idempotent (a closed Attempt is a no-op), fail-open, never overwrites
         an already-recorded business error, cleans the registry/context, and
-        reports the final span.
+        reports the final span. The force-close is the single funnel that also
+        constructs the terminal ``AttemptResult`` and aggregates it into the
+        Router exactly once (via ``_aggregated_to_router``) — so a Router that
+        finalizes with an open Attempt ends ERROR with the right
+        ``final_error_category`` and ``fail_count``, never OK while its child
+        Attempt is ERROR.
         """
         if self._closed:
+            # Already closed (possibly already aggregated by finalize_attempt /
+            # the streaming finalizer). Idempotent — do not re-aggregate.
             return
         try:
             if self._error is None:
@@ -335,7 +354,42 @@ class AttemptSpan:
                 ))
         except Exception as e:
             logger.error("Attempt force_close error-mark failed: %s", e)
+        # Aggregate the terminal result into the Router exactly once. A
+        # business error already on the Attempt is preserved (force-close only
+        # set gateway_internal when no error existed). Captured usage/cost
+        # (partial consumption) are carried into the result.
+        self._aggregate_force_close_result()
         self.close()
+
+    def _aggregate_force_close_result(self):
+        """Build the terminal AttemptResult and aggregate it to the Router.
+
+        Idempotent via ``_aggregated_to_router``; fail-open. Mirrors the
+        streaming finalizer / runtime.finalize_attempt aggregation so the
+        Router's fail_count, final_error and cost/usage aggregates stay
+        consistent with this force-closed Attempt.
+        """
+        try:
+            if self._router is None or self._aggregated_to_router:
+                return
+            from .router_span import AttemptResult
+            error = self._error
+            result = AttemptResult(
+                attempt_index=self._attempt_index,
+                channel_id=self._raw_channel_id,
+                http_status_code=self._status,
+                duration_ms=self._duration_ms,
+                ttft_ms=self._ttft_ms,
+                error=error,
+                finish_reason=self._finish_reason,
+                usage=self._usage,
+                cost=self._cost,
+                success=False,
+            )
+            self._aggregated_to_router = True
+            self._router.register_attempt_result(result)
+        except Exception as e:
+            logger.error("Attempt force_close aggregation failed: %s", e)
 
     def _cleanup(self):
         """Unregister (Router open-attempts + registry) + clear ONLY the

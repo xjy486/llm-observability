@@ -155,3 +155,75 @@ class TestRouterFinalizeForceClose:
         assert handle.router.open_attempt_count == 0
         assert handle.router.open_attempts == []
         assert runtime.attempt_registry.size() == 0
+
+
+class TestOpenAttemptRegistryConcurrency:
+    """P1-4: the _open_attempts registry is race-free under concurrency."""
+
+    def test_concurrent_attempt_register_unregister_safe(self, tracer):
+        import threading
+
+        runtime = GatewayRuntime(tracer=tracer)
+        handle = runtime.handle_request({})
+        started = []
+        stop = threading.Event()
+
+        def worker():
+            while not stop.is_set():
+                a = handle.start_attempt()
+                a.start()
+                a.close()
+                started.append(1)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        # Let them run briefly, then stop and finalize.
+        import time as _time
+        _time.sleep(0.1)
+        stop.set()
+        for t in threads:
+            t.join()
+
+        handle.finalize()
+        # No leaked open entries; every attempt that started also closed.
+        assert handle.router.open_attempt_count == 0
+        assert handle.router.open_attempts == []
+
+    def test_finalize_snapshot_stable_under_concurrent_close(self, tracer):
+        import threading
+
+        runtime = GatewayRuntime(tracer=tracer)
+        handle = runtime.handle_request({})
+        attempts = []
+        # Start many open attempts, then race their close against Router finalize.
+        for _ in range(20):
+            a = handle.start_attempt()
+            a.start()
+            attempts.append(a)
+
+        closed_flag = threading.Event()
+
+        def closer():
+            for a in attempts:
+                if closed_flag.is_set():
+                    return
+                try:
+                    a.close()
+                except Exception:
+                    pass
+
+        closer_t = threading.Thread(target=closer)
+        closer_t.start()
+        handle.finalize()  # force-closes whatever is still open
+        closed_flag.set()
+        closer_t.join()
+
+        # The registry is empty; each attempt closed exactly once (no double).
+        assert handle.router.open_attempt_count == 0
+        # fail_count reflects force-closed attempts only (those not already closed).
+        reported = list(tracer.reporter._queue)
+        attempt_span_ids = {a.span.span_id for a in attempts}
+        for sid in attempt_span_ids:
+            reports = [r for r in reported if isinstance(r, dict) and r.get("span_id") == sid]
+            assert len(reports) == 1, f"attempt {sid} reported {len(reports)} times"

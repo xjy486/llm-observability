@@ -23,10 +23,16 @@ from llm_observability.gateway_observability import (
     ErrorCategory,
     GatewayStream,
     AsyncGatewayStream,
+    CostCalculator,
 )
 from llm_observability.gateway_observability.attributes import ATTR_ATTEMPT, ATTR_ROUTER
 from llm_observability.gateway_observability.context import GatewayContext, clear_gateway_context
 from llm_observability.gateway_observability.streaming import is_meaningful_content
+
+
+_PRICING = {
+    "gpt-5.6": {"input_usd_per_1m_tokens": 2.0, "output_usd_per_1m_tokens": 8.0},
+}
 
 
 @pytest.fixture(autouse=True)
@@ -40,6 +46,17 @@ def _make_stream_handle(tracer, chunks):
     runtime = GatewayRuntime(tracer=tracer, sample_rate=1.0, privacy=PrivacyGuard(secret="s"))
     handle = runtime.handle_request({"gateway_name": "mock", "requested_model": "gpt-5.6"})
     attempt = handle.start_attempt()
+    attempt.start()
+    return handle, handle.router, attempt, chunks
+
+
+def _make_stream_handle_cost(tracer, chunks, resolved_model="gpt-5.6"):
+    runtime = GatewayRuntime(
+        tracer=tracer, sample_rate=1.0, privacy=PrivacyGuard(secret="s"),
+        cost_calculator=CostCalculator(pricing_table=_PRICING),
+    )
+    handle = runtime.handle_request({"gateway_name": "mock", "requested_model": resolved_model})
+    attempt = handle.start_attempt({"resolved_model": resolved_model})
     attempt.start()
     return handle, handle.router, attempt, chunks
 
@@ -261,3 +278,70 @@ class TestMeaningfulContentPredicate:
     ])
     def test_content_chunks_are_meaningful(self, chunk):
         assert is_meaningful_content(chunk) is True
+
+
+class TestStreamingCost:
+    def test_streaming_cost_computed_from_terminal_usage(self, tracer):
+        chunks = iter([
+            {"choices": [{"delta": {"content": "hi"}}]},
+            {"choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}},
+        ])
+        handle, router, attempt, _ = _make_stream_handle_cost(tracer, chunks)
+        stream = GatewayStream(chunks, router, attempt, runtime_handle=handle)
+        list(stream)
+
+        assert attempt.cost is not None
+        assert attempt.cost.cost_source == "priced"
+        # 100 * 2.0/1M + 50 * 8.0/1M = 0.0002 + 0.0004 = 0.0006
+        assert attempt.cost.total_cost == pytest.approx(0.0006)
+        assert router.cost_aggregate is not None
+        assert router.cost_aggregate.total_cost == pytest.approx(0.0006)
+        # Cost attributes land on both spans.
+        assert attempt.span.attributes.get("cost.total") == pytest.approx(0.0006)
+        assert router.span.attributes.get("cost.total") == pytest.approx(0.0006)
+
+    def test_streaming_cost_unpriced_when_no_pricing(self, tracer):
+        chunks = iter([
+            {"choices": [{"delta": {"content": "hi"}}]},
+            {"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}},
+        ])
+        handle, router, attempt, _ = _make_stream_handle_cost(tracer, chunks, resolved_model="unknown-model")
+        stream = GatewayStream(chunks, router, attempt, runtime_handle=handle)
+        list(stream)
+
+        assert attempt.cost is not None
+        assert attempt.cost.cost_source == "unpriced"
+        assert attempt.cost.total_cost is None
+
+    def test_streaming_cancel_partial_usage_cost_fail_open(self, tracer):
+        chunks = iter([
+            {"choices": [{"delta": {"content": "hi"}}]},
+            {"usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}},
+        ])
+        handle, router, attempt, _ = _make_stream_handle_cost(tracer, chunks)
+        stream = GatewayStream(chunks, router, attempt, runtime_handle=handle)
+        it = iter(stream)
+        next(it)
+        next(it)
+        stream.close()  # cancel with partial usage already captured
+
+        # Partial usage → cost computed fail-open; never an exception.
+        assert attempt.cost is not None
+        assert attempt.cost.cost_source == "priced"
+        assert attempt.cost.total_cost == pytest.approx(0.000014)  # 3*2/1M + 1*8/1M
+
+
+class TestStreamingErrorClassification:
+    def test_stream_generic_error_classified_stream_interrupted(self, tracer):
+        def bad_json():
+            yield {"choices": [{"delta": {"content": "a"}}]}
+            raise ValueError("malformed SSE frame")  # unclassifiable by global classifier
+        handle, router, attempt, chunks = _make_stream_handle(tracer, bad_json())
+        stream = GatewayStream(chunks, router, attempt, runtime_handle=handle)
+        with pytest.raises(ValueError):
+            list(stream)
+
+        assert attempt.span.status == "ERROR"
+        assert attempt.span.attributes[ATTR_ATTEMPT["error_category"]] == ErrorCategory.STREAM_INTERRUPTED
+        assert router.span.status == "ERROR"
+        assert router.span.attributes[ATTR_ROUTER["final_error_category"]] == ErrorCategory.STREAM_INTERRUPTED

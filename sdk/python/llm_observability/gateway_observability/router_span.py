@@ -23,7 +23,7 @@ from .attempt_span import AttemptSpan
 from .context import GatewayContext
 from .cost import NormalizedCost, add_cost, cost_to_attributes
 from .errors import GatewayError, ErrorCategory
-from .privacy import PrivacyGuard
+from .privacy import PrivacyGuard, set_gateway_attribute
 from .recorder import GatewayEventRecorder
 from .registry import AttemptRegistry, RouterRegistry
 from .usage import NormalizedUsage, add_usage, usage_to_attributes
@@ -221,6 +221,12 @@ class RouterSpan:
         self._attempts: list[AttemptSpan] = []
         self._open_attempts: dict[str, AttemptSpan] = {}
         self._index_lock = threading.Lock()
+        # Independent re-entrant lock for the open-attempt registry: covers
+        # register/unregister/snapshot/force-close/clear so concurrent attempts,
+        # hedged requests, or a Router-finalize racing an Attempt-close cannot
+        # miss or double an entry. RLock because force_close → close →
+        # unregister re-enters the lock.
+        self._open_attempts_lock = threading.RLock()
         self._used_attempt_indices: set[int] = set()
         self._attempt_count = 0
         self._success_count = 0
@@ -241,6 +247,17 @@ class RouterSpan:
 
         self.recorder = GatewayEventRecorder(span=None, privacy=self._privacy)
 
+    def _set_attr(self, span, key, value):
+        """Write an external-string span attribute through the unified guard.
+
+        External strings (route, request_id, provider, model names, reasons,
+        policy names, error type/message, …) MUST go through this so the
+        PrivacyGuard applies whitelist + secret masking + URL-query stripping +
+        length limits. Internal counters, booleans, hashed channel IDs and
+        numeric metrics are written directly elsewhere.
+        """
+        return set_gateway_attribute(span, key, value, self._privacy)
+
     # ── lifecycle ──
 
     def start(self) -> "RouterSpan":
@@ -260,16 +277,16 @@ class RouterSpan:
             )
             rc = self._request_context
             if rc is not None:
-                span.set_attribute(ATTR_GATEWAY["name"], rc.gateway_name)
+                self._set_attr(span, ATTR_GATEWAY["name"], rc.gateway_name)
                 if rc.gateway_version:
-                    span.set_attribute(ATTR_GATEWAY["version"], rc.gateway_version)
+                    self._set_attr(span, ATTR_GATEWAY["version"], rc.gateway_version)
                 if rc.request_id:
-                    span.set_attribute(ATTR_GATEWAY["request_id"], rc.request_id)
-                span.set_attribute(ATTR_GATEWAY["protocol"], rc.protocol or "openai-compatible")
+                    self._set_attr(span, ATTR_GATEWAY["request_id"], rc.request_id)
+                self._set_attr(span, ATTR_GATEWAY["protocol"], rc.protocol or "openai-compatible")
                 if rc.route:
-                    span.set_attribute(ATTR_GATEWAY["route"], rc.route)
+                    self._set_attr(span, ATTR_GATEWAY["route"], rc.route)
                 if rc.requested_model:
-                    span.set_attribute(ATTR_ROUTER["requested_model"], rc.requested_model)
+                    self._set_attr(span, ATTR_ROUTER["requested_model"], rc.requested_model)
                 # Full association field set — written to the Span top-level
                 # fields using the EXISTING Span Record naming (``business_scene``,
                 # never a second ``business_scenario`` spelling), sanitized.
@@ -292,15 +309,15 @@ class RouterSpan:
             rd = self._route_decision
             if rd is not None:
                 if rd.provider:
-                    span.set_attribute(ATTR_ROUTER["provider"], rd.provider)
+                    self._set_attr(span, ATTR_ROUTER["provider"], rd.provider)
                 if rd.resolved_model:
-                    span.set_attribute(ATTR_ROUTER["resolved_model"], rd.resolved_model)
+                    self._set_attr(span, ATTR_ROUTER["resolved_model"], rd.resolved_model)
                 if rd.channel_type:
-                    span.set_attribute(ATTR_ROUTER["channel_type"], rd.channel_type)
+                    self._set_attr(span, ATTR_ROUTER["channel_type"], rd.channel_type)
                 if rd.route_reason:
-                    span.set_attribute(ATTR_ROUTER["route_reason"], rd.route_reason)
+                    self._set_attr(span, ATTR_ROUTER["route_reason"], rd.route_reason)
                 if rd.policy_name:
-                    span.set_attribute(ATTR_ROUTER["policy_name"], rd.policy_name)
+                    self._set_attr(span, ATTR_ROUTER["policy_name"], rd.policy_name)
                 if rd.channel_id:
                     self._final_channel_id = rd.channel_id
                     span.set_attribute(
@@ -405,10 +422,14 @@ class RouterSpan:
         """Force-close every Attempt still open when the Router finalizes.
 
         A business exception between Attempt start and close must not leak an
-        open span / registry entry / active-attempt ContextVar.
+        open span / registry entry / active-attempt ContextVar. The snapshot
+        + clear happen under the registry lock so a concurrent Attempt close
+        cannot mutate the dict mid-iteration or re-register after clear.
         """
         try:
-            open_attempts = list(self._open_attempts.values())
+            with self._open_attempts_lock:
+                open_attempts = list(self._open_attempts.values())
+                self._open_attempts.clear()
         except Exception:
             open_attempts = []
         for attempt in open_attempts:
@@ -419,10 +440,6 @@ class RouterSpan:
                 )
             except Exception as e:
                 logger.error("Router force-close of open attempt failed: %s", e)
-        try:
-            self._open_attempts.clear()
-        except Exception:
-            pass
 
     # ── open-attempt registry ──
 
@@ -430,7 +447,8 @@ class RouterSpan:
         """Track an Attempt as open (called on Attempt start)."""
         try:
             key = attempt.span.span_id if attempt.span is not None else str(id(attempt))
-            self._open_attempts[key] = attempt
+            with self._open_attempts_lock:
+                self._open_attempts[key] = attempt
         except Exception as e:
             logger.error("Router open-attempt register failed: %s", e)
 
@@ -438,14 +456,16 @@ class RouterSpan:
         """Stop tracking an Attempt (called on Attempt close/force_close)."""
         try:
             key = attempt.span.span_id if attempt.span is not None else str(id(attempt))
-            self._open_attempts.pop(key, None)
+            with self._open_attempts_lock:
+                self._open_attempts.pop(key, None)
         except Exception as e:
             logger.error("Router open-attempt unregister failed: %s", e)
 
     @property
     def open_attempt_count(self) -> int:
         try:
-            return len(self._open_attempts)
+            with self._open_attempts_lock:
+                return len(self._open_attempts)
         except Exception:
             return 0
 
@@ -498,7 +518,7 @@ class RouterSpan:
             if self._final_error is not None:
                 span.set_attribute(ATTR_ROUTER["final_error_category"], self._final_error.category)
                 if self._final_error.type:
-                    span.set_attribute(ATTR_ROUTER["final_error_type"], self._final_error.type)
+                    self._set_attr(span, ATTR_ROUTER["final_error_type"], self._final_error.type)
             for key, value in usage_to_attributes(self._usage_aggregate).items():
                 span.set_attribute(key, value)
             for key, value in cost_to_attributes(self._cost_aggregate).items():
@@ -758,7 +778,8 @@ class RouterSpan:
     def open_attempts(self) -> list:
         """Snapshot of currently open Attempts."""
         try:
-            return list(self._open_attempts.values())
+            with self._open_attempts_lock:
+                return list(self._open_attempts.values())
         except Exception:
             return []
 

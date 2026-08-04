@@ -115,15 +115,19 @@ class _TerminalFinalizer:
 
     def __init__(self, router: Optional[RouterSpan], attempt, usage_normalizer=None,
                  upstream_status: Optional[int] = None, duration_ms: Optional[float] = None,
-                 connect_duration_ms: Optional[float] = None):
+                 connect_duration_ms: Optional[float] = None,
+                 cost_calculator=None, resolved_model: Optional[str] = None):
         self._router = router
         self._attempt = attempt
         self._usage_normalizer = usage_normalizer
+        self._cost_calculator = cost_calculator
+        self._resolved_model = resolved_model
         self._upstream_status = upstream_status
         self._duration_ms = duration_ms
         self._connect_duration_ms = connect_duration_ms
         self._finalized = False
         self._stream_usage = None  # usage captured from terminal chunks
+        self._stream_cost = None   # cost computed from the terminal usage
 
     @property
     def finalized(self) -> bool:
@@ -140,6 +144,21 @@ class _TerminalFinalizer:
                     self._stream_usage = normalized
         except Exception as e:
             logger.error("Gateway stream usage capture failed: %s", e)
+
+    def _compute_cost(self, usage):
+        """Compute the streaming attempt cost from captured usage (fail-open).
+
+        Mirrors the non-streaming ``runtime.finalize_attempt`` cost path: the
+        resolved model's pricing table decides priced vs unpriced; a calc
+        failure leaves cost unset and never propagates.
+        """
+        if usage is None or self._cost_calculator is None:
+            return None
+        try:
+            return self._cost_calculator.calculate(usage, model=self._resolved_model)
+        except Exception as e:
+            logger.error("Gateway stream cost computation failed: %s", e)
+            return None
 
     def _apply_upstream_facts(self):
         """Write header-time upstream facts onto the Attempt (no finalize).
@@ -180,6 +199,7 @@ class _TerminalFinalizer:
                 http_status_code=status,
                 duration_ms=self._duration_ms,
                 usage=usage,
+                cost=self._stream_cost,
                 success=True,
             ))
         except Exception as e:
@@ -210,6 +230,7 @@ class _TerminalFinalizer:
                 duration_ms=self._duration_ms,
                 error=gateway_error,
                 usage=usage,
+                cost=self._stream_cost,
                 success=False,
             ))
         except Exception as e:
@@ -247,6 +268,7 @@ class _TerminalFinalizer:
                 duration_ms=self._duration_ms,
                 error=gateway_error,
                 usage=usage,
+                cost=self._stream_cost,
                 success=False,
             ))
         except Exception as e:
@@ -261,7 +283,18 @@ class _TerminalFinalizer:
             return error
         try:
             from .errors import classify_error
-            return classify_error(error)
+            classified = classify_error(error)
+            # Streaming-only remap (spec §5): an unclassifiable mid-stream
+            # interruption is stream_interrupted, never unknown. Global
+            # classify_error() behavior is unchanged.
+            if classified.category == ErrorCategory.UNKNOWN:
+                return GatewayError(
+                    category=ErrorCategory.STREAM_INTERRUPTED,
+                    type=classified.type or type(error).__name__,
+                    message=classified.message,
+                    retryable=True,
+                )
+            return classified
         except Exception:
             return GatewayError(
                 category=ErrorCategory.STREAM_INTERRUPTED,
@@ -271,13 +304,26 @@ class _TerminalFinalizer:
             )
 
     def _apply_usage_to_attempt(self):
-        """Write captured stream usage onto the Attempt; return it."""
+        """Write captured stream usage + cost onto the Attempt; return usage.
+
+        Cost is computed from the captured terminal Usage via the
+        ``CostCalculator`` and the Attempt's ``resolved_model`` (fail-open),
+        mirroring the non-streaming cost path so streaming and non-streaming
+        attempts carry ``cost.*`` identically.
+        """
         usage = self._stream_usage
         if usage is not None and self._attempt is not None:
             try:
                 self._attempt.set_usage(usage)
             except Exception as e:
                 logger.error("Gateway stream attempt usage failed: %s", e)
+        cost = self._compute_cost(usage)
+        if cost is not None and self._attempt is not None:
+            try:
+                self._attempt.set_cost(cost)
+            except Exception as e:
+                logger.error("Gateway stream attempt cost failed: %s", e)
+        self._stream_cost = cost
         return usage
 
     def _close_attempt(self):
@@ -353,15 +399,19 @@ class GatewayStream:
         self._first_token_time: Optional[float] = None
         self._closed = False
         usage_normalizer = None
+        cost_calculator = None
         try:
             if runtime_handle is not None:
                 usage_normalizer = runtime_handle._runtime._usage_normalizer
+                cost_calculator = runtime_handle._runtime._cost_calculator
         except Exception:
             usage_normalizer = None
         self._finalizer = _TerminalFinalizer(
             router, attempt, usage_normalizer,
             upstream_status=upstream_status, duration_ms=duration_ms,
             connect_duration_ms=connect_duration_ms,
+            cost_calculator=cost_calculator,
+            resolved_model=getattr(attempt, "_resolved_model", None),
         )
         # Header-time upstream facts (status/duration) recorded now — the
         # attempt is NOT finalized here (rework P0-4: no success at header).
@@ -495,15 +545,19 @@ class AsyncGatewayStream:
         self._first_token_time: Optional[float] = None
         self._closed = False
         usage_normalizer = None
+        cost_calculator = None
         try:
             if runtime_handle is not None:
                 usage_normalizer = runtime_handle._runtime._usage_normalizer
+                cost_calculator = runtime_handle._runtime._cost_calculator
         except Exception:
             usage_normalizer = None
         self._finalizer = _TerminalFinalizer(
             router, attempt, usage_normalizer,
             upstream_status=upstream_status, duration_ms=duration_ms,
             connect_duration_ms=connect_duration_ms,
+            cost_calculator=cost_calculator,
+            resolved_model=getattr(attempt, "_resolved_model", None),
         )
         self._finalizer._apply_upstream_facts()
 
