@@ -165,7 +165,7 @@ The system SHALL provide a real gateway E2E suite exercising the full chain — 
 
 CI SHALL use the unified variables `GATEWAY_E2E_API_KEY`, `GATEWAY_E2E_BASE_URL`, and `GATEWAY_E2E_MODEL`, read under those exact names by the live-upstream test. On trusted branches, a missing secret SHALL fail the live-upstream job; on fork PRs the entire secret job SHALL be skipped. Log redaction SHALL use `scripts/redact_ci_secrets.py` (not a single-quoted `sed` expression embedding the secret). CI SHALL assert the run executed more than zero tests and that the number of skipped required-E2E tests is zero. The deterministic HTTP-harness E2E (mock upstream) SHALL run in the always-on gateway test job, not the secret-gated one.
 
-#### Scenario: Real E2E ingests Router and Attempt into Core over HTTP
+#### Scenario: Real E2E ingests Router and Attempt into Core
 
 - **WHEN** the HTTP-harness E2E suite runs a success, a retry, a fallback, a streaming success, and a streaming cancel
 - **THEN** Core ingest (reached via real Reporter HTTP) contains the Router and all Attempt records with valid TraceIDs and correct parent links

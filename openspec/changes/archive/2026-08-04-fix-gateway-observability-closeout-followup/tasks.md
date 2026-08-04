@@ -30,6 +30,6 @@
 - [x] C.4 (P1-3) 既有 live-upstream 测试重命名为 `test_live_upstream_runtime_e2e`（明确其验证 Runtime 主链路 + 真实上游，非服务器级），保持 secret-gated；更新 `test_real_gateway_e2e.py` 文件头注释
 - [x] C.5 (P1-3) `gateway-runtime-tests` CI job 纳入新的确定性 HTTP E2E（mock upstream，不依赖 secret）；`gateway-real-e2e` 仍跑 live-upstream（secret-gated）
 - [x] C.6 全量回归：gateway_observability 套件 + Phase 2.1–2.5 + 归档 closeout 测试全绿
-- [ ] C.7 GitHub CI 全部成功（含新 HTTP E2E、live-upstream 0 skipped 证据）
-- [ ] C.8 **终审**：对照 design Risks 逐项核验；三层证据（代码审查 / CI 绿 / E2E 0 skipped）齐备
-- [ ] C.9 归档本 change（`openspec archive fix-gateway-observability-closeout-followup`），不修改已归档历史
+- [x] C.7 GitHub CI 全部成功（含新 HTTP E2E、live-upstream 0 skipped 证据）
+- [x] C.8 **终审**：对照 design Risks 逐项核验；三层证据（代码审查 / CI 绿 / E2E 0 skipped）齐备
+- [x] C.9 归档本 change（`openspec archive fix-gateway-observability-closeout-followup`），不修改已归档历史
