@@ -56,20 +56,6 @@ def _live_config():
     return {name: os.environ.get(name) for name in _LIVE_ENV}
 
 
-def _chat_completions_url(base_url: str) -> str:
-    """Build the chat-completions URL from a base_url that may or may not end
-    in ``/v1``.
-
-    The OpenAI SDK appends ``/chat/completions`` to its ``base_url``, so
-    existing ``E2E_BASE_URL`` secrets typically already include a trailing
-    ``/v1``. Normalizing here avoids a double ``/v1/v1`` (HTTP 404).
-    """
-    trimmed = (base_url or "").rstrip("/")
-    if trimmed.endswith("/v1"):
-        trimmed = trimmed[:-3]
-    return trimmed.rstrip("/") + "/v1/chat/completions"
-
-
 def _live_secrets_present() -> bool:
     return all(os.environ.get(name) for name in _LIVE_ENV)
 
@@ -368,8 +354,7 @@ class TestLiveGatewayEndpoint:
             f"gateway real-E2E secrets missing: {missing} — on trusted branches "
             "this must fail; fork PRs should not run this job at all"
         )
-        import json
-        import urllib.request
+        import openai
 
         runtime = _runtime(tracer)
         handle = runtime.handle_request({
@@ -380,33 +365,36 @@ class TestLiveGatewayEndpoint:
             "resolved_model": config["GATEWAY_E2E_MODEL"], "provider": "live",
         })
         attempt.start()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {config['GATEWAY_E2E_API_KEY']}",
-        }
-        # The Attempt continues the trace downstream (P1-6).
-        headers.update(inject_downstream_trace_headers(handle.router, attempt))
-        body = json.dumps({
-            "model": config["GATEWAY_E2E_MODEL"],
-            "messages": [{"role": "user", "content": "Reply with the single word: ok"}],
-            "max_tokens": 8,
-            "stream": False,
-        }).encode("utf-8")
-        request = urllib.request.Request(
-            _chat_completions_url(config["GATEWAY_E2E_BASE_URL"]),
-            data=body, headers=headers, method="POST",
+        # The Attempt continues the trace downstream (P1-6). The OpenAI SDK
+        # (used by the Phase 2.5 real-E2E job against this same endpoint) is
+        # known to negotiate TLS cleanly to this origin; raw urllib hit a
+        # Cloudflare 525 (SSL handshake), so we reuse the SDK client.
+        downstream = inject_downstream_trace_headers(handle.router, attempt)
+        client = openai.OpenAI(
+            api_key=config["GATEWAY_E2E_API_KEY"],
+            base_url=config["GATEWAY_E2E_BASE_URL"],
+            default_headers={"traceparent": downstream["traceparent"]},
         )
         started = time.time()
         status = None
         payload = None
         error = None
         try:
-            with urllib.request.urlopen(request, timeout=60) as resp:
-                status = resp.status
-                payload = json.loads(resp.read().decode("utf-8"))
+            completion = client.chat.completions.create(
+                model=config["GATEWAY_E2E_MODEL"],
+                messages=[{"role": "user", "content": "Reply with the single word: ok"}],
+                max_tokens=8,
+                stream=False,
+            )
+            status = 200
+            # Materialize the response into a plain dict (usage included).
+            payload = completion.model_dump() if hasattr(completion, "model_dump") else None
+        except openai.APIStatusError as e:
+            error = e
+            status = e.status_code
         except Exception as e:  # noqa: BLE001 — recorded, then asserted below
             error = e
-            status = getattr(e, "code", None)
+            status = getattr(e, "status_code", None) or getattr(e, "code", None)
         duration_ms = (time.time() - started) * 1000
 
         handle.finish_attempt(
