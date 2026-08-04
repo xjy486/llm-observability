@@ -22,6 +22,6 @@
 - [x] C.1 (非阻塞) HTTP streaming-cancel E2E 改为确定性：服务器端 `threading.Event` 同步代替 `sleep`，断言 `gateway.stream.cancelled` 事件触发
 - [x] C.2 (非阻塞) Association 顶层字段（user_id/session_id/message_id/app_name/business_scene）加字节长度限制（≤256B）+ 控制字符剥离；单测覆盖
 - [x] C.3 全量回归：gateway_observability 套件 + Phase 2.1–2.5 + 归档 closeout 测试全绿
-- [ ] C.4 GitHub CI 全部成功
-- [ ] C.5 **终审**：对照 design Risks 逐项核验；三层证据（代码审查 / CI 绿 / E2E 0 skipped）齐备
-- [ ] C.6 归档本 change（`openspec archive fix-gateway-forceclose-state-consistency`），不修改已归档历史
+- [x] C.4 GitHub CI 全部成功
+- [x] C.5 **终审**：对照 design Risks 逐项核验；三层证据（代码审查 / CI 绿 / E2E 0 skipped）齐备
+- [x] C.6 归档本 change（`openspec archive fix-gateway-forceclose-state-consistency`），不修改已归档历史
