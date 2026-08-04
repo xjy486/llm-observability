@@ -156,10 +156,12 @@ TTFT SHALL be measured from the real upstream request start time (not wrapper cr
 
 Each Attempt SHALL record that single request's Usage and Cost, including Usage returned by a Provider on a failed attempt. The Router SHALL record the aggregate of all Attempt Usages and Costs (including failed attempts), the number of successful and failed attempts, and the final channel. The SDK LLM span SHALL record the logical response Usage seen by the caller; it is NOT required to equal the Router aggregate. The runtime SHALL NOT use a process-local ContextVar to write the Router aggregate back into the SDK LLM span, because SDK and gateway commonly run in different processes. Core/UI SHALL derive from the trace tree: Logical Usage = LLM Usage; Actual Gateway Usage = Router Usage; Retry Waste = Router Usage − final successful Attempt Usage. If the Router aggregate must be returned to the client, it SHALL use an explicit protocol (e.g., response headers such as `x-llm-obs-input-tokens`, `x-llm-obs-output-tokens`, `x-llm-obs-total-cost`) whose signature, size limits, trust boundary, proxy compatibility, and streaming support are designed separately.
 
-#### Scenario: Router usage is the sum of all attempts
+#### Scenario: Retry cost preserved in Router and LLM aggregates
 
 - **WHEN** an attempt fails with a billable upstream Usage and a later attempt succeeds
 - **THEN** the Router aggregate Usage and Cost include both the failed attempt's and the successful attempt's values
+- **AND** the SDK LLM span records the logical response Usage seen by the caller (NOT required to equal the Router aggregate)
+- **AND** Retry Waste is derivable as the Router aggregate minus the final successful Attempt Usage
 
 #### Scenario: Failed attempt records usage
 

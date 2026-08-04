@@ -45,6 +45,6 @@
 - [x] 3.4 (P0-6) 新增 `scripts/redact_ci_secrets.py`（从环境变量读 secret 列表做流式替换），替换单引号 sed 脱敏
 - [x] 3.5 (P0-6) CI 新增门禁：运行测试数 > 0 且必需 E2E skipped = 0
 - [x] 3.6 Phase 2.1～2.5 全量回归通过（SDK + proxy/core 156+ 测试）
-- [ ] 3.7 GitHub CI 全部成功（含 gateway-real-e2e 0 skipped 证据）
-- [ ] 3.8 **终审**：对照文档 §20 Definition of Done 25 条逐项核验；三层证据（代码审查 / CI 绿 / Real E2E 0 skipped）齐备
-- [ ] 3.9 归档本 change（`openspec archive fix-gateway-native-observability-closeout`），不得修改已归档历史
+- [x] 3.7 GitHub CI 全部成功（含 gateway-real-e2e 0 skipped 证据）
+- [x] 3.8 **终审**：对照文档 §20 Definition of Done 25 条逐项核验；三层证据（代码审查 / CI 绿 / Real E2E 0 skipped）齐备
+- [x] 3.9 归档本 change（`openspec archive fix-gateway-native-observability-closeout`），不得修改已归档历史
