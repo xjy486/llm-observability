@@ -13,7 +13,7 @@ Once a Router has reached its terminal state (`_closed = True`), it SHALL reject
 
 `AttemptSpan.start()` SHALL make activation atomic with `force_close()` / `close()` via a per-Attempt re-entrant lifecycle lock. The post-activation confirmation — re-check `_closed`, install the active-attempt ContextVar, and record `gateway.attempt.started` — SHALL run as one critical section (`_activate_context_and_started_event`). `force_close()` and `close()` SHALL take the same lifecycle lock for their `_closed`-state transition, so only two orders are possible: `start` completes the ContextVar + event installation (then `force_close` runs and clears the token it can now see), or `force_close` closes first and `start`'s critical section observes `_closed` and installs nothing — no intermediate "closed-check passed but finalize lands before ContextVar install" window. A post-install re-check inside the critical section SHALL clear a just-installed token if finalize lands between `set_attempt` and the event. The Attempt SHALL NOT depend on a later business-thread `close()` to clean up a leaked token. A rejected (no-op) Attempt SHALL drop its `Span` reference so no started-but-unended Span object lingers.
 
-Because Python `ContextVar`s are per-Context/per-thread, a finalize running on another thread CANNOT reset a worker thread's `active_attempt` via the saved token. The active-attempt slot in `GatewayContextState` SHALL therefore hold a **weak reference** to the Attempt (not a strong reference). `GatewayContext.get()` SHALL dereference it lazily: when the referent is dead OR closed (`_closed`), the current thread's attempt slot SHALL be cleared (a per-thread `ContextVar.set`, no foreign token) and `active_attempt` SHALL read `None`. `Runtime.active_attempt()` SHALL never return an ended Attempt. This makes cross-thread cleanup unnecessary — an ended Attempt stops surfacing the moment any thread reads the context, so a long-lived worker / thread-pool thread reused after a cross-thread force_close observes no stale `active_attempt`, even when the owner never called `close()`.
+Because Python `ContextVar`s are per-Context/per-thread, a finalize running on another thread CANNOT reset a worker thread's `active_attempt` or `active_router` via the saved token. BOTH slots in `GatewayContextState` SHALL therefore hold **weak references** (the Router and the Attempt), not strong references. `GatewayContext.get()` SHALL dereference BOTH lazily: when EITHER referent is dead OR closed (`_closed`), the current thread's context SHALL be cleared (a per-thread `ContextVar.set`, no foreign token) and the cleared slots SHALL read `None`. `Runtime.active_router()` SHALL never return an ended Router, and `Runtime.active_attempt()` SHALL never return an ended Attempt. This makes cross-thread cleanup unnecessary for either slot — an ended Router (and its `_attempts`, which transitively pin Attempts) stops surfacing and stops pinning the moment any thread reads the context, so a long-lived worker / thread-pool thread reused after a cross-thread `Router.finalize()` observes no stale `active_router` (and no transitive Attempt retention), even when the owner never called `close()`. The public `GatewayContextState.router` / `.active_attempt` fields SHALL remain dereferencing accessors (returning the live `RouterSpan` / `AttemptSpan` or `None`), not the weak-ref holders, preserving the public API contract.
 
 #### Scenario: Normal completion cleans registries
 
@@ -102,6 +102,18 @@ Because Python `ContextVar`s are per-Context/per-thread, a finalize running on a
 - **THEN** the reused worker's `active_attempt` reads `None` (no stale ended Attempt)
 - **AND** no business exception propagates from the stale-slot read
 
+#### Scenario: Cross-thread Router finalize hides the closed Router on the owner thread
+
+- **WHEN** a Router fully activates on thread A and is later finalized (`handle.finalize()`) on thread B, and thread A never exits its scope, then A re-reads the gateway context
+- **THEN** `Runtime.active_router()` returns `None` (the ended Router is not surfaced), via lazy invalidation of the weak Router slot
+- **AND** the weak Router slot no longer pins `Router._attempts`, so the ended Router's Attempts are collectable
+
+#### Scenario: Thread-pool worker reused after Router finalize has no active router
+
+- **WHEN** a worker thread runs a request whose `handle.finalize()` is invoked from another thread (owner never closes), and the same worker is then reused for a second task that reads the gateway context
+- **THEN** the reused worker's `active_router` reads `None` (no stale ended Router)
+- **AND** `active_attempt` also reads `None`
+
 ### Requirement: GatewayEventRecorder
 
 The runtime SHALL provide a `GatewayEventRecorder` that records the fixed gateway events with the limited attribute set from the contract. A recorder failure SHALL be fail-open and SHALL NOT alter the span state or business outcome. The recorder SHALL be wired into the actual runtime lifecycle: `gateway.route.selected` on route selection, `gateway.attempt.started` on Attempt start, `gateway.attempt.completed` on Attempt success, `gateway.attempt.failed` on Attempt failure, and `gateway.response.completed` / `gateway.response.failed` at Router terminal states. Each terminal event SHALL be recorded at most once and SHALL be written before the span ends; event attributes SHALL pass through the PrivacyGuard. An Attempt SHALL never carry both a completed and a failed event.
@@ -130,7 +142,7 @@ Attempt cost SHALL be calculated with the Attempt's resolved model: `calculate(u
 
 `RouterSpan.register_attempt_result` — which mutates `_success_count`/`_fail_count`, `_final_error`, `_final_http_status`, `_final_channel_id`, `_ttft_ms`, `_usage_aggregate`, and `_cost_aggregate` — SHALL be protected by an independent re-entrant aggregate lock so that concurrent (hedged / parallel provider) attempt results aggregate without lost updates or torn read-modify-writes on the usage/cost aggregates. The same lock SHALL guard the cache-hit direct setters (`set_usage_aggregate` / `set_cost_aggregate`) and the aggregate read at Router finalize.
 
-Exactly-once aggregation of a single Attempt across all paths (non-streaming `finalize_attempt`, the streaming terminal finalizer, and `force_close`) SHALL be enforced by a single Attempt-owned funnel `try_aggregate_result(result)`: the `_aggregated_to_router` check-and-set SHALL be atomic under the Attempt's lifecycle lock, and only the first caller SHALL call `Router.register_attempt_result`. A later caller (e.g. `force_close` racing a `finish_attempt` that already aggregated) SHALL be a no-op, so the same Attempt is never counted twice regardless of which path wins.
+Exactly-once aggregation of a single Attempt across all paths (non-streaming `finalize_attempt`, the streaming terminal finalizer, and `force_close`) SHALL be enforced by a single Attempt-owned funnel `try_aggregate_result(result)`: the `_aggregated_to_router` check, the `Router.register_attempt_result(result)` publish, and the `_aggregated_to_router = True` claim SHALL ALL run atomically under the Attempt's lifecycle lock, with the publish BEFORE the claim. A `Router.finalize()` that observes `_aggregated_to_router=True` is thus guaranteed the result is already in the Router aggregate — the reported Router Record SHALL reflect the fully-published aggregate (no result published after the Router report). Lock ordering SHALL be `Attempt._lifecycle_lock` → `Router._aggregate_lock`, never reversed.
 
 #### Scenario: OpenAI-compatible usage normalized
 
@@ -176,6 +188,18 @@ Exactly-once aggregation of a single Attempt across all paths (non-streaming `fi
 - **WHEN** `finish_attempt` and `force_close` (or the streaming finalizer and `force_close`) race to aggregate the SAME Attempt
 - **THEN** exactly one of them aggregates the result (the other is a no-op via `try_aggregate_result`)
 - **AND** the Router's `success_count` + `fail_count` increments by exactly one for that attempt
+
+#### Scenario: Router finalize waits for a claimed attempt's published result
+
+- **WHEN** `try_aggregate_result` has published the result to the Router but a `Router.finalize()` races before the claim is observable, OR `finalize()` observes `_aggregated_to_router=True`
+- **THEN** the result is guaranteed already in the Router aggregate (publish-before-claim), so the reported Router Record includes the result's `usage.*`, `cost.*`, `final_error_category`, and counts
+- **AND** no result is published after the Router Report has been emitted
+
+#### Scenario: Reported Router Record matches the final in-memory aggregate
+
+- **WHEN** a racing `finish_attempt`/`force_close` aggregation and a `Router.finalize()` report occur
+- **THEN** the Router Record captured by the Reporter has the same status, `final_error_category`, `usage.*`, `cost.*`, and `attempt_count` as the Router's final in-memory state
+- **AND** the streaming-finalize-vs-router-finalize race aggregates exactly one (not zero)
 
 ### Requirement: PrivacyGuard
 
