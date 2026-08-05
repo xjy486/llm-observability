@@ -11,7 +11,7 @@ The Router SHALL explicitly track its open Attempts (`_open_attempts: dict[str, 
 
 Once a Router has reached its terminal state (`_closed = True`), it SHALL reject registration of any new Attempt: `register_open_attempt` SHALL be a no-op that returns False when the Router is closed, and `RouterSpan.attempt()` / `AttemptSpan.start()` SHALL treat a closed Router as a fail-open no-op telemetry path — no registry entry, no active-attempt ContextVar, no reportable orphan span — while business continues. The Router SHALL set `_closed = True` atomically with the open-attempt snapshot+clear under the same lock, so a concurrent register either is captured in the snapshot or observes the closed state and is rejected. `RouterSpan.attempt()` SHALL check `_closed` and allocate the Attempt index under the lifecycle lock, so a Router that finalizes during allocation cannot bump `attempt_count` / `_used_attempt_indices` without a real, activatable Attempt; `gateway.attempt_count` SHALL always equal the number of real Attempt spans.
 
-`AttemptSpan.start()` SHALL treat activation as a critical section: after `register_open_attempt` succeeds, it SHALL re-check `self._closed` immediately before setting the active-attempt ContextVar and recording `gateway.attempt.started`. If the Attempt was force-closed between registration and that point, it SHALL NOT set the ContextVar and SHALL NOT record the started event — the Attempt is already ended + reported by `force_close`. `AttemptSpan.close()` SHALL, when it finds `_closed = True` on entry, still clear the `active_attempt` ContextVar if this Attempt currently owns it (fail-open), so a leaked token never survives on a worker/thread-pool thread. A rejected (no-op) Attempt SHALL drop its `Span` reference so no started-but-unended Span object lingers.
+`AttemptSpan.start()` SHALL make activation atomic with `force_close()` / `close()` via a per-Attempt re-entrant lifecycle lock. The post-activation confirmation — re-check `_closed`, install the active-attempt ContextVar, and record `gateway.attempt.started` — SHALL run as one critical section (`_activate_context_and_started_event`). `force_close()` and `close()` SHALL take the same lifecycle lock for their `_closed`-state transition, so only two orders are possible: `start` completes the ContextVar + event installation (then `force_close` runs and clears the token it can now see), or `force_close` closes first and `start`'s critical section observes `_closed` and installs nothing — no intermediate "closed-check passed but finalize lands before ContextVar install" window. A post-install re-check inside the critical section SHALL clear a just-installed token if finalize lands between `set_attempt` and the event. The Attempt SHALL NOT depend on a later business-thread `close()` to clean up a leaked token. A rejected (no-op) Attempt SHALL drop its `Span` reference so no started-but-unended Span object lingers.
 
 #### Scenario: Normal completion cleans registries
 
@@ -80,6 +80,13 @@ Once a Router has reached its terminal state (`_closed = True`), it SHALL reject
 - **THEN** the Attempt holds no `Span` reference (no started-but-unended Span lingers in memory)
 - **AND** it is neither reported nor registered
 
+#### Scenario: No ContextVar leak when finalize lands inside the set_attempt window
+
+- **WHEN** a Router finalize (force_close) lands after the Attempt's closed-check has returned False but before/inside `GatewayContext.set_attempt`, and `start()` then resumes
+- **THEN** the lifecycle lock serializes the two: either `start` finishes installing the ContextVar (then `force_close` clears it), or `force_close` closes first (then `start`'s critical section installs nothing)
+- **AND** no `gateway.attempt.started` event is recorded on the ended Attempt span
+- **AND** no leaked `active_attempt` ContextVar survives on the racing thread even if the business owner never calls `close()`
+
 ### Requirement: GatewayEventRecorder
 
 The runtime SHALL provide a `GatewayEventRecorder` that records the fixed gateway events with the limited attribute set from the contract. A recorder failure SHALL be fail-open and SHALL NOT alter the span state or business outcome. The recorder SHALL be wired into the actual runtime lifecycle: `gateway.route.selected` on route selection, `gateway.attempt.started` on Attempt start, `gateway.attempt.completed` on Attempt success, `gateway.attempt.failed` on Attempt failure, and `gateway.response.completed` / `gateway.response.failed` at Router terminal states. Each terminal event SHALL be recorded at most once and SHALL be written before the span ends; event attributes SHALL pass through the PrivacyGuard. An Attempt SHALL never carry both a completed and a failed event.
@@ -105,6 +112,8 @@ The runtime SHALL provide a `GatewayEventRecorder` that records the fixed gatewa
 The runtime SHALL provide a `UsageNormalizer` that maps provider-specific usage payloads (OpenAI chat completion, Anthropic Messages, and OpenAI-compatible responses) into `NormalizedUsage` (`input_tokens`, `output_tokens`, `total_tokens`, `cached_input_tokens`, `reasoning_tokens`, `cache_creation_tokens`, `cache_read_tokens`, `usage_source`) and a `CostCalculator` that maps normalized usage to `NormalizedCost` (`input_cost`, `output_cost`, `total_cost`, `currency`, `cost_source`). Normalization and cost-calc failures SHALL be fail-open: the span still ends with whatever data was successfully recorded.
 
 Attempt cost SHALL be calculated with the Attempt's resolved model: `calculate(usage=normalized, model=attempt.resolved_model)`. The pricing table SHALL use explicit per-1M-token units, configured under unambiguous names `input_usd_per_1m_tokens` and `output_usd_per_1m_tokens`. When no price exists for the resolved model, `cost.source` SHALL be `unpriced`. For cache hits, an explicitly caller-provided cost SHALL be preserved; when no cost is provided but usage exists, cost SHALL be computed from the resolved model. Router cost SHALL include the cost of failed and retried attempts. Streaming attempts SHALL compute Cost from their captured terminal Usage by the same `CostCalculator.calculate(usage, model=resolved_model)` path as non-streaming attempts.
+
+`RouterSpan.register_attempt_result` — which mutates `_success_count`/`_fail_count`, `_final_error`, `_final_http_status`, `_final_channel_id`, `_ttft_ms`, `_usage_aggregate`, and `_cost_aggregate` — SHALL be protected by an independent re-entrant aggregate lock so that concurrent (hedged / parallel provider) attempt results aggregate without lost updates or torn read-modify-writes on the usage/cost aggregates. The same lock SHALL guard the cache-hit direct setters (`set_usage_aggregate` / `set_cost_aggregate`) and the aggregate read at Router finalize.
 
 #### Scenario: OpenAI-compatible usage normalized
 
@@ -137,6 +146,13 @@ Attempt cost SHALL be calculated with the Attempt's resolved model: `calculate(u
 - **WHEN** a cache hit supplies an explicit cost
 - **THEN** that cost is used instead of recomputation
 - **AND** when retries occur, the Router cost sums all attempts including failed ones
+
+#### Scenario: Parallel attempt results aggregate exactly
+
+- **WHEN** N attempt results are aggregated concurrently (hedged / parallel provider attempts)
+- **THEN** `success_count` + `fail_count` equals N (no lost count updates)
+- **AND** the Router usage aggregate is the exact sum of all attempts' usage (no overwritten read-modify-writes)
+- **AND** the Router cost aggregate is the exact sum of all attempts' cost
 
 ### Requirement: PrivacyGuard
 
