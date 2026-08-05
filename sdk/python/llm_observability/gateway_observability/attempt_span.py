@@ -93,6 +93,9 @@ class AttemptSpan:
         # A no-op attempt (Router was already closed at start) is never
         # registered, never set as the active attempt, and never reported.
         self._no_op = False
+        # Explicit index requested by the caller (resolved atomically in
+        # Router.activate_attempt; None → Router auto-allocates).
+        self._explicit_index: Optional[int] = None
         # The raw (pre-hash) channel ID is only stored for aggregation, never
         # written to telemetry (the span carries the hashed value).
         self._raw_channel_id: Optional[str] = channel_id
@@ -116,17 +119,20 @@ class AttemptSpan:
     def start(self) -> "AttemptSpan":
         """Create and start the Attempt span (fail-open)."""
         try:
+            # Quick closed-check before creating a span (avoid orphan spans).
+            if self._router is not None and self._router._closed:
+                self._no_op = True
+                return self
             trace_id, parent_span_id = self._parent_ids()
             span_id = generate_span_id()
             span = Span(
                 trace_id=trace_id,
                 span_id=span_id,
                 parent_span_id=parent_span_id,
-                span_name=f"gateway.attempt.{self._attempt_index}",
+                span_name="gateway.attempt",
                 span_kind=SpanKind.GATEWAY,
             )
             span.set_attribute(ATTR_GATEWAY["span_role"], PROVIDER_ATTEMPT)
-            span.set_attribute(ATTR_ATTEMPT["attempt_index"], self._attempt_index)
             if self._provider:
                 self._set_attr(span, ATTR_ATTEMPT["provider"], self._provider)
             hashed = self._privacy.hash_channel_id(self._channel_id)
@@ -146,24 +152,48 @@ class AttemptSpan:
             # Register + track as open on the Router + attach as active attempt.
             if self._registry is not None:
                 self._registry.register(trace_id, span_id, self)
-            registered = True
+            # Atomic activation: closed-check + index allocation + open registry
+            # + append, all under the Router's lifecycle lock. The index is
+            # allocated HERE (not in Router.attempt()) so a Router that
+            # finalizes before activation cannot bump attempt_count without a
+            # real, activatable Attempt.
+            activated = True
             try:
                 if self._router is not None:
-                    registered = self._router.register_open_attempt(self)
+                    activated = self._router.activate_attempt(self)
+                else:
+                    self._attempt_index = 0
             except Exception as e:
-                logger.error("Attempt open-register on router failed: %s", e)
-                registered = False
-            if not registered:
+                logger.error("Attempt activation on router failed: %s", e)
+                activated = False
+            if not activated:
                 # The Router is already closed (terminal). Take the fail-open
                 # no-op path: do NOT set the active-attempt ContextVar, do NOT
                 # emit lifecycle events, mark this span as not-for-report, and
                 # remove the registry entry just added. Business continues.
                 self._no_op = True
+                # Drop the started-but-unended Span reference — it is neither
+                # reported nor registered, so it must not linger in memory.
+                self._span = None
                 try:
                     if self._registry is not None:
                         self._registry.remove(trace_id, span_id)
                 except Exception:
                     pass
+                return self
+            # Activation set the real index; reflect it on the span.
+            try:
+                self._span.span_name = f"gateway.attempt.{self._attempt_index}"
+                self._span.set_attribute(ATTR_ATTEMPT["attempt_index"], self._attempt_index)
+            except Exception:
+                pass
+            # Second check: the Attempt may have been force-closed by a Router
+            # finalize that raced us between activation and here. Do NOT set
+            # the active-attempt ContextVar or record `attempt.started` on an
+            # already-ended span — the Attempt is already reported by
+            # force_close, and re-installing the ContextVar would leak on a
+            # worker/thread-pool thread (close()'s early-return skips cleanup).
+            if self._closed:
                 return self
             self._ctx_token = GatewayContext.set_attempt(self)
             # Lifecycle event: exactly one gateway.attempt.started per attempt.
@@ -319,6 +349,11 @@ class AttemptSpan:
         is neither ended nor reported — it is simply discarded.
         """
         if self._closed:
+            # Already closed (possibly force-closed by a Router finalize that
+            # raced our start). Still clear the active-attempt ContextVar if
+            # this Attempt currently owns it — a leaked token must not survive
+            # on a worker/thread-pool thread. Fail-open.
+            self._cleanup_context_if_owned()
             return
         self._closed = True
         if self._no_op:
@@ -424,6 +459,24 @@ class AttemptSpan:
             self._router.register_attempt_result(result)
         except Exception as e:
             logger.error("Attempt force_close aggregation failed: %s", e)
+
+    def _cleanup_context_if_owned(self):
+        """Clear the active-attempt ContextVar if this Attempt currently owns it.
+
+        Used on the ``close()`` early-return path (``_closed=True``) so that a
+        token installed by a racing ``start()`` does not leak on a worker /
+        thread-pool thread. Safe to call when no token was set. Fail-open.
+        """
+        try:
+            token = self._ctx_token
+            if token is None:
+                return
+            current = GatewayContext.get()
+            if getattr(current, "active_attempt", None) is self:
+                GatewayContext.clear_attempt(token)
+                self._ctx_token = None
+        except Exception as e:
+            logger.error("Attempt owned-context cleanup failed: %s", e)
 
     def _cleanup(self):
         """Unregister (Router open-attempts + registry) + clear ONLY the

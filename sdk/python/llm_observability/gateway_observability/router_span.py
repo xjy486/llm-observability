@@ -656,11 +656,12 @@ class RouterSpan:
         """Create a fresh AttemptSpan under this Router (spec §13.2).
 
         Each call produces a new, unique Attempt span — never reused. The
-        index is allocated by the Router (default increments; duplicates are
-        remapped with a warning; invalid values fall back to auto-allocation).
-        When the Router is already closed (terminal), returns a no-op
-        AttemptSpan (no index allocated, not tracked) so callers that never
-        start() are also safe; Attempt.start() independently re-checks.
+        index is NOT allocated here; it is allocated atomically with
+        registration in ``activate_attempt`` (called from ``Attempt.start``),
+        so a Router that finalizes before activation cannot bump
+        ``attempt_count`` / ``_used_attempt_indices`` without a real,
+        activatable Attempt. When the Router is already closed, returns a
+        no-op AttemptSpan; ``Attempt.start()`` independently re-checks.
         """
         if self._closed:
             return AttemptSpan(
@@ -669,10 +670,9 @@ class RouterSpan:
                 resolved_model=resolved_model, timeout_ms=timeout_ms,
                 privacy=self._privacy, registry=None, tracer=None, sampled=False,
             )
-        index = self.allocate_attempt_index(attempt_index)
         attempt = AttemptSpan(
             router=self,
-            attempt_index=index,
+            attempt_index=0,
             provider=provider,
             channel_id=channel_id,
             channel_type=channel_type,
@@ -683,8 +683,34 @@ class RouterSpan:
             tracer=self._tracer,
             sampled=self._sampled,
         )
-        self._attempts.append(attempt)
+        attempt._explicit_index = attempt_index
         return attempt
+
+    def activate_attempt(self, attempt: AttemptSpan) -> bool:
+        """Atomically activate an Attempt: closed-check + index allocation +
+        open-registry registration + append to the attempts list.
+
+        Returns True if activated (``attempt._attempt_index`` set, registered),
+        False if the Router is closed. All under ``_open_attempts_lock`` so a
+        Router finalize cannot interleave between the closed-check, the index
+        allocation, and the registration — ``attempt_count`` only moves when a
+        real, activatable Attempt exists. ``allocate_attempt_index`` nests
+        ``_index_lock`` inside this lock (ordering: open_attempts → index,
+        never reversed).
+        """
+        try:
+            with self._open_attempts_lock:
+                if self._closed:
+                    return False
+                index = self.allocate_attempt_index(getattr(attempt, "_explicit_index", None))
+                attempt._attempt_index = index
+                self._attempts.append(attempt)
+                key = attempt.span.span_id if attempt.span is not None else str(id(attempt))
+                self._open_attempts[key] = attempt
+                return True
+        except Exception as e:
+            logger.error("Router activate_attempt failed: %s", e)
+            return False
 
     def register_attempt_result(self, result: AttemptResult):
         """Aggregate one attempt's outcome into the Router (fail-open).

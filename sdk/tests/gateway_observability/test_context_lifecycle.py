@@ -142,41 +142,47 @@ class TestAttemptClosePreservesRouter:
 class TestAttemptIndexAllocation:
     def test_default_attempt_index_increments(self, tracer):
         router = RouterSpan(tracer=tracer).start()
-        a1 = router.attempt()
-        a2 = router.attempt()
-        a3 = router.attempt()
+        a1 = router.attempt(); a1.start()
+        a2 = router.attempt(); a2.start()
+        a3 = router.attempt(); a3.start()
         assert (a1.attempt_index, a2.attempt_index, a3.attempt_index) == (1, 2, 3)
+        for a in (a1, a2, a3):
+            a.close()
         router.close()
 
     def test_attempt_count_matches_actual_attempts(self, tracer):
         router = RouterSpan(tracer=tracer).start()
-        router.attempt()
-        router.attempt()
+        for _ in range(2):
+            a = router.attempt(); a.start(); a.close()
         assert router.attempt_count == 2
-        router.attempt(attempt_index=7)  # explicit — still one more attempt
+        a = router.attempt(attempt_index=7); a.start(); a.close()  # explicit
         assert router.attempt_count == 3
         router.close()
 
     def test_duplicate_explicit_attempt_index_handled(self, tracer):
         router = RouterSpan(tracer=tracer).start()
-        a1 = router.attempt(attempt_index=2)
-        a2 = router.attempt(attempt_index=2)  # duplicate → remapped
+        a1 = router.attempt(attempt_index=2); a1.start()
+        a2 = router.attempt(attempt_index=2); a2.start()  # duplicate → remapped
         assert a1.attempt_index == 2
         assert a2.attempt_index != 2
         indices = {a.attempt_index for a in router.attempts}
         assert len(indices) == 2, "duplicate explicit index must be remapped"
+        for a in (a1, a2):
+            a.close()
         router.close()
 
     def test_invalid_attempt_index_falls_back(self, tracer):
         router = RouterSpan(tracer=tracer).start()
-        a_zero = router.attempt(attempt_index=0)
-        a_neg = router.attempt(attempt_index=-3)
-        a_str = router.attempt(attempt_index="x")
+        a_zero = router.attempt(attempt_index=0); a_zero.start()
+        a_neg = router.attempt(attempt_index=-3); a_neg.start()
+        a_str = router.attempt(attempt_index="x"); a_str.start()
         for a in (a_zero, a_neg, a_str):
             assert isinstance(a.attempt_index, int)
             assert a.attempt_index >= 1
         indices = [a.attempt_index for a in router.attempts]
         assert len(set(indices)) == 3
+        for a in (a_zero, a_neg, a_str):
+            a.close()
         router.close()
 
     def test_parallel_attempt_index_is_thread_safe(self, tracer):
@@ -186,8 +192,10 @@ class TestAttemptIndexAllocation:
 
         def worker():
             a = router.attempt()
+            a.start()
             with lock:
                 indices.append(a.attempt_index)
+            a.close()
 
         threads = [threading.Thread(target=worker) for _ in range(32)]
         for t in threads:

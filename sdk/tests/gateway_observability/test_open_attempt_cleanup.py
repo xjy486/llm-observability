@@ -329,3 +329,193 @@ class TestClosedRouterRejectsRegistration:
         # No leaked open entries after finalize.
         assert handle.router.open_attempt_count == 0
         assert runtime.attempt_registry.size() == 0
+
+
+class TestAttemptActivationRace:
+    """Deterministic barrier tests for the activate→set_attempt / allocation
+    races (fix-gateway-attempt-activation-race). Patches ``activate_attempt``
+    to hit the exact window between activation and ContextVar setup."""
+
+    def test_finalize_after_register_before_context_set_no_context_leak(self, tracer):
+        import threading
+        from llm_observability.gateway_observability.context import GatewayContext
+
+        runtime = GatewayRuntime(tracer=tracer)
+        handle = runtime.handle_request({})
+        router = handle.router
+        activated = threading.Event()
+        release = threading.Event()
+        orig_activate = router.activate_attempt
+
+        def patched_activate(attempt):
+            result = orig_activate(attempt)
+            # Block AFTER activation (registered + indexed) but BEFORE start()
+            # calls set_attempt — the exact race window.
+            activated.set()
+            release.wait(timeout=5)
+            return result
+
+        router.activate_attempt = patched_activate
+        results = {}
+
+        def starter():
+            a = handle.start_attempt()
+            a.start()
+            results["attempt"] = a
+            results["ctx_after"] = GatewayContext.get().active_attempt
+
+        t = threading.Thread(target=starter)
+        t.start()
+        assert activated.wait(timeout=5), "attempt did not reach the activation window"
+        # While the attempt is activated-but-not-active, finalize the Router:
+        # force_close ends the attempt (sets _closed, cleans registry).
+        handle.finalize()
+        release.set()  # let start() resume into the second-check
+        t.join()
+
+        a = results["attempt"]
+        assert a._closed is True, "attempt must be force-closed by finalize"
+        assert results["ctx_after"] is None, "active_attempt must NOT be set on a force-closed attempt"
+        assert GatewayContext.get().active_attempt is None
+
+    def test_no_started_event_after_attempt_force_closed(self, tracer):
+        import threading
+        from llm_observability.gateway_observability.events import EVENT_ATTEMPT_STARTED
+
+        runtime = GatewayRuntime(tracer=tracer)
+        handle = runtime.handle_request({})
+        router = handle.router
+        activated = threading.Event()
+        release = threading.Event()
+        orig_activate = router.activate_attempt
+
+        def patched_activate(attempt):
+            result = orig_activate(attempt)
+            activated.set()
+            release.wait(timeout=5)
+            return result
+
+        router.activate_attempt = patched_activate
+        attempt_holder = {}
+
+        def starter():
+            a = handle.start_attempt()
+            a.start()
+            attempt_holder["attempt"] = a
+
+        t = threading.Thread(target=starter)
+        t.start()
+        assert activated.wait(timeout=5)
+        handle.finalize()
+        release.set()
+        t.join()
+
+        a = attempt_holder["attempt"]
+        assert a._closed is True
+        started = [e for e in (a.span.events if a.span is not None else []) if e.get("name") == EVENT_ATTEMPT_STARTED]
+        assert started == [], "attempt.started must not be recorded on a force-closed attempt"
+
+    def test_force_close_in_other_thread_then_owner_close_clears_context(self, tracer):
+        # White-box: construct the state "attempt is closed but still owns the
+        # ContextVar token" (the exact leak the second-check prevents at the
+        # source) and assert close()'s early-return still clears it.
+        from llm_observability.gateway_observability.context import GatewayContext
+
+        runtime = GatewayRuntime(tracer=tracer)
+        handle = runtime.handle_request({})
+        attempt = handle.start_attempt()
+        attempt.start()
+        assert GatewayContext.get().active_attempt is attempt
+        # Simulate the race: force-close without clearing this thread's token
+        # (as if set_attempt ran after force_close).
+        attempt._closed = True
+        assert GatewayContext.get().active_attempt is attempt
+        attempt.close()  # early-return path must clear the owned token
+        assert GatewayContext.get().active_attempt is None, "owned ContextVar must be cleared on close early-return"
+        handle.finalize()
+
+    def test_rejected_attempt_does_not_increment_attempt_count(self, tracer):
+        runtime = GatewayRuntime(tracer=tracer)
+        handle = runtime.handle_request({})
+        before = handle.router.attempt_count
+        handle.finalize()  # Router now closed
+        a = handle.start_attempt()
+        a.start()
+        assert a._no_op is True
+        assert handle.router.attempt_count == before, "rejected attempt must not bump attempt_count"
+
+    def test_attempt_allocation_racing_finalize_not_in_router_count(self, tracer):
+        import threading
+
+        runtime = GatewayRuntime(tracer=tracer)
+        handle = runtime.handle_request({})
+        router = handle.router
+        before_activate = threading.Event()
+        release = threading.Event()
+        orig_activate = router.activate_attempt
+
+        def patched_activate(attempt):
+            # Block BEFORE the original runs (before acquiring the lock / seeing
+            # _closed). finalize can therefore proceed and set _closed first.
+            before_activate.set()
+            release.wait(timeout=5)
+            return orig_activate(attempt)
+
+        router.activate_attempt = patched_activate
+        before_count = router.attempt_count
+        before_used = set(router._used_attempt_indices)
+        attempt_holder = {}
+
+        def starter():
+            a = handle.start_attempt()
+            a.start()
+            attempt_holder["attempt"] = a
+
+        t = threading.Thread(target=starter)
+        t.start()
+        assert before_activate.wait(timeout=5), "did not reach the activation window"
+        handle.finalize()  # Router now closed while start() is blocked pre-activate
+        release.set()  # activate_attempt proceeds → sees _closed → False → no-op
+        t.join()
+
+        assert router.attempt_count == before_count, "no index allocated for a rejected attempt"
+        assert router._used_attempt_indices == before_used
+        a = attempt_holder["attempt"]
+        assert a._no_op is True
+
+    def test_worker_thread_context_empty_after_finalize_race(self, tracer):
+        import threading
+        from llm_observability.gateway_observability.context import GatewayContext
+
+        runtime = GatewayRuntime(tracer=tracer)
+        handle = runtime.handle_request({})
+        router = handle.router
+        activated = threading.Event()
+        release = threading.Event()
+        orig_activate = router.activate_attempt
+        ctx_on_worker = {}
+
+        def patched_activate(attempt):
+            result = orig_activate(attempt)
+            activated.set()
+            release.wait(timeout=5)
+            return result
+
+        router.activate_attempt = patched_activate
+
+        def worker():
+            a = handle.start_attempt()
+            a.start()
+            ctx_on_worker["after"] = GatewayContext.get().active_attempt
+            a.close()
+            ctx_on_worker["after_close"] = GatewayContext.get().active_attempt
+
+        t = threading.Thread(target=worker)
+        t.start()
+        assert activated.wait(timeout=5)
+        handle.finalize()
+        release.set()
+        t.join()
+
+        assert ctx_on_worker["after"] is None, "worker active_attempt must be None (force-closed)"
+        assert ctx_on_worker["after_close"] is None, "worker active_attempt must stay None after close"
