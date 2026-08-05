@@ -19,6 +19,7 @@ from llm_observability.gateway_observability import (
     NormalizedUsage,
     NormalizedCost,
 )
+from llm_observability.gateway_observability.attributes import ATTR_ROUTER
 from llm_observability.gateway_observability.context import clear_gateway_context
 from llm_observability.gateway_observability.runtime import GatewayRuntime
 
@@ -232,3 +233,263 @@ class TestSingleAttemptExactlyOnceAggregation:
 
         # Exactly one of the two won.
         assert handle.router.success_count + handle.router.fail_count == 1
+
+
+class _ReportSpy:
+    """Synchronous recorder replacing the async reporter."""
+
+    def __init__(self, tracer):
+        self.records = []
+        self._original = tracer.reporter.report
+        tracer.reporter.report = self._capture
+
+    def _capture(self, record):
+        self.records.append(record)
+
+    def restore(self, tracer):
+        tracer.reporter.report = self._original
+
+    def router_record(self, router):
+        for r in self.records:
+            if isinstance(r, dict) and r.get("span_id") == router.span.span_id:
+                return r
+        return None
+
+
+class TestPublishBeforeClaim:
+    """P0-2: try_aggregate_result publishes to the Router BEFORE claiming
+    _aggregated_to_router, so a Router.finalize() that races the publish (or
+    observes the claim) reports a Router Record that already includes the
+    result — no result is published after the Router Report."""
+
+    def test_router_finalize_waits_for_claimed_attempt_aggregation(self, tracer):
+        import threading
+
+        runtime = _router(tracer)
+        handle = runtime.handle_request({})
+        attempt = handle.start_attempt()
+        attempt.start()
+        publish_entered = threading.Event()
+        publish_release = threading.Event()
+        orig_publish = handle.router.register_attempt_result
+
+        def blocked_publish(result):
+            # Inside try_aggregate_result's lifecycle-lock CS, before the claim.
+            publish_entered.set()
+            publish_release.wait(timeout=5)
+            return orig_publish(result)
+
+        handle.router.register_attempt_result = blocked_publish
+        results = {}
+
+        def finisher():
+            # finish_attempt aggregates a success result (publish blocked).
+            handle.finish_attempt(attempt, upstream_status=200, duration_ms=5.0,
+                                   raw_usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10})
+            results["finished"] = True
+
+        tf = threading.Thread(target=finisher)
+        tf.start()
+        assert publish_entered.wait(timeout=5), "did not reach the publish window"
+        # finalize races: it must wait for the publish (claim not yet set).
+        finalize_done = threading.Event()
+
+        def finalizer():
+            handle.finalize()
+            finalize_done.set()
+
+        tfinal = threading.Thread(target=finalizer)
+        tfinal.start()
+        # Let finalize block on the lifecycle lock (held by finish_attempt's CS).
+        import time as _time
+        _time.sleep(0.05)
+        publish_release.set()  # finish_attempt publishes + claims, then exits CS
+        tf.join(timeout=5)
+        tfinal.join(timeout=5)
+        attempt.close()
+
+        # finalize reported the Router AFTER the publish, so the Router is OK
+        # (the finalize completed without the result being lost).
+        assert finalize_done.is_set()
+
+    def test_error_result_published_before_router_report(self, tracer):
+        import threading
+
+        runtime = _router(tracer)
+        handle = runtime.handle_request({})
+        attempt = handle.start_attempt()
+        attempt.start()
+        spy = _ReportSpy(tracer)
+        try:
+            publish_entered = threading.Event()
+            publish_release = threading.Event()
+            orig_publish = handle.router.register_attempt_result
+
+            def blocked_publish(result):
+                publish_entered.set()
+                publish_release.wait(timeout=5)
+                return orig_publish(result)
+
+            handle.router.register_attempt_result = blocked_publish
+
+            def finisher():
+                handle.finish_attempt(attempt, error=TimeoutError("upstream timed out"))
+
+            tf = threading.Thread(target=finisher)
+            tf.start()
+            assert publish_entered.wait(timeout=5)
+            finalize_done = threading.Event()
+
+            def finalizer():
+                handle.finalize()
+                finalize_done.set()
+
+            tfinal = threading.Thread(target=finalizer)
+            tfinal.start()
+            import time as _time
+            _time.sleep(0.05)
+            publish_release.set()
+            tf.join(timeout=5)
+            tfinal.join(timeout=5)
+            attempt.close()
+
+            rec = spy.router_record(handle.router)
+            assert rec is not None, "Router must be reported"
+            # The reported record carries the error category (publish-before-claim).
+            assert rec["attributes"].get(ATTR_ROUTER["final_error_category"]) == "timeout"
+        finally:
+            spy.restore(tracer)
+
+    def test_usage_cost_published_before_router_report(self, tracer):
+        import threading
+
+        runtime = _router(tracer)
+        handle = runtime.handle_request({})
+        attempt = handle.start_attempt()
+        attempt.start()
+        spy = _ReportSpy(tracer)
+        try:
+            publish_entered = threading.Event()
+            publish_release = threading.Event()
+            orig_publish = handle.router.register_attempt_result
+
+            def blocked_publish(result):
+                publish_entered.set()
+                publish_release.wait(timeout=5)
+                return orig_publish(result)
+
+            handle.router.register_attempt_result = blocked_publish
+
+            def finisher():
+                handle.finish_attempt(attempt, upstream_status=200, duration_ms=5.0,
+                                      raw_usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10})
+
+            tf = threading.Thread(target=finisher)
+            tf.start()
+            assert publish_entered.wait(timeout=5)
+            finalize_done = threading.Event()
+
+            def finalizer():
+                handle.finalize()
+                finalize_done.set()
+
+            tfinal = threading.Thread(target=finalizer)
+            tfinal.start()
+            import time as _time
+            _time.sleep(0.05)
+            publish_release.set()
+            tf.join(timeout=5)
+            tfinal.join(timeout=5)
+            attempt.close()
+
+            rec = spy.router_record(handle.router)
+            assert rec is not None
+            # usage + cost landed before the Router was reported.
+            assert rec["attributes"].get("usage.total_tokens") == 10
+            assert rec["attributes"].get("cost.source") in ("priced", "unpriced")
+        finally:
+            spy.restore(tracer)
+
+    def test_stream_finalize_race_aggregates_exactly_one(self, tracer):
+        # The streaming-vs-router-finalize race must aggregate exactly ONE
+        # (not zero, not two) — the prior test used assert <= 1 which let 0 pass.
+        from llm_observability.gateway_observability import GatewayStream
+        runtime = _router(tracer)
+        handle = runtime.handle_request({})
+        attempt = handle.start_attempt()
+        attempt.start()
+        chunks = iter([{"choices": [{"delta": {"content": "hi"}}]}])
+        stream = GatewayStream(chunks, handle.router, attempt, runtime_handle=handle)
+
+        barrier = threading.Barrier(2)
+
+        def consume():
+            barrier.wait()
+            list(stream)
+
+        def finalize():
+            barrier.wait()
+            handle.finalize()
+
+        tc = threading.Thread(target=consume)
+        tf = threading.Thread(target=finalize)
+        tc.start(); tf.start()
+        tc.join(); tf.join()
+
+        total = handle.router.success_count + handle.router.fail_count
+        assert total == 1, f"exactly one aggregation expected, got {total}"
+
+    def test_router_report_record_matches_final_in_memory_aggregate(self, tracer):
+        import threading
+
+        runtime = _router(tracer)
+        handle = runtime.handle_request({})
+        attempt = handle.start_attempt()
+        attempt.start()
+        spy = _ReportSpy(tracer)
+        try:
+            publish_entered = threading.Event()
+            publish_release = threading.Event()
+            orig_publish = handle.router.register_attempt_result
+
+            def blocked_publish(result):
+                publish_entered.set()
+                publish_release.wait(timeout=5)
+                return orig_publish(result)
+
+            handle.router.register_attempt_result = blocked_publish
+
+            def finisher():
+                handle.finish_attempt(attempt, upstream_status=200, duration_ms=5.0,
+                                      raw_usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10})
+
+            tf = threading.Thread(target=finisher)
+            tf.start()
+            assert publish_entered.wait(timeout=5)
+            finalize_done = threading.Event()
+
+            def finalizer():
+                handle.finalize()
+                finalize_done.set()
+
+            tfinal = threading.Thread(target=finalizer)
+            tfinal.start()
+            import time as _time
+            _time.sleep(0.05)
+            publish_release.set()
+            tf.join(timeout=5)
+            tfinal.join(timeout=5)
+            attempt.close()
+
+            rec = spy.router_record(handle.router)
+            assert rec is not None
+            # The reported record matches the final in-memory state.
+            assert rec["attributes"].get("usage.total_tokens") == 10
+            assert rec["attributes"].get(ATTR_ROUTER["attempt_count"]) == 1
+            assert rec["attributes"].get(ATTR_ROUTER["final_error_category"]) is None or \
+                   rec["status"] == "OK"
+            # In-memory agrees.
+            assert handle.router.usage_aggregate.total_tokens == 10
+            assert handle.router.attempt_count == 1
+        finally:
+            spy.restore(tracer)

@@ -752,3 +752,117 @@ class TestCrossThreadFullActivationWeakRef:
             "reused worker must NOT see a stale ended active_attempt"
         )
         assert results["runtime_active_on_reuse"] is None
+
+
+class TestCrossThreadRouterFinalizeWeakRef:
+    """P0-1: the Router slot is weak + lazily invalidated, so a Router finalized
+    from ANOTHER thread (owner never closes) does not leave a stale
+    active_router (nor a transitive Attempt pin) on the owner / reused worker."""
+
+    def test_cross_thread_router_finalize_hides_closed_router(self, tracer):
+        import threading
+        from llm_observability.gateway_observability.context import GatewayContext
+
+        runtime = GatewayRuntime(tracer=tracer)
+        handle = runtime.handle_request({})
+        router = handle.router
+        # Router slot installed on this (owner) thread.
+        assert runtime.active_router() is router
+
+        # finalize from another thread.
+        finalizer = threading.Thread(target=handle.finalize)
+        finalizer.start()
+        finalizer.join()
+        assert router._closed is True
+
+        # Owner re-reads: the ended Router is lazily hidden.
+        assert runtime.active_router() is None, "ended Router must not surface on the owner thread"
+        assert GatewayContext.get().router is None
+
+    def test_thread_pool_worker_reuse_has_no_active_router(self, tracer):
+        import concurrent.futures
+        import time as _time
+        from llm_observability.gateway_observability.context import GatewayContext
+
+        runtime = GatewayRuntime(tracer=tracer)
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        results = {}
+
+        def task1():
+            handle = runtime.handle_request({})
+            attempt = handle.start_attempt()
+            attempt.start()
+            results["router"] = handle.router
+            results["attempt"] = attempt
+            results["active_router_after_start"] = runtime.active_router() is handle.router
+            results["task1_done"] = True
+            # Do NOT close — block until the main thread finalizes from outside.
+            deadline = _time.monotonic() + 5
+            while not results.get("finalized") and _time.monotonic() < deadline:
+                _time.sleep(0.01)
+
+        def task2():
+            results["active_router_on_reuse"] = runtime.active_router()
+            results["active_attempt_on_reuse"] = runtime.active_attempt()
+            results["ctx_router_on_reuse"] = GatewayContext.get().router
+
+        f1 = pool.submit(task1)
+        deadline = _time.monotonic() + 5
+        while not results.get("task1_done") and _time.monotonic() < deadline:
+            _time.sleep(0.01)
+        assert results.get("task1_done"), "task1 did not activate"
+        handle_router = results["router"]
+        # Cross-thread finalize (handle.finalize) from the MAIN thread.
+        handle_router.close()  # Router.close() force-closes the open attempt too
+        results["finalized"] = True
+        f1.result(timeout=5)
+
+        f2 = pool.submit(task2)
+        f2.result(timeout=5)
+        pool.shutdown(wait=True)
+
+        assert results["active_router_after_start"] is True
+        assert results["active_router_on_reuse"] is None, "reused worker must NOT see a stale Router"
+        assert results["active_attempt_on_reuse"] is None
+        assert results["ctx_router_on_reuse"] is None
+
+    def test_runtime_active_router_never_returns_closed_router(self, tracer):
+        runtime = GatewayRuntime(tracer=tracer)
+        handle = runtime.handle_request({})
+        router = handle.router
+        assert runtime.active_router() is router
+        # White-box: mark closed without clearing this thread's token.
+        router._closed = True
+        assert runtime.active_router() is None, "closed Router must be lazily hidden"
+        handle.finalize()
+
+    def test_cross_thread_finalize_releases_router_and_attempt_references(self, tracer):
+        import gc
+        import threading
+        import weakref
+        from llm_observability.gateway_observability.context import GatewayContext
+
+        runtime = GatewayRuntime(tracer=tracer)
+        handle = runtime.handle_request({})
+        attempt = handle.start_attempt()
+        attempt.start()
+        router = handle.router
+
+        router_weak = weakref.ref(router)
+        attempt_weak = weakref.ref(attempt)
+        # Drop our strong local refs; only the context + handle hold them.
+        del router
+        del attempt
+
+        finalizer = threading.Thread(target=handle.finalize)
+        finalizer.start()
+        finalizer.join()
+        # Clear this thread's context too (lazy invalidation already hid it,
+        # but force a clear so no strong ref lingers on the ContextVar).
+        GatewayContext.clear()
+        del handle
+        gc.collect()
+
+        # The Router (and its _attempts → Attempts) are now collectable.
+        assert router_weak() is None, "ended Router must be collectable after finalize"
+        assert attempt_weak() is None, "ended Attempt must be collectable after finalize"

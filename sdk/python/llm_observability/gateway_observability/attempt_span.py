@@ -498,23 +498,30 @@ class AttemptSpan:
 
         Single funnel for ALL aggregation paths (runtime.finalize_attempt,
         the streaming finalizer, and force_close): the
-        ``_aggregated_to_router`` check-and-set is atomic under
-        ``_lifecycle_lock``, so when two paths race (e.g. finish_attempt vs
-        force_close) only the first aggregates — no double-counting of a
-        single Attempt. ``register_attempt_result`` is called OUTSIDE the
-        Attempt lock (it takes the Router ``_aggregate_lock``) to avoid
-        holding ``_lifecycle_lock`` across Router aggregation. Returns True
-        if this call aggregated, False otherwise.
+        ``_aggregated_to_router`` check, the ``Router.register_attempt_result``
+        publish, and the ``_aggregated_to_router = True`` claim ALL run
+        atomically under ``_lifecycle_lock``, with the PUBLISH BEFORE THE
+        CLAIM. So a ``Router.finalize()`` that observes
+        ``_aggregated_to_router=True`` is guaranteed the result is already in
+        the Router aggregate — the reported Router Record reflects the
+        fully-published aggregate (no result published after the Router
+        report). ``register_attempt_result`` is a pure in-memory mutation under
+        the Router ``_aggregate_lock`` (no network/Reporter), so holding
+        ``_lifecycle_lock`` across it is safe. Lock ordering:
+        ``_lifecycle_lock`` → ``_aggregate_lock``, never reversed.
+        Returns True if this call aggregated, False otherwise.
         """
         try:
             with self._lifecycle_lock:
                 if self._aggregated_to_router:
                     return False
-                self._aggregated_to_router = True
                 router = self._router
-            if router is not None:
-                router.register_attempt_result(result)
-            return True
+                # Publish BEFORE claiming: a finalize observing the claim is
+                # then guaranteed the result is already in the aggregate.
+                if router is not None:
+                    router.register_attempt_result(result)
+                self._aggregated_to_router = True
+                return True
         except Exception as e:
             logger.error("Attempt try_aggregate_result failed: %s", e)
             return False
@@ -592,7 +599,7 @@ class AttemptSpan:
         # this attempt (e.g. the token belonged to another asyncio Context).
         try:
             current = GatewayContext.get()
-            if current.active_attempt is not None and current.active_attempt.attempt() is self:
+            if current.active_attempt is self:
                 GatewayContext.clear_attempt_only()
         except Exception:
             pass

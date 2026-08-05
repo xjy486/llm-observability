@@ -70,17 +70,71 @@ class ActiveAttemptRef:
 
 
 @dataclass(frozen=True)
+class ActiveRouterRef:
+    """Weak holder for the active Router in a GatewayContextState.
+
+    Same rationale as ``ActiveAttemptRef``: a cross-thread ``Router.finalize()``
+    cannot reset the owner thread's Router slot, so the slot holds a weak
+    reference and is lazily invalidated on read when the Router is dead or
+    ``_closed``. Without this the strong Router slot would transitively pin
+    ``Router._attempts`` (all Attempts) in memory.
+    """
+    ref: "weakref.ref"
+
+    def router(self):
+        """Return the live Router, or None if dead/closed."""
+        try:
+            r = self.ref()
+        except Exception:
+            return None
+        if r is None:
+            return None
+        if getattr(r, "_closed", False):
+            return None
+        return r
+
+
+def _weak_router_ref(router):
+    try:
+        return ActiveRouterRef(weakref.ref(router))
+    except TypeError:
+        return ActiveRouterRef(lambda: router)
+
+
+def _weak_attempt_ref(attempt):
+    try:
+        return ActiveAttemptRef(weakref.ref(attempt))
+    except TypeError:
+        return ActiveAttemptRef(lambda: attempt)
+
+
+@dataclass
 class GatewayContextState:
     """Runtime tuple held in the ContextVar (router slot + attempt slot).
 
-    The two slots are managed independently: closing an Attempt MUST only
-    touch the attempt slot; only a Router terminal state may clear the router
-    slot (spec: context slot semantics). The attempt slot holds an
-    ``ActiveAttemptRef`` (weak) so an ended Attempt never lingers as a stale
-    strong reference across threads.
+    Both slots hold WEAK references (``_router_ref`` / ``_active_attempt_ref``)
+    so an ended Router/Attempt is lazily invalidated on read by ``GatewayContext.get()``
+    — a cross-thread finalize cannot reset the owner's ContextVar, so the weak
+    slot + lazy deref is the only leak-free path. The public ``router`` /
+    ``active_attempt`` accessors dereference to the live object (or None),
+    preserving the historical public API contract.
     """
-    router: Optional[object] = None
-    active_attempt: Optional[ActiveAttemptRef] = None
+    _router_ref: Optional[ActiveRouterRef] = field(default=None, repr=False)
+    _active_attempt_ref: Optional[ActiveAttemptRef] = field(default=None, repr=False)
+
+    @property
+    def router(self):
+        """The live active Router, or None if dead/closed."""
+        if self._router_ref is None:
+            return None
+        return self._router_ref.router()
+
+    @property
+    def active_attempt(self):
+        """The live active Attempt, or None if dead/closed."""
+        if self._active_attempt_ref is None:
+            return None
+        return self._active_attempt_ref.attempt()
 
 
 _gateway_context_var: ContextVar[Optional[GatewayContextState]] = ContextVar(
@@ -103,44 +157,50 @@ class GatewayContext:
         Convenience reader that dereferences the weak slot (and thus returns
         None for any ended Attempt, lazily clearing the slot via ``get()``).
         """
-        state = GatewayContext.get()
-        if state is None or state.active_attempt is None:
-            return None
-        return state.active_attempt.attempt()
+        return GatewayContext.get().active_attempt
 
     @staticmethod
     def get() -> GatewayContextState:
         """Get the current gateway context state (never raises).
 
-        Lazily invalidates the attempt slot: if the active Attempt is dead or
-        closed, the current thread's attempt slot is cleared (a per-thread
-        ``ContextVar.set``, no foreign token needed) so no stale ended Attempt
-        is surfaced. This makes cross-thread cleanup unnecessary — an ended
-        Attempt stops appearing the moment any thread reads the context.
+        Lazily invalidates BOTH slots: if the active Router is dead/closed OR
+        the active Attempt is dead/closed, the current thread's whole context
+        is cleared (a per-thread ``ContextVar.set``, no foreign token needed)
+        so no stale ended Router/Attempt is surfaced. This makes cross-thread
+        cleanup unnecessary — an ended Router/Attempt stops appearing the
+        moment any thread reads the context, and the weak Router slot no
+        longer transitively pins ``Router._attempts``.
         """
         state = _gateway_context_var.get()
         if state is None:
             return GatewayContextState()
-        ref = state.active_attempt
-        if ref is not None and ref.attempt() is None:
-            # Attempt ended (dead referent or _closed). Clear this thread's
-            # attempt slot lazily; preserve the router slot.
+        # A dead/closed Router clears the whole context (its attempt is moot).
+        router_ref = state._router_ref
+        if router_ref is not None and router_ref.router() is None:
+            cleared = GatewayContextState()
             try:
-                _gateway_context_var.set(
-                    GatewayContextState(router=state.router, active_attempt=None)
-                )
+                _gateway_context_var.set(cleared)
+            except Exception as e:
+                logger.error("Gateway lazy router-slot clear failed: %s", e)
+            return cleared
+        # Router alive — check the attempt slot independently.
+        attempt_ref = state._active_attempt_ref
+        if attempt_ref is not None and attempt_ref.attempt() is None:
+            cleared = GatewayContextState(_router_ref=router_ref)
+            try:
+                _gateway_context_var.set(cleared)
             except Exception as e:
                 logger.error("Gateway lazy attempt-slot clear failed: %s", e)
-            return GatewayContextState(router=state.router, active_attempt=None)
+            return cleared
         return state
 
     @staticmethod
     def enter_router(router) -> Tuple[Token, object]:
-        """Set the active router. Returns (token, previous_router)."""
+        """Set the active router (weakly). Returns (token, previous_router)."""
         prev = _gateway_context_var.get()
         prev_router = prev.router if prev is not None else None
         token = _gateway_context_var.set(
-            GatewayContextState(router=router)
+            GatewayContextState(_router_ref=_weak_router_ref(router))
         )
         return token, prev_router
 
@@ -178,16 +238,10 @@ class GatewayContext:
         still recorded on a transient state.
         """
         state = _gateway_context_var.get()
-        if state is None:
-            state = GatewayContextState()
-        try:
-            ref = ActiveAttemptRef(weakref.ref(attempt))
-        except TypeError:
-            # Cannot weak-reference (e.g. a bare object) — fall back to a
-            # strong-holding ref that still respects _closed on read.
-            ref = ActiveAttemptRef(lambda: attempt)
+        router_ref = state._router_ref if state is not None else None
         token = _gateway_context_var.set(
-            GatewayContextState(router=state.router, active_attempt=ref)
+            GatewayContextState(_router_ref=router_ref,
+                                 _active_attempt_ref=_weak_attempt_ref(attempt))
         )
         return token
 
@@ -201,10 +255,10 @@ class GatewayContext:
         """
         try:
             state = _gateway_context_var.get()
-            router = state.router if state is not None else None
+            router_ref = state._router_ref if state is not None else None
             # Clear only the attempt slot, keeping the router slot intact.
             _gateway_context_var.set(
-                GatewayContextState(router=router, active_attempt=None)
+                GatewayContextState(_router_ref=router_ref)
             )
             try:
                 _gateway_context_var.reset(token)
@@ -223,9 +277,9 @@ class GatewayContext:
         """
         try:
             state = _gateway_context_var.get()
-            router = state.router if state is not None else None
+            router_ref = state._router_ref if state is not None else None
             _gateway_context_var.set(
-                GatewayContextState(router=router, active_attempt=None)
+                GatewayContextState(_router_ref=router_ref)
             )
         except Exception as e:
             logger.error("Gateway attempt-only clear failed: %s", e)

@@ -311,9 +311,13 @@ class GatewayRuntime:
     # ── context access ──
 
     def active_router(self) -> Optional[RouterSpan]:
-        """Current Router from the gateway ContextVar (or None)."""
-        state = GatewayContext.get()
-        return state.router if state is not None else None
+        """Current Router from the gateway ContextVar (or None).
+
+        Never returns an ended Router: ``GatewayContext.get()`` lazily
+        invalidates the slot when the Router is dead/closed, so this reads
+        ``None`` for any ended Router (cross-thread Router finalize included).
+        """
+        return GatewayContext.get().router
 
     def active_attempt(self):
         """Current Attempt from the gateway ContextVar (or None).
@@ -322,10 +326,7 @@ class GatewayRuntime:
         invalidates the slot when the referent is dead/closed, so this reads
         ``None`` for any ended Attempt (cross-thread force_close included).
         """
-        state = GatewayContext.get()
-        if state is None or state.active_attempt is None:
-            return None
-        return state.active_attempt.attempt()
+        return GatewayContext.get().active_attempt
 
 
 class GatewayRuntimeHandle:
