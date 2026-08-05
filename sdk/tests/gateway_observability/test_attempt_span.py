@@ -125,7 +125,9 @@ def test_attempt_active_in_context(clean_sdk):
     a = handle.start_attempt({"attempt_index": 1})
     a.start()
     state = GatewayContext.get()
-    assert state.active_attempt is a
+    assert state.active_attempt is not None
+    assert state.active_attempt.attempt() is a
+    assert GatewayContext.active_attempt() is a
     a.close()
     state = GatewayContext.get()
     assert state.active_attempt is None

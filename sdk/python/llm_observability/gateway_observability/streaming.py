@@ -337,17 +337,15 @@ class _TerminalFinalizer:
     def _aggregate_to_router(self, result: AttemptResult):
         """Aggregate the terminal AttemptResult into the Router exactly once.
 
-        An attempt that was already aggregated via ``runtime.finalize_attempt``
-        (non-streaming) is never re-aggregated by a wrapper.
+        Routes through Attempt.try_aggregate_result so the
+        _aggregated_to_router check-and-set is atomic under _lifecycle_lock —
+        a racing finalize_attempt/force_close cannot double-count the same
+        Attempt.
         """
-        if self._router is None:
-            return
         try:
-            if getattr(self._attempt, "_aggregated_to_router", False):
+            if self._attempt is None:
                 return
-            if self._attempt is not None:
-                self._attempt._aggregated_to_router = True
-            self._router.register_attempt_result(result)
+            self._attempt.try_aggregate_result(result)
         except Exception as e:
             logger.error("Gateway stream router aggregation failed: %s", e)
 

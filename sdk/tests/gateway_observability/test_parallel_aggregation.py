@@ -1,8 +1,10 @@
-"""P1: parallel attempt-result aggregation is race-free (aggregate lock).
+"""P1: parallel attempt-result aggregation + exactly-once single-Attempt funnel.
 
 Concurrent (hedged / parallel provider) attempts all call
 ``register_attempt_result``; the aggregate lock prevents lost count updates and
-overwritten usage/cost read-modify-writes.
+overwritten usage/cost read-modify-writes. The single ``try_aggregate_result``
+funnel guarantees the SAME Attempt is aggregated at most once across racing
+paths (finalize_attempt / streaming finalizer / force_close).
 """
 import os
 import sys
@@ -136,3 +138,97 @@ class TestParallelAggregation:
 
         assert router.success_count == n_succ
         assert router.fail_count == n_fail
+
+
+class TestSingleAttemptExactlyOnceAggregation:
+    """P1: try_aggregate_result makes the same Attempt aggregate exactly once
+    across racing paths (finalize_attempt / streaming finalizer / force_close)."""
+
+    def test_finish_attempt_racing_force_close_aggregates_once(self, tracer):
+        runtime = _router(tracer)
+        handle = runtime.handle_request({})
+        attempt = handle.start_attempt()
+        attempt.start()
+        barrier = threading.Barrier(2)
+
+        def finish():
+            barrier.wait()
+            # Business success result.
+            handle.finish_attempt(attempt, upstream_status=200, duration_ms=5.0)
+
+        def force():
+            barrier.wait()
+            attempt.force_close()
+
+        tf = threading.Thread(target=finish)
+        tforce = threading.Thread(target=force)
+        tf.start(); tforce.start()
+        tf.join(); tforce.join()
+        attempt.close()
+        handle.finalize()
+
+        # Exactly one aggregation: success_count + fail_count == 1.
+        assert handle.router.success_count + handle.router.fail_count == 1, (
+            f"same Attempt aggregated {handle.router.success_count + handle.router.fail_count} times"
+        )
+
+    def test_stream_finalize_racing_router_finalize_aggregates_once(self, tracer):
+        from llm_observability.gateway_observability import GatewayStream
+        runtime = _router(tracer)
+        handle = runtime.handle_request({})
+        attempt = handle.start_attempt()
+        attempt.start()
+        chunks = iter([{"choices": [{"delta": {"content": "hi"}}]}])
+        stream = GatewayStream(chunks, handle.router, attempt, runtime_handle=handle)
+
+        barrier = threading.Barrier(2)
+
+        def consume():
+            barrier.wait()
+            list(stream)  # drives finalize_success
+
+        def finalize():
+            barrier.wait()
+            handle.finalize()  # may force_close if still open
+
+        tc = threading.Thread(target=consume)
+        tf = threading.Thread(target=finalize)
+        tc.start(); tf.start()
+        tc.join(); tf.join()
+
+        # The Attempt was aggregated at most once (success or force_close, not both).
+        total = handle.router.success_count + handle.router.fail_count
+        assert total <= 1, f"same Attempt aggregated {total} times"
+
+    def test_same_attempt_success_failure_race_count_equals_one(self, tracer):
+        runtime = _router(tracer)
+        handle = runtime.handle_request({})
+        attempt = handle.start_attempt()
+        attempt.start()
+        succ = AttemptResult(
+            attempt_index=attempt.attempt_index, http_status_code=200,
+            usage=_u(10, 5), success=True,
+        )
+        fail = AttemptResult(
+            attempt_index=attempt.attempt_index, http_status_code=500,
+            error=None, success=False,
+        )
+        barrier = threading.Barrier(2)
+
+        def agg_succ():
+            barrier.wait()
+            attempt.try_aggregate_result(succ)
+
+        def agg_fail():
+            barrier.wait()
+            attempt.try_aggregate_result(fail)
+
+        t1 = threading.Thread(target=agg_succ)
+        t2 = threading.Thread(target=agg_fail)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+        attempt.close()
+        handle.finalize()
+
+        # Exactly one of the two won.
+        assert handle.router.success_count + handle.router.fail_count == 1

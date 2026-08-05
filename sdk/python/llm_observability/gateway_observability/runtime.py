@@ -243,12 +243,11 @@ class GatewayRuntime:
             logger.error("Gateway attempt terminal event failed: %s", e)
         # Aggregate into the Router (including failed attempts), at most once
         # per attempt — a streaming wrapper must not re-aggregate a finalize
-        # that already happened here.
+        # that already happened here. try_aggregate_result makes the
+        # _aggregated_to_router check-and-set atomic under _lifecycle_lock so
+        # a racing force_close/streaming-finalizer cannot double-count.
         try:
-            router = attempt._router
-            if router is not None and not attempt._aggregated_to_router:
-                attempt._aggregated_to_router = True
-                router.register_attempt_result(result)
+            attempt.try_aggregate_result(result)
         except Exception as e:
             logger.error("Router attempt aggregation failed: %s", e)
         return result
@@ -317,9 +316,16 @@ class GatewayRuntime:
         return state.router if state is not None else None
 
     def active_attempt(self):
-        """Current Attempt from the gateway ContextVar (or None)."""
+        """Current Attempt from the gateway ContextVar (or None).
+
+        Never returns an ended Attempt: ``GatewayContext.get()`` lazily
+        invalidates the slot when the referent is dead/closed, so this reads
+        ``None`` for any ended Attempt (cross-thread force_close included).
+        """
         state = GatewayContext.get()
-        return state.active_attempt if state is not None else None
+        if state is None or state.active_attempt is None:
+            return None
+        return state.active_attempt.attempt()
 
 
 class GatewayRuntimeHandle:

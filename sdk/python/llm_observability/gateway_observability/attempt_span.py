@@ -493,13 +493,41 @@ class AttemptSpan:
         # RLock; with RLock it is fine, but we release first for clarity.
         self.close()
 
+    def try_aggregate_result(self, result) -> bool:
+        """Aggregate a terminal AttemptResult into the Router exactly once.
+
+        Single funnel for ALL aggregation paths (runtime.finalize_attempt,
+        the streaming finalizer, and force_close): the
+        ``_aggregated_to_router`` check-and-set is atomic under
+        ``_lifecycle_lock``, so when two paths race (e.g. finish_attempt vs
+        force_close) only the first aggregates — no double-counting of a
+        single Attempt. ``register_attempt_result`` is called OUTSIDE the
+        Attempt lock (it takes the Router ``_aggregate_lock``) to avoid
+        holding ``_lifecycle_lock`` across Router aggregation. Returns True
+        if this call aggregated, False otherwise.
+        """
+        try:
+            with self._lifecycle_lock:
+                if self._aggregated_to_router:
+                    return False
+                self._aggregated_to_router = True
+                router = self._router
+            if router is not None:
+                router.register_attempt_result(result)
+            return True
+        except Exception as e:
+            logger.error("Attempt try_aggregate_result failed: %s", e)
+            return False
+
     def _aggregate_force_close_result(self):
         """Build the terminal AttemptResult and aggregate it to the Router.
 
         Idempotent via ``_aggregated_to_router``; fail-open. Mirrors the
         streaming finalizer / runtime.finalize_attempt aggregation so the
         Router's fail_count, final_error and cost/usage aggregates stay
-        consistent with this force-closed Attempt.
+        consistent with this force-closed Attempt. Runs under
+        ``_lifecycle_lock`` (acquired by force_close), so it calls
+        ``try_aggregate_result`` (re-entrant RLock) for the atomic guard.
         """
         try:
             if self._router is None or self._aggregated_to_router:
@@ -518,8 +546,7 @@ class AttemptSpan:
                 cost=self._cost,
                 success=False,
             )
-            self._aggregated_to_router = True
-            self._router.register_attempt_result(result)
+            self.try_aggregate_result(result)
         except Exception as e:
             logger.error("Attempt force_close aggregation failed: %s", e)
 
@@ -565,7 +592,7 @@ class AttemptSpan:
         # this attempt (e.g. the token belonged to another asyncio Context).
         try:
             current = GatewayContext.get()
-            if current.active_attempt is self:
+            if current.active_attempt is not None and current.active_attempt.attempt() is self:
                 GatewayContext.clear_attempt_only()
         except Exception:
             pass

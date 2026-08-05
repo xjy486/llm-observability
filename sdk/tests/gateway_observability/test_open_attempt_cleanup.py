@@ -425,13 +425,17 @@ class TestAttemptActivationRace:
         handle = runtime.handle_request({})
         attempt = handle.start_attempt()
         attempt.start()
-        assert GatewayContext.get().active_attempt is attempt
+        assert GatewayContext.active_attempt() is attempt
         # Simulate the race: force-close without clearing this thread's token
-        # (as if set_attempt ran after force_close).
+        # (as if set_attempt ran after force_close). With the weakref slot,
+        # marking _closed=True lazily invalidates the slot on read — no stale
+        # ended Attempt is surfaced, even before close().
         attempt._closed = True
-        assert GatewayContext.get().active_attempt is attempt
-        attempt.close()  # early-return path must clear the owned token
-        assert GatewayContext.get().active_attempt is None, "owned ContextVar must be cleared on close early-return"
+        assert GatewayContext.active_attempt() is None, (
+            "ended Attempt must be lazily hidden from the context"
+        )
+        attempt.close()  # early-return path: idempotent, no token leak
+        assert GatewayContext.active_attempt() is None, "owned ContextVar must stay cleared on close early-return"
         handle.finalize()
 
     def test_rejected_attempt_does_not_increment_attempt_count(self, tracer):
@@ -573,17 +577,23 @@ class TestSetAttemptWindowRace:
             return real_force_close()
 
         handle.router._force_close_open_attempts = signaled_force_close
+        finalized_event = threading.Event()
         state = {}
         try:
             def starter():
                 a = handle.start_attempt()
                 a.start()
                 state["attempt"] = a
-                state["ctx_after"] = GatewayContext.get().active_attempt
+                # Read the dereferenced active attempt AFTER finalize completes
+                # (weakref lazy-invalidation: an ended Attempt reads None on
+                # the worker thread even with no business close()).
+                finalized_event.wait(timeout=5)
+                state["ctx_after"] = GatewayContext.active_attempt()
 
             def finalizer():
                 handle.finalize()
                 state["finalized"] = True
+                finalized_event.set()
 
             t = threading.Thread(target=starter)
             t.start()
@@ -638,3 +648,107 @@ class TestSetAttemptWindowRace:
                 "cleanup comes from the lifecycle lock, not the owner"
             )
         self._run_window_race(tracer, check)
+
+
+class TestCrossThreadFullActivationWeakRef:
+    """Blocker (final): a fully-activated Attempt that is force-closed from
+    ANOTHER thread (owner never calls close()) leaves no stale active_attempt
+    on the owner / reused worker thread. ContextVars are per-thread, so
+    cross-thread token reset is impossible — the weakref slot is lazily
+    invalidated on read instead."""
+
+    def test_cross_thread_force_close_after_full_activation_clears_owner_context(self, tracer):
+        import threading
+        from llm_observability.gateway_observability.context import GatewayContext
+
+        runtime = GatewayRuntime(tracer=tracer)
+        handle = runtime.handle_request({})
+        attempt = handle.start_attempt()
+        attempt.start()
+        # Full activation: ContextVar installed, started recorded, lock released.
+        assert GatewayContext.active_attempt() is attempt
+
+        # Owner never calls close(); finalize (force_close) runs on another thread.
+        finalizer = threading.Thread(target=handle.finalize)
+        finalizer.start()
+        finalizer.join()
+
+        assert attempt._closed is True, "attempt must be force-closed"
+        # The owner thread re-reads the context — the ended Attempt is lazily
+        # hidden (no cross-thread token reset needed).
+        assert GatewayContext.active_attempt() is None, (
+            "ended Attempt must not surface on the owner thread"
+        )
+
+    def test_owner_never_closes_after_full_activation_context_not_stale(self, tracer):
+        import threading
+        from llm_observability.gateway_observability.context import GatewayContext
+
+        runtime = GatewayRuntime(tracer=tracer)
+        handle = runtime.handle_request({})
+        attempt = handle.start_attempt()
+        attempt.start()
+        assert GatewayContext.active_attempt() is attempt
+
+        finalizer = threading.Thread(target=handle.finalize)
+        finalizer.start()
+        finalizer.join()
+
+        # Runtime.active_attempt() must never return an ended Attempt.
+        assert runtime.active_attempt() is None
+        assert GatewayContext.active_attempt() is None
+
+    def test_thread_pool_worker_reused_after_force_close_has_no_active_attempt(self, tracer):
+        import concurrent.futures
+        from llm_observability.gateway_observability.context import GatewayContext
+
+        runtime = GatewayRuntime(tracer=tracer)
+        # A single-worker thread pool: Task 1 fully activates an Attempt, gets
+        # force-closed from the main thread (owner never closes), then Task 2
+        # runs on the SAME worker and reads the context.
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        results = {}
+
+        def task1():
+            handle = runtime.handle_request({})
+            attempt = handle.start_attempt()
+            attempt.start()
+            results["attempt"] = attempt
+            results["active_after_start"] = GatewayContext.active_attempt() is attempt
+            # Do NOT close — signal the main thread to finalize from outside.
+            results["task1_done"] = True
+            # Block here so the worker is reused for task2 on the same thread
+            # only after finalize completes.
+            import time as _time
+            deadline = _time.monotonic() + 5
+            while not results.get("finalized") and _time.monotonic() < deadline:
+                _time.sleep(0.01)
+
+        def task2():
+            results["active_on_reuse"] = GatewayContext.active_attempt()
+            results["runtime_active_on_reuse"] = runtime.active_attempt()
+
+        # Run task1 on the single worker.
+        f1 = pool.submit(task1)
+        # Wait until task1 has activated + signalled, then finalize from here.
+        import time as _time
+        deadline = _time.monotonic() + 5
+        while not results.get("task1_done") and _time.monotonic() < deadline:
+            _time.sleep(0.01)
+        assert results.get("task1_done"), "task1 did not activate"
+        attempt = results["attempt"]
+        # Force-close from the MAIN thread (cross-thread finalize).
+        attempt.force_close()
+        results["finalized"] = True
+        f1.result(timeout=5)
+
+        # Now reuse the same worker for task2 — it must NOT see a stale Attempt.
+        f2 = pool.submit(task2)
+        f2.result(timeout=5)
+        pool.shutdown(wait=True)
+
+        assert results["active_after_start"] is True, "task1 should have activated"
+        assert results["active_on_reuse"] is None, (
+            "reused worker must NOT see a stale ended active_attempt"
+        )
+        assert results["runtime_active_on_reuse"] is None
