@@ -519,3 +519,122 @@ class TestAttemptActivationRace:
 
         assert ctx_on_worker["after"] is None, "worker active_attempt must be None (force-closed)"
         assert ctx_on_worker["after_close"] is None, "worker active_attempt must stay None after close"
+
+
+class TestSetAttemptWindowRace:
+    """Deterministic tests that block *inside* GatewayContext.set_attempt — i.e.
+    the Attempt has already passed the closed-check and is inside the
+    _lifecycle_lock critical section. This is the exact window the prior
+    lockless second-check could not close; the lifecycle lock must hold.
+
+    finalize() runs in its OWN thread because it blocks on _lifecycle_lock
+    (held by set_attempt) until set_attempt returns; running it inline would
+    deadlock the test thread against the worker.
+    """
+
+    def _patched_set_attempt_factory(self, entered, release, real_set_attempt):
+        def patched_set_attempt(attempt):
+            entered.set()
+            release.wait(timeout=5)
+            return real_set_attempt(attempt)
+        return patched_set_attempt
+
+    def _run_window_race(self, tracer, on_finalized):
+        """Shared harness: start attempt → block inside set_attempt → finalize
+        in a background thread (blocks on the lock) → release → join both.
+
+        finalize() runs in its OWN thread because it blocks on _lifecycle_lock
+        (held by set_attempt) until set_attempt returns; running it inline would
+        deadlock the test thread against the worker. We wait until the finalizer
+        is blocked on the lock (via a patched force_close signal) before
+        releasing set_attempt, so force_close is guaranteed to win the lock
+        next — the post-install re-check then sees _closed and clears the
+        worker's own token.
+        """
+        import threading
+        import time as _time
+        from llm_observability.gateway_observability import context as ctx_mod
+
+        runtime = GatewayRuntime(tracer=tracer)
+        handle = runtime.handle_request({})
+        entered = threading.Event()
+        release = threading.Event()
+        force_close_waiting = threading.Event()
+        real_set_attempt = ctx_mod.GatewayContext.set_attempt
+        ctx_mod.GatewayContext.set_attempt = staticmethod(
+            self._patched_set_attempt_factory(entered, release, real_set_attempt)
+        )
+        # Signal when force_close has begun (it will block on _lifecycle_lock
+        # immediately after, since set_attempt still holds it).
+        real_force_close = handle.router._force_close_open_attempts
+
+        def signaled_force_close():
+            force_close_waiting.set()
+            return real_force_close()
+
+        handle.router._force_close_open_attempts = signaled_force_close
+        state = {}
+        try:
+            def starter():
+                a = handle.start_attempt()
+                a.start()
+                state["attempt"] = a
+                state["ctx_after"] = GatewayContext.get().active_attempt
+
+            def finalizer():
+                handle.finalize()
+                state["finalized"] = True
+
+            t = threading.Thread(target=starter)
+            t.start()
+            assert entered.wait(timeout=5), "did not reach the set_attempt window"
+            f = threading.Thread(target=finalizer)
+            f.start()
+            # Wait until force_close is about to acquire _lifecycle_lock (it is
+            # blocked because set_attempt still holds it). Now releasing
+            # set_attempt guarantees force_close wins the lock next.
+            assert force_close_waiting.wait(timeout=5), "force_close did not start"
+            _time.sleep(0.02)  # let it actually block on the lock
+            release.set()
+            t.join(timeout=5)
+            f.join(timeout=5)
+            on_finalized(handle, state)
+        finally:
+            ctx_mod.GatewayContext.set_attempt = staticmethod(real_set_attempt)
+            handle.router._force_close_open_attempts = real_force_close
+
+    def test_finalize_after_closed_check_before_set_attempt_no_leak(self, tracer):
+        from llm_observability.gateway_observability.events import EVENT_ATTEMPT_STARTED
+
+        def check(handle, state):
+            a = state["attempt"]
+            assert a._closed is True, "attempt must be force-closed"
+            assert state["ctx_after"] is None, "active_attempt must be None (post-install re-check cleared it)"
+            assert GatewayContext.get().active_attempt is None
+            started = [e for e in (a.span.events if a.span is not None else [])
+                       if e.get("name") == EVENT_ATTEMPT_STARTED]
+            assert started == [], "no late attempt.started on ended span"
+        self._run_window_race(tracer, check)
+
+    def test_no_started_event_when_force_close_occurs_inside_set_attempt_window(self, tracer):
+        from llm_observability.gateway_observability.events import EVENT_ATTEMPT_STARTED
+
+        def check(handle, state):
+            a = state["attempt"]
+            assert a._closed is True
+            started = [e for e in (a.span.events if a.span is not None else [])
+                       if e.get("name") == EVENT_ATTEMPT_STARTED]
+            assert started == [], "attempt.started must not be recorded when force_close lands in the set_attempt window"
+        self._run_window_race(tracer, check)
+
+    def test_owner_never_calls_close_after_race_context_still_empty(self, tracer):
+        # The decisive test: after the set_attempt-window race, do NOT call
+        # attempt.close(). The leaked token must NOT survive — cleanup must
+        # come from the lifecycle lock + post-install re-check, not from a
+        # later business-thread close().
+        def check(handle, state):
+            assert state["ctx_after"] is None, (
+                "active_attempt must be None without a business close() — "
+                "cleanup comes from the lifecycle lock, not the owner"
+            )
+        self._run_window_race(tracer, check)

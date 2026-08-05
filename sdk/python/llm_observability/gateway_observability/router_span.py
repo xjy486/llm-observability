@@ -227,6 +227,13 @@ class RouterSpan:
         # miss or double an entry. RLock because force_close → close →
         # unregister re-enters the lock.
         self._open_attempts_lock = threading.RLock()
+        # Aggregate lock: guards register_attempt_result's mutation of
+        # _success_count / _fail_count / _final_error / _final_http_status /
+        # _final_channel_id / _ttft_ms / _usage_aggregate / _cost_aggregate,
+        # plus the cache-hit direct setters and the aggregate read at finalize.
+        # Required so concurrent (hedged / parallel provider) attempt results
+        # aggregate without lost updates or torn read-modify-writes.
+        self._aggregate_lock = threading.RLock()
         self._used_attempt_indices: set[int] = set()
         self._attempt_count = 0
         self._success_count = 0
@@ -511,18 +518,31 @@ class RouterSpan:
             if self._span is None:
                 return
             span = self._span
-            span.set_attribute(ATTR_ROUTER["attempt_count"], self._attempt_count)
-            span.set_attribute(ATTR_ROUTER["retry_count"], self._retry_count)
-            span.set_attribute(ATTR_ROUTER["fallback_count"], self._fallback_count)
-            if self._cache_status:
-                span.set_attribute(ATTR_ROUTER["cache_status"], self._cache_status)
-            if self._final_channel_id:
+            # Snapshot the aggregate state under _aggregate_lock so a racing
+            # register_attempt_result cannot produce a torn read at finalize.
+            with self._aggregate_lock:
+                attempt_count = self._attempt_count
+                retry_count = self._retry_count
+                fallback_count = self._fallback_count
+                cache_status = self._cache_status
+                final_channel_id = self._final_channel_id
+                ttft_ms = self._ttft_ms
+                final_http_status = self._final_http_status
+                final_error = self._final_error
+                usage_attrs = usage_to_attributes(self._usage_aggregate)
+                cost_attrs = cost_to_attributes(self._cost_aggregate)
+            span.set_attribute(ATTR_ROUTER["attempt_count"], attempt_count)
+            span.set_attribute(ATTR_ROUTER["retry_count"], retry_count)
+            span.set_attribute(ATTR_ROUTER["fallback_count"], fallback_count)
+            if cache_status:
+                span.set_attribute(ATTR_ROUTER["cache_status"], cache_status)
+            if final_channel_id:
                 span.set_attribute(
                     ATTR_ROUTER["channel_id"],
-                    self._privacy.hash_channel_id(self._final_channel_id),
+                    self._privacy.hash_channel_id(final_channel_id),
                 )
-            if self._ttft_ms is not None:
-                span.set_attribute(ATTR_ROUTER["ttft_ms"], self._ttft_ms)
+            if ttft_ms is not None:
+                span.set_attribute(ATTR_ROUTER["ttft_ms"], ttft_ms)
             if self._queue_duration_ms is not None:
                 span.set_attribute(ATTR_ROUTER["queue_duration_ms"], self._queue_duration_ms)
             if self._auth_duration_ms is not None:
@@ -534,15 +554,15 @@ class RouterSpan:
                     ATTR_ROUTER["total_duration_ms"],
                     round((self._ended_at - self._started_at) * 1000, 2),
                 )
-            if self._final_http_status is not None:
-                span.set_attribute(ATTR_ROUTER["final_http_status_code"], self._final_http_status)
-            if self._final_error is not None:
-                span.set_attribute(ATTR_ROUTER["final_error_category"], self._final_error.category)
-                if self._final_error.type:
-                    self._set_attr(span, ATTR_ROUTER["final_error_type"], self._final_error.type)
-            for key, value in usage_to_attributes(self._usage_aggregate).items():
+            if final_http_status is not None:
+                span.set_attribute(ATTR_ROUTER["final_http_status_code"], final_http_status)
+            if final_error is not None:
+                span.set_attribute(ATTR_ROUTER["final_error_category"], final_error.category)
+                if final_error.type:
+                    self._set_attr(span, ATTR_ROUTER["final_error_type"], final_error.type)
+            for key, value in usage_attrs.items():
                 span.set_attribute(key, value)
-            for key, value in cost_to_attributes(self._cost_aggregate).items():
+            for key, value in cost_attrs.items():
                 span.set_attribute(key, value)
         except Exception as e:
             logger.error("Router aggregate apply failed: %s", e)
@@ -716,41 +736,46 @@ class RouterSpan:
         """Aggregate one attempt's outcome into the Router (fail-open).
 
         Failed attempts with Provider-returned usage still contribute to the
-        aggregate (spec §12.2).
+        aggregate (spec §12.2). The whole mutation runs under _aggregate_lock
+        so concurrent (hedged / parallel provider) results aggregate without
+        lost count updates or overwritten usage/cost aggregates.
         """
         try:
-            if result.success:
-                self._success_count += 1
-                if result.channel_id:
-                    self._final_channel_id = result.channel_id
-                if result.http_status_code is not None:
-                    self._final_http_status = result.http_status_code
-            else:
-                self._fail_count += 1
-                if result.http_status_code is not None:
-                    self._final_http_status = result.http_status_code
-                if result.channel_id:
-                    self._final_channel_id = result.channel_id
-            # Final error reflects the LAST attempt's outcome: a later success
-            # clears the error left by an earlier failed attempt (spec §13.2).
-            self._final_error = result.error
-            if result.ttft_ms is not None and self._ttft_ms is None:
-                self._ttft_ms = result.ttft_ms
-            # Always aggregate usage/cost (including failed attempts).
-            if result.usage is not None:
-                self._usage_aggregate = add_usage(self._usage_aggregate, result.usage)
-            if result.cost is not None:
-                self._cost_aggregate = add_cost(self._cost_aggregate, result.cost)
+            with self._aggregate_lock:
+                if result.success:
+                    self._success_count += 1
+                    if result.channel_id:
+                        self._final_channel_id = result.channel_id
+                    if result.http_status_code is not None:
+                        self._final_http_status = result.http_status_code
+                else:
+                    self._fail_count += 1
+                    if result.http_status_code is not None:
+                        self._final_http_status = result.http_status_code
+                    if result.channel_id:
+                        self._final_channel_id = result.channel_id
+                # Final error reflects the LAST attempt's outcome: a later success
+                # clears the error left by an earlier failed attempt (spec §13.2).
+                self._final_error = result.error
+                if result.ttft_ms is not None and self._ttft_ms is None:
+                    self._ttft_ms = result.ttft_ms
+                # Always aggregate usage/cost (including failed attempts).
+                if result.usage is not None:
+                    self._usage_aggregate = add_usage(self._usage_aggregate, result.usage)
+                if result.cost is not None:
+                    self._cost_aggregate = add_cost(self._cost_aggregate, result.cost)
         except Exception as e:
             logger.error("Router attempt aggregation failed: %s", e)
 
     def set_usage_aggregate(self, usage: NormalizedUsage):
         """Directly set the Router usage aggregate (e.g. cache hit with usage)."""
-        self._usage_aggregate = usage
+        with self._aggregate_lock:
+            self._usage_aggregate = usage
 
     def set_cost_aggregate(self, cost: NormalizedCost):
         """Directly set the Router cost aggregate."""
-        self._cost_aggregate = cost
+        with self._aggregate_lock:
+            self._cost_aggregate = cost
 
     # ── route decision helpers (spec §13-14) ──
 

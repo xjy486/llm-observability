@@ -6,6 +6,7 @@ is managed by the Router (or the streaming wrapper) so it ends only at a
 terminal state.
 """
 import logging
+import threading
 import time
 from typing import Optional
 
@@ -93,6 +94,18 @@ class AttemptSpan:
         # A no-op attempt (Router was already closed at start) is never
         # registered, never set as the active attempt, and never reported.
         self._no_op = False
+        # Intent flag set by force_close() BEFORE it waits for _lifecycle_lock.
+        # Lets _activate_context_and_started_event detect an in-flight
+        # force-close inside its critical section and skip ContextVar install
+        # (a cross-thread finalize cannot reset a worker-thread token, so we
+        # must never install one when a force-close is underway).
+        self._closing = False
+        # Per-Attempt lifecycle lock: serializes the post-activation ContextVar
+        # install + attempt.started recording with force_close()/close()'s
+        # _closed-state transition. Closes the "closed-check passed but
+        # finalize lands before set_attempt" window. RLock so close()→
+        # _cleanup_context_if_owned and force_close()→close() re-enter safely.
+        self._lifecycle_lock = threading.RLock()
         # Explicit index requested by the caller (resolved atomically in
         # Router.activate_attempt; None → Router auto-allocates).
         self._explicit_index: Optional[int] = None
@@ -187,25 +200,58 @@ class AttemptSpan:
                 self._span.set_attribute(ATTR_ATTEMPT["attempt_index"], self._attempt_index)
             except Exception:
                 pass
-            # Second check: the Attempt may have been force-closed by a Router
-            # finalize that raced us between activation and here. Do NOT set
-            # the active-attempt ContextVar or record `attempt.started` on an
-            # already-ended span — the Attempt is already reported by
-            # force_close, and re-installing the ContextVar would leak on a
-            # worker/thread-pool thread (close()'s early-return skips cleanup).
-            if self._closed:
-                return self
-            self._ctx_token = GatewayContext.set_attempt(self)
-            # Lifecycle event: exactly one gateway.attempt.started per attempt.
-            self.recorder.attempt_started(
-                attempt_index=self._attempt_index,
-                channel_id=self._raw_channel_id,
-                provider=self._provider,
-                resolved_model=self._resolved_model,
-            )
+            # Atomic activation confirmation: re-check _closed, install the
+            # active-attempt ContextVar, and record gateway.attempt.started as
+            # ONE critical section under _lifecycle_lock, serialized with
+            # force_close()/close(). This closes the window between the
+            # closed-check and set_attempt — a finalize landing there either
+            # waits for the CS (then sees the token and clears it) or has
+            # already closed (then this CS installs nothing).
+            self._activate_context_and_started_event()
         except Exception as e:
             logger.error("Attempt span start failed: %s", e)
         return self
+
+    def _activate_context_and_started_event(self) -> bool:
+        """Install the active-attempt ContextVar + record gateway.attempt.started
+        atomically with force_close()/close() under _lifecycle_lock.
+
+        Returns True if installed, False if the Attempt was force-closed (the
+        token is cleared and no event is recorded).
+
+        Because ContextVars are per-context, a finalize running on another
+        thread cannot reset a token installed on THIS (worker) thread. So the
+        guard is intent-based: ``force_close`` sets ``_closing`` BEFORE waiting
+        for the lock. Inside the critical section we re-check ``_closing``
+        (and ``_closed``) both at entry and immediately before
+        ``set_attempt``. If ``force_close`` has begun (even if it is still
+        blocked on this lock), we install NOTHING — so no worker-thread token
+        can leak when the owner never calls ``close()``.
+        """
+        try:
+            with self._lifecycle_lock:
+                if self._closed or self._no_op or self._closing:
+                    return False
+                self._ctx_token = GatewayContext.set_attempt(self)
+                # Post-install re-check: force_close may have set _closing
+                # between the entry check and set_attempt. If so, clear the
+                # just-installed token (on THIS thread's context) and skip the
+                # event — the Attempt is about to be ended + reported by
+                # force_close once it gets the lock.
+                if self._closed or self._closing:
+                    self._cleanup_context_if_owned()
+                    return False
+                # Lifecycle event: exactly one gateway.attempt.started.
+                self.recorder.attempt_started(
+                    attempt_index=self._attempt_index,
+                    channel_id=self._raw_channel_id,
+                    provider=self._provider,
+                    resolved_model=self._resolved_model,
+                )
+                return True
+        except Exception as e:
+            logger.error("Attempt context activation failed: %s", e)
+            return False
 
     def _parent_ids(self):
         """Return (trace_id, parent_span_id) — the Attempt's parent is always
@@ -346,42 +392,46 @@ class AttemptSpan:
 
         Registry entry + active-attempt ContextVar are always cleaned, even if
         span end or report raises. A no-op attempt (Router was closed at start)
-        is neither ended nor reported — it is simply discarded.
+        is neither ended nor reported — it is simply discarded. The _closed
+        state transition is taken under _lifecycle_lock, serialized with
+        start()'s activation critical section, so a finalize racing activation
+        cannot leave an installed-but-orphaned ContextVar.
         """
-        if self._closed:
-            # Already closed (possibly force-closed by a Router finalize that
-            # raced our start). Still clear the active-attempt ContextVar if
-            # this Attempt currently owns it — a leaked token must not survive
-            # on a worker/thread-pool thread. Fail-open.
-            self._cleanup_context_if_owned()
-            return
-        self._closed = True
-        if self._no_op:
-            # Never registered / never started as a real span: nothing to end
-            # or report, no ContextVar to clear.
-            return
-        try:
+        with self._lifecycle_lock:
+            if self._closed:
+                # Already closed (possibly force-closed by a Router finalize
+                # that raced our start). Still clear the active-attempt
+                # ContextVar if this Attempt currently owns it — a leaked token
+                # must not survive on a worker/thread-pool thread. Fail-open.
+                self._cleanup_context_if_owned()
+                return
+            self._closed = True
+            if self._no_op:
+                # Never registered / never started as a real span: nothing to
+                # end or report, no ContextVar to clear.
+                return
             try:
-                if self._span is not None:
-                    if self._duration_ms is None and self._started_at:
-                        self._duration_ms = round((time.time() - self._started_at) * 1000, 2)
-                    if self._error is not None:
-                        self._span.set_status("ERROR")
-                    else:
-                        self._span.set_status("OK")
-                    if self._duration_ms is not None:
-                        self._span.set_attribute(ATTR_ATTEMPT["upstream_duration_ms"], self._duration_ms)
-                    self._record_terminal_event()
-                    self._span.end()
-                    if self._sampled and self._tracer is not None:
-                        try:
-                            self._tracer.reporter.report(self._span.to_record())
-                        except Exception as e:
-                            logger.error("Failed to report Attempt span: %s", e)
-            except Exception as e:
-                logger.error("Attempt span end failed: %s", e)
-        finally:
-            self._cleanup()
+                try:
+                    if self._span is not None:
+                        if self._duration_ms is None and self._started_at:
+                            self._duration_ms = round((time.time() - self._started_at) * 1000, 2)
+                        if self._error is not None:
+                            self._span.set_status("ERROR")
+                        else:
+                            self._span.set_status("OK")
+                        if self._duration_ms is not None:
+                            self._span.set_attribute(ATTR_ATTEMPT["upstream_duration_ms"], self._duration_ms)
+                        self._record_terminal_event()
+                        self._span.end()
+                        if self._sampled and self._tracer is not None:
+                            try:
+                                self._tracer.reporter.report(self._span.to_record())
+                            except Exception as e:
+                                logger.error("Failed to report Attempt span: %s", e)
+                except Exception as e:
+                    logger.error("Attempt span end failed: %s", e)
+            finally:
+                self._cleanup()
 
     def force_close(self, category: str = "gateway_internal",
                     reason: str = "router_finalized_with_open_attempt"):
@@ -400,34 +450,47 @@ class AttemptSpan:
           states stay consistent (Router OK ⟺ Attempt OK).
         - Never aggregated → set ``gateway_internal`` ERROR, aggregate the failure
           result exactly once, then close — so the Router ends ERROR.
+
+        The closed-check + error-mark + aggregation decision run under
+        _lifecycle_lock (RLock, so force_close→close re-enters), serialized
+        with start()'s activation critical section.
+
+        ``_closing`` is set BEFORE waiting for the lock so a start() inside its
+        critical section sees an in-flight force-close and skips the ContextVar
+        install (cross-thread finalize cannot reset a worker-thread token).
         """
-        if self._closed:
-            # Already closed (possibly already aggregated by finalize_attempt /
-            # the streaming finalizer). Idempotent — do not re-aggregate.
-            return
-        if self._aggregated_to_router:
-            # The outcome is already in the Router (success or business error).
-            # Just close the span with its existing status; do NOT fabricate a
-            # gateway_internal error or re-aggregate — that would create a
-            # Router-OK / Attempt-ERROR contradiction.
-            self.close()
-            return
-        try:
-            if self._error is None:
-                from .errors import GatewayError
-                self.set_error(GatewayError(
-                    category=category,
-                    type="GatewayInternalError",
-                    message=reason,
-                    retryable=False,
-                ))
-        except Exception as e:
-            logger.error("Attempt force_close error-mark failed: %s", e)
-        # Aggregate the terminal result into the Router exactly once. A
-        # business error already on the Attempt is preserved (force-close only
-        # set gateway_internal when no error existed). Captured usage/cost
-        # (partial consumption) are carried into the result.
-        self._aggregate_force_close_result()
+        self._closing = True
+        with self._lifecycle_lock:
+            if self._closed:
+                # Already closed (possibly already aggregated by finalize_attempt /
+                # the streaming finalizer). Idempotent — do not re-aggregate.
+                return
+            if self._aggregated_to_router:
+                # The outcome is already in the Router (success or business
+                # error). Just close the span with its existing status; do NOT
+                # fabricate a gateway_internal error or re-aggregate — that
+                # would create a Router-OK / Attempt-ERROR contradiction.
+                pass
+            else:
+                try:
+                    if self._error is None:
+                        from .errors import GatewayError
+                        self.set_error(GatewayError(
+                            category=category,
+                            type="GatewayInternalError",
+                            message=reason,
+                            retryable=False,
+                        ))
+                except Exception as e:
+                    logger.error("Attempt force_close error-mark failed: %s", e)
+                # Aggregate the terminal result into the Router exactly once. A
+                # business error already on the Attempt is preserved (force-close
+                # only set gateway_internal when no error existed). Captured
+                # usage/cost (partial consumption) are carried into the result.
+                self._aggregate_force_close_result()
+        # close() re-enters _lifecycle_lock (RLock) and does the span end +
+        # cleanup. Holding the lock across close() would self-deadlock without
+        # RLock; with RLock it is fine, but we release first for clarity.
         self.close()
 
     def _aggregate_force_close_result(self):
