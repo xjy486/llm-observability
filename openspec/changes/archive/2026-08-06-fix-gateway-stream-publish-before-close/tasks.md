@@ -21,6 +21,6 @@
 
 - [x] C.1 (P1) 主 spec lifecycle requirement 的 slot 清理文字已修正（Router dead→清整个；Attempt dead while Router alive→只清 Attempt slot）—— 已在本 change delta spec 中体现，归档后同步主 spec
 - [x] C.2 全量回归：gateway_observability 套件 + Phase 2.1–2.5 + 归档 closeout 测试全绿
-- [ ] C.3 GitHub CI 全部成功（含 live-upstream 0 skipped 证据）
-- [ ] C.4 **终审**：对照 design Risks 逐项核验；三层证据（代码审查 / CI 绿 / E2E 0 skipped）齐备
-- [ ] C.5 归档本 change（`openspec archive fix-gateway-stream-publish-before-close`），不修改已归档历史
+- [x] C.3 GitHub CI 全部成功（含 live-upstream 0 skipped 证据）
+- [x] C.4 **终审**：对照 design Risks 逐项核验；三层证据（代码审查 / CI 绿 / E2E 0 skipped）齐备
+- [x] C.5 归档本 change（`openspec archive fix-gateway-stream-publish-before-close`），不修改已归档历史
