@@ -115,7 +115,11 @@ jobs:
       - run: pip install -e sdk/python
       - run: |
           python -m pytest sdk/tests/gateway_observability/test_streaming.py \
-            sdk/tests/gateway_observability/test_stream_terminal_state.py -q --tb=short
+            sdk/tests/gateway_observability/test_stream_terminal_state.py \
+            sdk/tests/gateway_observability/test_stream_terminal_atomicity.py \
+            sdk/tests/gateway_observability/test_stream_duration_semantics.py \
+            sdk/tests/gateway_observability/test_terminal_event_exclusion.py \
+            sdk/tests/gateway_observability/test_hedged_attempt_winner.py -q --tb=short
 
   real-e2e:
     name: Real E2E (Live Endpoint)

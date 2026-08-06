@@ -27,6 +27,7 @@ EVENT_QUEUE_EXITED: Final[str] = "gateway.queue.exited"
 EVENT_ATTEMPT_STARTED: Final[str] = "gateway.attempt.started"
 EVENT_ATTEMPT_FAILED: Final[str] = "gateway.attempt.failed"
 EVENT_ATTEMPT_COMPLETED: Final[str] = "gateway.attempt.completed"
+EVENT_ATTEMPT_SELECTED: Final[str] = "gateway.attempt.selected"
 
 EVENT_RETRY_SCHEDULED: Final[str] = "gateway.retry.scheduled"
 EVENT_FALLBACK_SELECTED: Final[str] = "gateway.fallback.selected"
@@ -47,6 +48,7 @@ EVENT_GATEWAY: Final[frozenset[str]] = frozenset({
     EVENT_RATE_LIMIT_CHECKED, EVENT_RATE_LIMIT_REJECTED,
     EVENT_QUEUE_ENTERED, EVENT_QUEUE_EXITED,
     EVENT_ATTEMPT_STARTED, EVENT_ATTEMPT_FAILED, EVENT_ATTEMPT_COMPLETED,
+    EVENT_ATTEMPT_SELECTED,
     EVENT_RETRY_SCHEDULED, EVENT_FALLBACK_SELECTED,
     EVENT_STREAM_STARTED, EVENT_STREAM_FIRST_TOKEN, EVENT_STREAM_COMPLETED,
     EVENT_STREAM_CANCELLED,

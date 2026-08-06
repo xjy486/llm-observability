@@ -23,9 +23,11 @@ trigger TTFT.
 """
 import asyncio
 import logging
+import threading
 import time
 from typing import Any, Optional
 
+from .attributes import ATTR_ATTEMPT
 from .errors import ErrorCategory, GatewayError
 from .router_span import RouterSpan, AttemptResult
 from .usage import add_usage
@@ -125,13 +127,42 @@ class _TerminalFinalizer:
         self._upstream_status = upstream_status
         self._duration_ms = duration_ms
         self._connect_duration_ms = connect_duration_ms
-        self._finalized = False
+        # Atomic terminal state machine (spec: streaming terminal lifecycle).
+        # ``_terminal_state`` is None until exactly one finalizer path wins the
+        # ``_claim_terminal`` check-and-set under ``_terminal_lock``; every other
+        # racing path (success / error / cancelled / close / aclose / disconnect)
+        # then no-ops. First terminal claim wins — no timestamp inference, no
+        # implicit upgrade of one terminal over another.
+        self._terminal_lock = threading.Lock()
+        self._terminal_state: Optional[str] = None
+        self._terminal_time: Optional[float] = None  # captured at claim, for duration
         self._stream_usage = None  # usage captured from terminal chunks
         self._stream_cost = None   # cost computed from the terminal usage
 
     @property
     def finalized(self) -> bool:
-        return self._finalized
+        return self._terminal_state is not None
+
+    @property
+    def terminal_state(self) -> Optional[str]:
+        """The single claimed terminal state (``success``/``error``/``cancelled``)
+        or None if no finalizer has won the claim yet."""
+        return self._terminal_state
+
+    def _claim_terminal(self, state: str) -> bool:
+        """Atomically claim the single terminal state for this stream.
+
+        Returns True the first time it is called (the winning path); returns
+        False for every subsequent call (the losing racing paths). The terminal
+        time is captured on the winning claim so the full upstream stream
+        lifecycle duration can be computed at publish time. First claim wins.
+        """
+        with self._terminal_lock:
+            if self._terminal_state is not None:
+                return False
+            self._terminal_state = state
+            self._terminal_time = time.time()
+            return True
 
     def capture_usage(self, raw_usage: Any):
         """Capture usage from a stream chunk (terminal or partial)."""
@@ -182,9 +213,8 @@ class _TerminalFinalizer:
     # ── terminal paths ──
 
     def finalize_success(self):
-        if self._finalized:
+        if not self._claim_terminal("success"):
             return
-        self._finalized = True
         try:
             if self._router is not None:
                 self._router.recorder.stream_completed()
@@ -207,9 +237,8 @@ class _TerminalFinalizer:
             logger.error("Gateway stream success finalize failed: %s", e)
 
     def finalize_error(self, error: BaseException):
-        if self._finalized:
+        if not self._claim_terminal("error"):
             return
-        self._finalized = True
         try:
             gateway_error = self._classify(error)
             if self._attempt is not None:
@@ -236,9 +265,8 @@ class _TerminalFinalizer:
             logger.error("Gateway stream error finalize failed: %s", e)
 
     def finalize_cancelled(self):
-        if self._finalized:
+        if not self._claim_terminal("cancelled"):
             return
-        self._finalized = True
         try:
             gateway_error = GatewayError(
                 category=ErrorCategory.CLIENT_CANCELLED,
@@ -342,10 +370,45 @@ class _TerminalFinalizer:
         racing finalize either still sees the open Attempt (force-closes it as
         a no-op re-aggregation) or sees the already-published aggregate — so
         the reported Router Record always reflects the result.
+
+        Only the path that won ``_claim_terminal`` reaches here, so the
+        terminal-time duration overwrite runs exactly once.
         """
+        self._apply_terminal_duration()
         self._aggregate_to_router(result)
         self._close_attempt()
         self._close_router()
+
+    def _apply_terminal_duration(self):
+        """Overwrite ``gateway.upstream_duration_ms`` with the full upstream
+        stream lifecycle (``terminal_time - attempt_start_time``) at the
+        terminal state (spec: streaming duration semantics). The header-time
+        duration written at wrapper creation is replaced; connect duration is
+        left unchanged. Fail-open. Non-streaming duration semantics are
+        untouched (this only runs on the streaming terminal path).
+        """
+        if self._attempt is None or self._terminal_time is None:
+            return
+        try:
+            started = getattr(self._attempt, "_started_at", 0.0) or 0.0
+            if not started:
+                return
+            total_ms = round((self._terminal_time - started) * 1000, 2)
+            if total_ms < 0:
+                return
+            # Keep the Attempt's _duration_ms consistent so its own close()
+            # writes the same total (close() overwrites the attribute from
+            # _duration_ms when set).
+            try:
+                self._attempt._duration_ms = total_ms
+            except Exception:
+                pass
+            span = getattr(self._attempt, "_span", None)
+            if span is not None:
+                span.set_attribute(ATTR_ATTEMPT["upstream_duration_ms"], total_ms)
+        except Exception as e:
+            logger.error("Gateway stream terminal duration failed: %s", e)
+
 
     def _aggregate_to_router(self, result: AttemptResult):
         """Aggregate the terminal AttemptResult into the Router exactly once.

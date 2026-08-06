@@ -88,6 +88,49 @@ GATEWAY router
 └── GATEWAY attempt-1
 ```
 
+## 2.1 阶段拆分（Phase 3.0 / 3.1 / 3.2）
+
+Phase 3 正式拆分为三个可独立冻结的子阶段。本文档第 28 节 Definition of Done
+仅约束 **Phase 3.0**；One-API 真实生命周期接入与 Gateway 专用 UI/Metrics 不在
+Phase 3.0 DoD 内，分别由独立 change 承接。
+
+```text
+Phase 3.0 — Gateway Contract & Runtime
+  Router/Attempt Contract 冻结
+  Streaming Terminal 原子状态机（first terminal claim wins）
+  Hedged/Parallel Winner 语义（显式 select_winner + 确定性 fail-safe）
+  Terminal Event 互斥组
+  Streaming Duration 字段语义
+  Usage/Cost 聚合（含失败/loser Attempt）
+  Privacy / Sampling / Fail-open
+  Context/Registry 无泄漏
+  Gateway Runtime E2E 通过、CI 全绿、必需 E2E 0 skipped
+  → 本轮冻结
+
+Phase 3.1 — One-API Production Integration（future change）
+  真实 One-API 生命周期接入（middleware/hooks/lifecycle/streaming/bootstrap）
+  真实 Retry/Fallback/Streaming 由 One-API 事件驱动 Runtime
+  真实/容器化 One-API E2E
+  不侵入 One-API 路由语义、Telemetry fail-open
+
+Phase 3.2 — Gateway UI & Metrics（future change）
+  Router Detail / Attempt Timeline / Route Decision / Cost Breakdown
+  Gateway Filters（provider/channel/model/error_category/span_role/cache_status）
+  Gateway Metrics（requests/attempts/errors/retries/fallbacks/cache/latency/tokens/cost）
+  Retry/Hedge Waste Cost
+```
+
+只有 Phase 3.0、3.1、3.2 全部完成时，方可标记 `Phase 3 — Gateway Native
+Observability ✅ COMPLETE/FROZEN`。本文档不创建 `oneapi-production-integration`
+或 `gateway-ui-metrics` 的空白 spec 能力；3.1/3.2 由各自 change 在启动时建立
+实质 requirement。
+
+> 注：第 19–23 节（One-API Adapter 映射、UI 需求、Core/存储需求、指标需求、真实
+> E2E）描述的是 Phase 3 的完整终态愿景。其中 One-API Adapter 字段映射
+> （`OneApiAdapter`）已作为 Phase 3.0 的一部分实现并冻结；真实 One-API 生命周期
+> 接入属 Phase 3.1，Gateway 专用 UI 与 Metrics 属 Phase 3.2。不得在文档中表述
+> 3.1/3.2 已完成而代码未实现。
+
 ---
 
 # 3. 非目标
@@ -1450,7 +1493,11 @@ Step 13 Phase 2.1～2.5 Regression
 
 # 28. Definition of Done
 
-只有全部满足以下条件，Phase 3 才能冻结：
+> 本节为 **Phase 3.0 — Gateway Contract & Runtime** 的 DoD。One-API 真实生命周期
+> 接入属 Phase 3.1，Gateway 专用 UI/Metrics 属 Phase 3.2（见 §2.1），不在本节
+> 验收范围内。
+
+只有全部满足以下条件，Phase 3.0 才能冻结：
 
 ```text
 1. Router GATEWAY 与 Attempt GATEWAY 语义冻结
@@ -1463,19 +1510,39 @@ Step 13 Phase 2.1～2.5 Regression
 8. Client Cancel 不造成 Context/Registry 泄漏
 9. Usage 在 Attempt、Router、LLM 三层所有权一致
 10. Cost 包含失败重试产生的真实费用
-11. One-API 通过 Adapter 接入，不侵入核心
+11. One-API 通过 Adapter 字段映射接入（真实生命周期接入属 Phase 3.1）
 12. LiteLLM Adapter 接口可扩展
 13. 所有隐私字段默认不进入 Telemetry
 14. 所有 Telemetry 故障完整 Fail-open
 15. Sampling 正确继承
-16. Core/UI 可以展示 Router 与 Attempt Timeline
-17. Success/Retry/Fallback/Streaming/No-SDK Real E2E 全部通过
-18. Phase 2.1～2.5 Regression 全部通过
-19. GitHub CI 全部成功
-20. 无 skipped 的 Phase 3 必需验收测试
+16. Streaming Terminal 为原子状态机（first terminal claim wins）
+17. Hedged/Parallel 最终状态由显式 Winner 决定；无 Winner 有确定性 fail-safe
+18. Terminal Event 互斥（attempt/response/stream 组内至多一个）
+19. Streaming Duration 字段语义统一（完整上游流生命周期）
+20. Success/Retry/Fallback/Streaming/No-SDK Real E2E 全部通过
+21. Phase 2.1～2.5 Regression 全部通过
+22. GitHub CI 全部成功
+23. 无 skipped 的 Phase 3 必需验收测试
 ```
 
+> 第 16 节（原 Core/UI 展示 Router 与 Attempt Timeline）移入 Phase 3.2，不再
+> 作为 Phase 3.0 DoD。
+
 完成后标记：
+
+```text
+Phase 3.0 — Gateway Contract & Runtime
+✅ COMPLETE
+✅ FROZEN
+
+Phase 3.1 — One-API Production Integration
+❌ PENDING
+
+Phase 3.2 — Gateway UI & Metrics
+❌ PENDING
+```
+
+只有 Phase 3.1、3.2 也完成时，方可标记：
 
 ```text
 Phase 3 — Gateway Native Observability
