@@ -189,11 +189,10 @@ class _TerminalFinalizer:
             if self._router is not None:
                 self._router.recorder.stream_completed()
             usage = self._apply_usage_to_attempt()
-            self._close_attempt()
             status = self._upstream_status
             if status is None:
                 status = getattr(self._attempt, "status", None) if self._attempt else None
-            self._aggregate_to_router(AttemptResult(
+            result = AttemptResult(
                 attempt_index=getattr(self._attempt, "attempt_index", 1) if self._attempt else 1,
                 channel_id=getattr(self._attempt, "channel_id", None) if self._attempt else None,
                 http_status_code=status,
@@ -201,11 +200,11 @@ class _TerminalFinalizer:
                 usage=usage,
                 cost=self._stream_cost,
                 success=True,
-            ))
+            )
+            # Publish BEFORE close (see _publish_and_close).
+            self._publish_and_close(result)
         except Exception as e:
             logger.error("Gateway stream success finalize failed: %s", e)
-        finally:
-            self._close_router()
 
     def finalize_error(self, error: BaseException):
         if self._finalized:
@@ -221,9 +220,8 @@ class _TerminalFinalizer:
             if self._router is not None:
                 self._router.recorder.response_failed(error_category=gateway_error.category)
             usage = self._apply_usage_to_attempt()
-            self._close_attempt()
             # Router final_error_category == Attempt error_category (consistent).
-            self._aggregate_to_router(AttemptResult(
+            result = AttemptResult(
                 attempt_index=getattr(self._attempt, "attempt_index", 1) if self._attempt else 1,
                 channel_id=getattr(self._attempt, "channel_id", None) if self._attempt else None,
                 http_status_code=self._upstream_status,
@@ -232,11 +230,10 @@ class _TerminalFinalizer:
                 usage=usage,
                 cost=self._stream_cost,
                 success=False,
-            ))
+            )
+            self._publish_and_close(result)
         except Exception as e:
             logger.error("Gateway stream error finalize failed: %s", e)
-        finally:
-            self._close_router()
 
     def finalize_cancelled(self):
         if self._finalized:
@@ -260,8 +257,7 @@ class _TerminalFinalizer:
                 )
             # Partial usage already returned upstream is still recorded.
             usage = self._apply_usage_to_attempt()
-            self._close_attempt()
-            self._aggregate_to_router(AttemptResult(
+            result = AttemptResult(
                 attempt_index=getattr(self._attempt, "attempt_index", 1) if self._attempt else 1,
                 channel_id=getattr(self._attempt, "channel_id", None) if self._attempt else None,
                 http_status_code=self._upstream_status,
@@ -270,11 +266,10 @@ class _TerminalFinalizer:
                 usage=usage,
                 cost=self._stream_cost,
                 success=False,
-            ))
+            )
+            self._publish_and_close(result)
         except Exception as e:
             logger.error("Gateway stream cancel finalize failed: %s", e)
-        finally:
-            self._close_router()
 
     # ── internals ──
 
@@ -333,6 +328,24 @@ class _TerminalFinalizer:
             self._attempt.close()
         except Exception as e:
             logger.error("Gateway stream attempt close failed: %s", e)
+
+    def _publish_and_close(self, result: AttemptResult):
+        """Single terminal funnel shared by success/error/cancel: PUBLISH the
+        result to the Router, THEN close the Attempt, THEN close the Router.
+
+        Publishing BEFORE closing the Attempt is required: ``Attempt.close()``
+        unregisters the Attempt from ``Router._open_attempts`` and reports the
+        Attempt span. If a ``Router.finalize()`` races the old
+        close-then-aggregate order, it sees no open Attempt and reports the
+        Router with the pre-aggregate state; the resumed aggregation then
+        writes into an already-reported Router. Publishing first guarantees a
+        racing finalize either still sees the open Attempt (force-closes it as
+        a no-op re-aggregation) or sees the already-published aggregate — so
+        the reported Router Record always reflects the result.
+        """
+        self._aggregate_to_router(result)
+        self._close_attempt()
+        self._close_router()
 
     def _aggregate_to_router(self, result: AttemptResult):
         """Aggregate the terminal AttemptResult into the Router exactly once.
