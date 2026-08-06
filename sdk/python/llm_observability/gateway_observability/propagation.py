@@ -64,3 +64,32 @@ def decide_sampling(header_value: Optional[str], local_sample_rate: float) -> bo
         return inherited
     import random
     return random.random() < local_sample_rate
+
+
+def inject_downstream_trace_headers(router, attempt=None) -> dict:
+    """Build the W3C ``traceparent`` header for an Attempt's upstream request.
+
+    The downstream traceparent carries the Router's trace ID, the Attempt's
+    span ID as parent (falling back to the Router span when no attempt), and
+    the inherited sampling decision (``00`` when sampled out — still
+    propagated, never re-randomized).
+
+    Returns ``{}`` when no span exists (fail-open).
+    """
+    try:
+        router_span = router.span if router is not None else None
+        if router_span is None or not router_span.trace_id:
+            return {}
+        parent_span_id = router_span.span_id
+        if attempt is not None:
+            attempt_span = getattr(attempt, "span", None)
+            if attempt_span is not None and attempt_span.span_id:
+                parent_span_id = attempt_span.span_id
+        sampled = bool(getattr(router, "_sampled", True))
+        flags = TRACE_FLAG_SAMPLED if sampled else TRACE_FLAG_NOT_SAMPLED
+        return {
+            "traceparent": f"00-{router_span.trace_id}-{parent_span_id}-{flags}",
+        }
+    except Exception as e:
+        logger.error("Gateway downstream header injection failed: %s", e)
+        return {}

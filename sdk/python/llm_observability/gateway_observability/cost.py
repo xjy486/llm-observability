@@ -79,12 +79,17 @@ def cost_to_attributes(cost: Optional[NormalizedCost]) -> dict:
 class CostCalculator:
     """Map NormalizedUsage → NormalizedCost (fail-open).
 
-    Round-one scope: no pricing table is shipped (Phase 3.1); every mapped
-    cost is ``source = "unpriced"``. Subclasses / later phases supply tables.
+    Pricing-table entries use explicit per-1M-token USD units under the frozen
+    keys ``input_usd_per_1m_tokens`` / ``output_usd_per_1m_tokens`` (legacy
+    ``input``/``output`` per-token keys are still accepted for
+    backward compatibility). With no table entry the cost is
+    ``source = "unpriced"`` and ``total_cost = None``.
     """
 
     def __init__(self, pricing_table: Optional[dict] = None):
-        """Args: pricing_table — optional {model: {input, output}} USD per token."""
+        """Args: pricing_table — optional
+        ``{model: {"input_usd_per_1m_tokens": x, "output_usd_per_1m_tokens": y}}``.
+        """
         self._pricing_table = pricing_table or {}
 
     def calculate(self, usage: Optional[NormalizedUsage], model: Optional[str] = None) -> Optional[NormalizedCost]:
@@ -112,14 +117,24 @@ class CostCalculator:
         if not prices:
             return NormalizedCost(currency="USD", cost_source="unpriced")
 
-        input_price = prices.get("input")
-        output_price = prices.get("output")
+        # Frozen unit: USD per 1M tokens. Legacy per-token keys accepted.
+        if "input_usd_per_1m_tokens" in prices or "output_usd_per_1m_tokens" in prices:
+            input_per_token = (prices.get("input_usd_per_1m_tokens") or 0) / 1_000_000 or None
+            output_per_token = (prices.get("output_usd_per_1m_tokens") or 0) / 1_000_000 or None
+            if "input_usd_per_1m_tokens" not in prices:
+                input_per_token = None
+            if "output_usd_per_1m_tokens" not in prices:
+                output_per_token = None
+        else:
+            input_per_token = prices.get("input")
+            output_per_token = prices.get("output")
+
         input_cost = None
         output_cost = None
-        if input_price is not None and usage.input_tokens is not None:
-            input_cost = round(input_price * usage.input_tokens, 6)
-        if output_price is not None and usage.output_tokens is not None:
-            output_cost = round(output_price * usage.output_tokens, 6)
+        if input_per_token is not None and usage.input_tokens is not None:
+            input_cost = round(input_per_token * usage.input_tokens, 6)
+        if output_per_token is not None and usage.output_tokens is not None:
+            output_cost = round(output_per_token * usage.output_tokens, 6)
         total_cost = None
         if input_cost is not None and output_cost is not None:
             total_cost = round(input_cost + output_cost, 6)

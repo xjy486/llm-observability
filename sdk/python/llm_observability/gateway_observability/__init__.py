@@ -48,8 +48,12 @@ from .usage import NormalizedUsage, UsageNormalizer, add_usage, usage_to_attribu
 from .cost import NormalizedCost, CostCalculator, add_cost, cost_to_attributes
 from .router_span import RouterSpan, RouteDecision, AttemptContext, AttemptResult
 from .attempt_span import AttemptSpan
-from .privacy import PrivacyGuard
-from .propagation import sampling_from_traceparent, ROOT_ROUTER_SAMPLED_ATTR
+from .privacy import PrivacyGuard, set_gateway_attribute
+from .propagation import (
+    sampling_from_traceparent,
+    ROOT_ROUTER_SAMPLED_ATTR,
+    inject_downstream_trace_headers,
+)
 from .recorder import GatewayEventRecorder
 from .runtime import GatewayRuntime
 from .adapter import GatewayAdapter, GenericAdapter
@@ -84,7 +88,9 @@ __all__ = [
     "add_usage", "usage_to_attributes", "usage_has_values",
     "add_cost", "cost_to_attributes",
     # privacy / propagation
-    "PrivacyGuard", "sampling_from_traceparent", "ROOT_ROUTER_SAMPLED_ATTR",
+    "PrivacyGuard", "set_gateway_attribute",
+    "sampling_from_traceparent", "ROOT_ROUTER_SAMPLED_ATTR",
+    "inject_downstream_trace_headers",
     # adapters
     "GatewayAdapter", "GenericAdapter",
     # streaming + LLM aggregation hook

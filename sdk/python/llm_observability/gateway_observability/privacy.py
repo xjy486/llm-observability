@@ -59,6 +59,7 @@ _ALLOWED_EXACT_KEYS = frozenset({
     "finish_reason",
     # event attributes
     "reason", "delay_ms", "http_status_code",
+    "from_channel_id", "to_channel_id",
     # usage / cost leaf names
     "input_tokens", "output_tokens", "total_tokens", "cached_input_tokens",
     "reasoning_tokens", "cache_creation_tokens", "cache_read_tokens", "source",
@@ -161,6 +162,29 @@ class PrivacyGuard:
         except Exception:
             return self._mask
 
+    # ── association top-level fields ──
+
+    def sanitize_association(self, text: Optional[str]) -> str:
+        """Sanitize a Router association top-level field (user_id / session_id
+        / message_id / app_name / business_scene).
+
+        Applies secret-pattern masking, control-character stripping, and a
+        256-byte length limit — the same hardening the guarded span-attribute
+        path applies, since these fields are external strings written to the
+        Span record top-level (not via ``set_gateway_attribute``). Fail-closed.
+        """
+        if not isinstance(text, str) or not text:
+            return text if isinstance(text, str) else ""
+        try:
+            masked = text
+            for pattern, replacement in _SECRET_PATTERNS:
+                masked = pattern.sub(replacement, masked)
+            # Strip control chars (keep tab/newline out of telemetry fields).
+            masked = "".join(ch for ch in masked if ch == " " or (ord(ch) >= 0x20 and ord(ch) != 0x7F))
+            return _truncate_bytes(masked, _ASSOCIATION_MAX_BYTES)
+        except Exception:
+            return self._mask
+
     # ── channel ID hashing ──
 
     def hash_channel_id(self, raw_id: Optional[str]) -> Optional[str]:
@@ -198,3 +222,75 @@ class PrivacyGuard:
             return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
         except Exception:
             return self._mask
+
+
+# ── Unified guarded attribute entry point (P1-5) ──
+
+# Per-key byte limits for external string values.
+_MAX_STRING_BYTES = 512
+# Byte limit for Router association top-level fields (user_id / session_id /
+# message_id / app_name / business_scene) — written to the Span record, not via
+# set_gateway_attribute, so the bound is applied in sanitize_association.
+_ASSOCIATION_MAX_BYTES = 256
+_PER_KEY_LIMITS = {
+    "gateway.request_id": 256,
+    "gateway.upstream_request_id": 256,
+    "gateway.route": 256,
+    "gateway.route_reason": 256,
+    "gateway.provider": 128,
+    "gateway.resolved_model": 128,
+    "gateway.requested_model": 128,
+    "gateway.error_message": _MAX_STRING_BYTES,
+}
+
+
+def _truncate_bytes(text: str, limit: int) -> str:
+    """Truncate a string to at most ``limit`` UTF-8 bytes."""
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= limit:
+        return text
+    return encoded[:limit].decode("utf-8", errors="ignore")
+
+
+def _normalize_value(value: Any) -> Any:
+    """Type-normalize a value into a span-safe primitive."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    try:
+        return str(value)
+    except Exception:
+        return None
+
+
+def set_gateway_attribute(span, key: str, value: Any, privacy_guard: Optional[PrivacyGuard]) -> bool:
+    """Write one span attribute through the unified privacy guard.
+
+    Pipeline: field-name whitelist (default-deny unknown keys) → value
+    sanitization (secret masking, URL query stripping for ``gateway.route``)
+    → per-key length limits → type normalization → ``span.set_attribute``.
+    Fail-open: any failure logs and returns False without touching the span.
+
+    Router and Attempt code MUST route external strings through this entry
+    point instead of calling ``span.set_attribute`` directly.
+    """
+    if span is None or not key:
+        return False
+    try:
+        guard = privacy_guard if privacy_guard is not None else PrivacyGuard()
+        if not guard.is_allowed_attribute(str(key)):
+            return False
+        normalized = _normalize_value(value)
+        if normalized is None:
+            return False
+        if isinstance(normalized, str):
+            if str(key) == "gateway.route":
+                normalized = guard.sanitize_url(normalized)
+            else:
+                normalized = guard.sanitize_string(normalized)
+            limit = _PER_KEY_LIMITS.get(str(key), _MAX_STRING_BYTES)
+            normalized = _truncate_bytes(normalized, limit)
+        span.set_attribute(key, normalized)
+        return True
+    except Exception as e:
+        logger.error("set_gateway_attribute failed (%s): %s", key, e)
+        return False

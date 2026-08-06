@@ -132,14 +132,16 @@ class GatewayRuntime:
             logger.error("Gateway attempt-context extraction failed: %s", e)
             ctx = None
 
-        index = 1
+        index = None
         provider = None
         channel_id = None
         channel_type = None
         resolved_model = None
         timeout_ms = None
         if ctx is not None:
-            index = getattr(ctx, "attempt_index", 1) or 1
+            # None → Router auto-allocates; invalid values fall back inside
+            # router.allocate_attempt_index (never a hardcoded 1).
+            index = getattr(ctx, "attempt_index", None)
             provider = getattr(ctx, "provider", None)
             channel_id = getattr(ctx, "channel_id", None)
             channel_type = getattr(ctx, "channel_type", None)
@@ -195,8 +197,10 @@ class GatewayRuntime:
                 retryable=is_retryable_category(category),
             )
 
-        # Compute cost (fail-open).
-        cost = self._cost_calculator.calculate(normalized)
+        # Compute cost with the attempt's resolved model (fail-open).
+        cost = self._cost_calculator.calculate(
+            normalized, model=getattr(attempt, "_resolved_model", None),
+        )
 
         if gateway_error is not None:
             attempt.set_error(gateway_error)
@@ -208,6 +212,7 @@ class GatewayRuntime:
         if cost is not None:
             attempt.set_cost(cost)
 
+        succeeded = gateway_error is None and (upstream_status is None or upstream_status < 400)
         result = AttemptResult(
             attempt_index=attempt.attempt_index,
             channel_id=attempt.channel_id,
@@ -218,13 +223,31 @@ class GatewayRuntime:
             finish_reason=finish_reason,
             usage=normalized,
             cost=cost,
-            success=gateway_error is None and (upstream_status is None or upstream_status < 400),
+            success=succeeded,
         )
-        # Aggregate into the Router (including failed attempts).
+        # Terminal lifecycle event on the attempt span (exactly once, before
+        # span end — the caller closes the attempt after this returns).
         try:
-            router = attempt._router
-            if router is not None:
-                router.register_attempt_result(result)
+            attempt._terminal_event_recorded = True
+            if succeeded:
+                attempt.recorder.attempt_completed(
+                    attempt_index=attempt.attempt_index, http_status_code=upstream_status,
+                )
+            else:
+                attempt.recorder.attempt_failed(
+                    attempt_index=attempt.attempt_index,
+                    error_category=gateway_error.category if gateway_error is not None else None,
+                    http_status_code=upstream_status,
+                )
+        except Exception as e:
+            logger.error("Gateway attempt terminal event failed: %s", e)
+        # Aggregate into the Router (including failed attempts), at most once
+        # per attempt — a streaming wrapper must not re-aggregate a finalize
+        # that already happened here. try_aggregate_result makes the
+        # _aggregated_to_router check-and-set atomic under _lifecycle_lock so
+        # a racing force_close/streaming-finalizer cannot double-count.
+        try:
+            attempt.try_aggregate_result(result)
         except Exception as e:
             logger.error("Router attempt aggregation failed: %s", e)
         return result
@@ -251,7 +274,12 @@ class GatewayRuntime:
 
     def handle_cache(self, router: Optional[RouterSpan], cache_status: str = GATEWAY_CACHE_HIT,
                      usage: Any = None, cost: Any = None):
-        """Record a cache decision. A hit creates no Attempt (spec §14.1)."""
+        """Record a cache decision. A hit creates no Attempt (spec §14.1).
+
+        An explicit caller-provided cost is preserved; otherwise cost is
+        computed from usage with the router's resolved model (unpriced when
+        the model has no pricing entry).
+        """
         if router is None:
             return
         router.set_cache_status(cache_status)
@@ -261,7 +289,16 @@ class GatewayRuntime:
                 normalized = self._usage_normalizer.normalize(usage)
             if normalized is not None:
                 router.set_usage_aggregate(normalized)
-                calc = self._cost_calculator.calculate(normalized)
+                if cost is not None:
+                    calc = cost  # explicit caller cost wins
+                else:
+                    resolved_model = None
+                    try:
+                        rd = getattr(router, "_route_decision", None)
+                        resolved_model = getattr(rd, "resolved_model", None)
+                    except Exception:
+                        resolved_model = None
+                    calc = self._cost_calculator.calculate(normalized, model=resolved_model)
                 if calc is not None:
                     router.set_cost_aggregate(calc)
 
@@ -274,14 +311,22 @@ class GatewayRuntime:
     # ── context access ──
 
     def active_router(self) -> Optional[RouterSpan]:
-        """Current Router from the gateway ContextVar (or None)."""
-        state = GatewayContext.get()
-        return state.router if state is not None else None
+        """Current Router from the gateway ContextVar (or None).
+
+        Never returns an ended Router: ``GatewayContext.get()`` lazily
+        invalidates the slot when the Router is dead/closed, so this reads
+        ``None`` for any ended Router (cross-thread Router finalize included).
+        """
+        return GatewayContext.get().router
 
     def active_attempt(self):
-        """Current Attempt from the gateway ContextVar (or None)."""
-        state = GatewayContext.get()
-        return state.active_attempt if state is not None else None
+        """Current Attempt from the gateway ContextVar (or None).
+
+        Never returns an ended Attempt: ``GatewayContext.get()`` lazily
+        invalidates the slot when the referent is dead/closed, so this reads
+        ``None`` for any ended Attempt (cross-thread force_close included).
+        """
+        return GatewayContext.get().active_attempt
 
 
 class GatewayRuntimeHandle:
@@ -309,12 +354,47 @@ class GatewayRuntimeHandle:
                        upstream_status: Optional[int] = None, duration_ms: Optional[float] = None,
                        ttft_ms: Optional[float] = None, finish_reason: Optional[str] = None,
                        raw_usage: Any = None):
-        """Normalize + aggregate one attempt's outcome."""
+        """Normalize + aggregate one attempt's outcome (NON-streaming only).
+
+        Streaming attempts must go through ``finalize_streaming_attempt`` /
+        the stream wrapper's terminal funnel — never finished at header time.
+        """
         return self._runtime.finalize_attempt(
             attempt, response=response, error=error, upstream_status=upstream_status,
             duration_ms=duration_ms, ttft_ms=ttft_ms, finish_reason=finish_reason,
             raw_usage=raw_usage,
         )
+
+    # Explicit non-streaming alias so call sites state their intent.
+    def finish_non_streaming_attempt(self, attempt, **kwargs):
+        """Non-streaming attempt finalization (same as ``finish_attempt``)."""
+        return self.finish_attempt(attempt, **kwargs)
+
+    def finalize_streaming_attempt(self, iterable, attempt, check_done: bool = True,
+                                   async_stream: bool = False,
+                                   upstream_status: Optional[int] = None,
+                                   duration_ms: Optional[float] = None,
+                                   connect_duration_ms: Optional[float] = None):
+        """Wrap an upstream stream for terminal-state finalization.
+
+        The Attempt stays open until the stream reaches a terminal state
+        (full consumption / [DONE] / cancel / error); success is NEVER
+        aggregated at header time. Header-time upstream facts (status /
+        duration) are recorded on the Attempt but do not finalize it.
+        Returns the wrapped stream.
+        """
+        from .streaming import wrap_stream, wrap_async_stream
+        if async_stream:
+            return wrap_async_stream(iterable, self.router, attempt,
+                                     runtime_handle=self, check_done=check_done,
+                                     upstream_status=upstream_status,
+                                     duration_ms=duration_ms,
+                                     connect_duration_ms=connect_duration_ms)
+        return wrap_stream(iterable, self.router, attempt,
+                           runtime_handle=self, check_done=check_done,
+                           upstream_status=upstream_status,
+                           duration_ms=duration_ms,
+                           connect_duration_ms=connect_duration_ms)
 
     def cache_hit(self, usage: Any = None, cost: Any = None):
         """Record a cache hit (no Attempt created)."""
@@ -347,21 +427,15 @@ class GatewayRuntimeHandle:
         )
 
     def finalize(self):
-        """End the Router span + clean all registries/context (fail-open)."""
+        """End the Router span + clean all registries/context (fail-open).
+
+        Router.close() force-closes any still-open Attempt (spans are always
+        ended — never just dropped from the registry).
+        """
         if self._closed:
             return
         self._closed = True
-        try:
-            self._runtime.finalize_router(self.router)
-        finally:
-            # Guarantee cleanup even if finalize raised.
-            try:
-                if self.router is not None and self.router.span is not None:
-                    self._runtime.attempt_registry.remove(
-                        self.router.span.trace_id, self.router.span.span_id
-                    )
-            except Exception:
-                pass
+        self._runtime.finalize_router(self.router)
 
     def close(self):
         self.finalize()

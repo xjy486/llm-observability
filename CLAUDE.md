@@ -42,8 +42,10 @@
 - db.get_trace_summaries() returns {"traces": [...], "total": int} dict
 
 ## Current Status
-- Active development: **Phase 2.4** — generic runnable/callback instrumentation (spec: docs/llm-observability-phase2.4-generic-runnable-callback-development-spec.md).
-- Phase 2.1 (SDK & Agent Trace) is **COMPLETE / FROZEN**. Latest suite: 156 tests pass (SDK + proxy/core).
+- Active development: **Phase 3 — Gateway Native Observability** rework is complete; the gateway-observability contract + runtime are frozen in `openspec/specs/gateway-observability-{contract,runtime}/`. Source under `sdk/python/llm_observability/gateway_observability/` (17 modules: runtime, router_span, attempt_span, streaming, recorder, privacy, cost, usage, events, context, registry, propagation, adapter, attributes, errors, aggregation, `__init__`).
+- Phases 2.1–2.5 (SDK & Agent Trace / Tool Span / LangChain Auto-Instr / Runnable Callback / SDK parity) are **COMPLETE / FROZEN**.
+- Test suite: ~950+ tests pass (SDK + proxy/core + gateway observability). Run: `.venv/bin/python -m pytest sdk/tests/ tests/ -q`.
+- OpenSpec changes live under `openspec/changes/` (active) and `openspec/changes/archive/` (frozen history — never edit).
 - Repo: https://github.com/xjy486/llm-observability
 
 ## Phase History (detailed specs in docs/)
@@ -53,5 +55,7 @@
 | 2.1 SDK & Agent Trace | docs/application-sdk-agent-trace-development-spec.md, docs/llm-observability-phase2.1-*.md | COMPLETE / FROZEN |
 | 2.2 Tool Span | docs/llm-observability-phase2.2-*.md | done |
 | 2.3 LangChain Auto-Instr | docs/llm-observability-phase2.3-*.md | done |
-| 2.4 Runnable Callback | docs/llm-observability-phase2.4-generic-runnable-callback-development-spec.md | active |
+| 2.4 Runnable Callback | docs/llm-observability-phase2.4-generic-runnable-callback-development-spec.md | done |
+| 2.5 SDK Parity | docs/llm-observability-phase2.5-agentlens-sdk-parity-development-spec.md, docs/llm-observability-phase2.5-*.md | done |
+| 3 Gateway Native Obs | docs/llm-observability-phase3-*.md; frozen specs in openspec/specs/gateway-observability-{contract,runtime}/ | rework complete |
 - PRD: docs/LLM_Agent_Observability_PRD_v0.1.md

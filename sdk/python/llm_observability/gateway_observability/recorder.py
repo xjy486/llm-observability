@@ -12,6 +12,14 @@ from .events import filter_event_attributes
 
 logger = logging.getLogger("llm_obs.gateway.recorder")
 
+# Terminal lifecycle events — recorded at most once per bound span.
+_TERMINAL_EVENTS = frozenset({
+    event_names.EVENT_ATTEMPT_COMPLETED,
+    event_names.EVENT_ATTEMPT_FAILED,
+    event_names.EVENT_RESPONSE_COMPLETED,
+    event_names.EVENT_RESPONSE_FAILED,
+})
+
 
 class GatewayEventRecorder:
     """Record fixed gateway lifecycle events on a target span.
@@ -24,6 +32,7 @@ class GatewayEventRecorder:
     def __init__(self, span=None, privacy=None):
         self._span = span
         self._privacy = privacy
+        self._terminal_recorded: set = set()
 
     def bind(self, span):
         """Bind the recorder to a span (used before events fire)."""
@@ -37,10 +46,16 @@ class GatewayEventRecorder:
     def record(self, name: str, attributes: Optional[dict] = None) -> bool:
         """Record one fixed gateway event with whitelisted attributes.
 
-        Fail-open: any failure is logged and returns False.
+        Fail-open: any failure is logged and returns False. Terminal events
+        (attempt completed/failed, response completed/failed) are recorded at
+        most once per bound span.
         """
         if self._span is None:
             return False
+        if name in _TERMINAL_EVENTS:
+            if name in self._terminal_recorded:
+                return False
+            self._terminal_recorded.add(name)
         try:
             allowed = filter_event_attributes(attributes or {})
             if self._privacy is not None:
@@ -51,12 +66,21 @@ class GatewayEventRecorder:
             logger.error("Gateway event recording failed (%s): %s", name, e)
             return False
 
+    def _hashed_channel(self, channel_id):
+        """Hash a raw channel ID via the bound PrivacyGuard (None-safe)."""
+        if channel_id is None:
+            return None
+        if self._privacy is None:
+            return None  # never record an unhashed channel ID
+        return self._privacy.hash_channel_id(channel_id)
+
     # ── lifecycle helpers ──
 
     def route_selected(self, channel_id=None, provider=None, resolved_model=None, reason=None) -> bool:
         attrs = {}
-        if channel_id is not None:
-            attrs["channel_id"] = channel_id
+        hashed = self._hashed_channel(channel_id)
+        if hashed is not None:
+            attrs["channel_id"] = hashed
         if provider is not None:
             attrs["provider"] = provider
         if resolved_model is not None:
@@ -75,15 +99,19 @@ class GatewayEventRecorder:
             attrs["reason"] = reason
         return self.record(event_names.EVENT_RETRY_SCHEDULED, attrs)
 
-    def fallback_selected(self, channel_id=None, reason=None) -> bool:
-        """Record the to-channel + reason for a fallback transition.
+    def fallback_selected(self, from_channel_id=None, to_channel_id=None, reason=None) -> bool:
+        """Record a fallback transition with BOTH from/to channels (hashed).
 
-        The from-channel is conveyed by the caller via ``from_channel_id`` and
-        verified to differ from ``channel_id`` (see RouterSpan.fallback_selected).
+        The from-channel must differ from the to-channel (enforced by
+        ``RouterSpan.fallback_selected``). Raw channel IDs never appear.
         """
         attrs = {}
-        if channel_id is not None:
-            attrs["channel_id"] = channel_id
+        from_hashed = self._hashed_channel(from_channel_id)
+        to_hashed = self._hashed_channel(to_channel_id)
+        if from_hashed is not None:
+            attrs["from_channel_id"] = from_hashed
+        if to_hashed is not None:
+            attrs["to_channel_id"] = to_hashed
         if reason is not None:
             attrs["reason"] = reason
         return self.record(event_names.EVENT_FALLBACK_SELECTED, attrs)
@@ -92,8 +120,9 @@ class GatewayEventRecorder:
         attrs = {}
         if attempt_index is not None:
             attrs["attempt_index"] = attempt_index
-        if channel_id is not None:
-            attrs["channel_id"] = channel_id
+        hashed = self._hashed_channel(channel_id)
+        if hashed is not None:
+            attrs["channel_id"] = hashed
         if provider is not None:
             attrs["provider"] = provider
         if resolved_model is not None:

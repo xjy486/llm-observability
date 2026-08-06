@@ -11,18 +11,19 @@ Data models: ``RouteDecision`` (spec §8.2), ``AttemptContext`` (spec §8.3),
 and ``AttemptResult`` (internal aggregation unit).
 """
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
 
 from ..spans import Span, SpanKind
-from ..utils.ids import generate_span_id
+from ..utils.ids import generate_span_id, generate_trace_id
 from .attributes import ATTR_GATEWAY, ATTR_ROUTER, ATTR_USAGE, ATTR_COST, ROUTER
 from .attempt_span import AttemptSpan
 from .context import GatewayContext
 from .cost import NormalizedCost, add_cost, cost_to_attributes
 from .errors import GatewayError, ErrorCategory
-from .privacy import PrivacyGuard
+from .privacy import PrivacyGuard, set_gateway_attribute
 from .recorder import GatewayEventRecorder
 from .registry import AttemptRegistry, RouterRegistry
 from .usage import NormalizedUsage, add_usage, usage_to_attributes
@@ -114,6 +115,60 @@ _INTERNAL_STATE = {
     "request": None, "route_decision": None,
 }
 
+# Frozen trace origins (spec: trace origin three-value semantics).
+ORIGIN_SDK_CONTEXT = "sdk_context"
+ORIGIN_REMOTE_TRACEPARENT = "remote_traceparent"
+ORIGIN_GATEWAY_ROOT = "gateway_root"
+
+_ALL_ZERO_TRACE_ID = "0" * 32
+
+
+@dataclass(frozen=True)
+class ResolvedGatewayParent:
+    """Explicit result of Router parent resolution (never inferred indirectly).
+
+    Attributes:
+        trace_id: Always a valid W3C TraceID — 32 lowercase hex, never all zero.
+        parent_span_id: Parent span ID for sdk/remote origins; None for a root.
+        origin: One of ``sdk_context`` / ``remote_traceparent`` / ``gateway_root``.
+        upstream_trace_present: True iff origin is sdk_context or remote_traceparent.
+    """
+    trace_id: str
+    parent_span_id: Optional[str]
+    origin: str
+    upstream_trace_present: bool
+
+    @property
+    def trace_origin_attribute(self) -> str:
+        """The frozen ``gateway.trace_origin`` value for this origin."""
+        return {
+            ORIGIN_SDK_CONTEXT: "sdk",
+            ORIGIN_REMOTE_TRACEPARENT: "remote",
+            ORIGIN_GATEWAY_ROOT: "gateway",
+        }.get(self.origin, "gateway")
+
+
+def _new_valid_trace_id() -> str:
+    """Generate a valid W3C TraceID: 32 lowercase hex, never all zeros."""
+    trace_id = generate_trace_id()
+    if not trace_id or len(trace_id) != 32 or trace_id == _ALL_ZERO_TRACE_ID:
+        # Regenerate once; uuid4 hex is never all-zero in practice, but the
+        # contract forbids ever reporting one.
+        trace_id = generate_trace_id()
+        if not trace_id or len(trace_id) != 32 or trace_id == _ALL_ZERO_TRACE_ID:
+            trace_id = "1" + (trace_id or "0" * 32)[1:]
+    return trace_id.lower()
+
+
+def _is_valid_trace_id(trace_id: Optional[str]) -> bool:
+    """True iff trace_id is 32 hex chars and not all zeros."""
+    if not trace_id or not isinstance(trace_id, str):
+        return False
+    tid = trace_id.lower()
+    if len(tid) != 32 or tid == _ALL_ZERO_TRACE_ID:
+        return False
+    return all(c in "0123456789abcdef" for c in tid)
+
 
 class RouterSpan:
     """Context manager for a Router GATEWAY span (spec §4, §9.2).
@@ -161,8 +216,25 @@ class RouterSpan:
         self._closed = False
         self._started_at: float = 0.0
         self._ended_at: float = 0.0
+        self._resolved_parent: Optional[ResolvedGatewayParent] = None
 
         self._attempts: list[AttemptSpan] = []
+        self._open_attempts: dict[str, AttemptSpan] = {}
+        self._index_lock = threading.Lock()
+        # Independent re-entrant lock for the open-attempt registry: covers
+        # register/unregister/snapshot/force-close/clear so concurrent attempts,
+        # hedged requests, or a Router-finalize racing an Attempt-close cannot
+        # miss or double an entry. RLock because force_close → close →
+        # unregister re-enters the lock.
+        self._open_attempts_lock = threading.RLock()
+        # Aggregate lock: guards register_attempt_result's mutation of
+        # _success_count / _fail_count / _final_error / _final_http_status /
+        # _final_channel_id / _ttft_ms / _usage_aggregate / _cost_aggregate,
+        # plus the cache-hit direct setters and the aggregate read at finalize.
+        # Required so concurrent (hedged / parallel provider) attempt results
+        # aggregate without lost updates or torn read-modify-writes.
+        self._aggregate_lock = threading.RLock()
+        self._used_attempt_indices: set[int] = set()
         self._attempt_count = 0
         self._success_count = 0
         self._fail_count = 0
@@ -182,12 +254,26 @@ class RouterSpan:
 
         self.recorder = GatewayEventRecorder(span=None, privacy=self._privacy)
 
+    def _set_attr(self, span, key, value):
+        """Write an external-string span attribute through the unified guard.
+
+        External strings (route, request_id, provider, model names, reasons,
+        policy names, error type/message, …) MUST go through this so the
+        PrivacyGuard applies whitelist + secret masking + URL-query stripping +
+        length limits. Internal counters, booleans, hashed channel IDs and
+        numeric metrics are written directly elsewhere.
+        """
+        return set_gateway_attribute(span, key, value, self._privacy)
+
     # ── lifecycle ──
 
     def start(self) -> "RouterSpan":
         """Create and start the Router span (fail-open)."""
         try:
-            trace_id, parent_span_id, root_parent = self._resolve_parents()
+            resolved = self._resolve_parent()
+            self._resolved_parent = resolved
+            trace_id = resolved.trace_id
+            parent_span_id = resolved.parent_span_id
             span_id = generate_span_id()
             span = Span(
                 trace_id=trace_id,
@@ -198,36 +284,48 @@ class RouterSpan:
             )
             rc = self._request_context
             if rc is not None:
-                span.set_attribute(ATTR_GATEWAY["name"], rc.gateway_name)
+                self._set_attr(span, ATTR_GATEWAY["name"], rc.gateway_name)
                 if rc.gateway_version:
-                    span.set_attribute(ATTR_GATEWAY["version"], rc.gateway_version)
+                    self._set_attr(span, ATTR_GATEWAY["version"], rc.gateway_version)
                 if rc.request_id:
-                    span.set_attribute(ATTR_GATEWAY["request_id"], rc.request_id)
-                span.set_attribute(ATTR_GATEWAY["protocol"], rc.protocol or "openai-compatible")
+                    self._set_attr(span, ATTR_GATEWAY["request_id"], rc.request_id)
+                self._set_attr(span, ATTR_GATEWAY["protocol"], rc.protocol or "openai-compatible")
                 if rc.route:
-                    span.set_attribute(ATTR_GATEWAY["route"], rc.route)
-                span.set_attribute(ATTR_GATEWAY["trace_origin"], "gateway" if root_parent is None else "sdk")
-                span.set_attribute(ATTR_GATEWAY["upstream_trace_present"], root_parent is not None)
+                    self._set_attr(span, ATTR_GATEWAY["route"], rc.route)
                 if rc.requested_model:
-                    span.set_attribute(ATTR_ROUTER["requested_model"], rc.requested_model)
+                    self._set_attr(span, ATTR_ROUTER["requested_model"], rc.requested_model)
+                # Full association field set — written to the Span top-level
+                # fields using the EXISTING Span Record naming (``business_scene``,
+                # never a second ``business_scenario`` spelling), sanitized +
+                # length-limited + control-char-stripped.
                 if rc.user_id:
-                    span.set_attribute("user_id", rc.user_id)
+                    span.user_id = self._privacy.sanitize_association(rc.user_id)
                 if rc.session_id:
-                    span.set_attribute("session_id", rc.session_id)
+                    span.session_id = self._privacy.sanitize_association(rc.session_id)
+                if rc.message_id:
+                    span.message_id = self._privacy.sanitize_association(rc.message_id)
+                if rc.app_name:
+                    span.app_name = self._privacy.sanitize_association(rc.app_name)
+                if rc.business_scenario:
+                    span.business_scene = self._privacy.sanitize_association(rc.business_scenario)
+            # Frozen trace-origin semantics, derived from the explicit
+            # resolution — never inferred from "whether a parent exists".
+            span.set_attribute(ATTR_GATEWAY["trace_origin"], resolved.trace_origin_attribute)
+            span.set_attribute(ATTR_GATEWAY["upstream_trace_present"], resolved.upstream_trace_present)
             span.set_attribute(ATTR_GATEWAY["span_role"], ROUTER)
 
             rd = self._route_decision
             if rd is not None:
                 if rd.provider:
-                    span.set_attribute(ATTR_ROUTER["provider"], rd.provider)
+                    self._set_attr(span, ATTR_ROUTER["provider"], rd.provider)
                 if rd.resolved_model:
-                    span.set_attribute(ATTR_ROUTER["resolved_model"], rd.resolved_model)
+                    self._set_attr(span, ATTR_ROUTER["resolved_model"], rd.resolved_model)
                 if rd.channel_type:
-                    span.set_attribute(ATTR_ROUTER["channel_type"], rd.channel_type)
+                    self._set_attr(span, ATTR_ROUTER["channel_type"], rd.channel_type)
                 if rd.route_reason:
-                    span.set_attribute(ATTR_ROUTER["route_reason"], rd.route_reason)
+                    self._set_attr(span, ATTR_ROUTER["route_reason"], rd.route_reason)
                 if rd.policy_name:
-                    span.set_attribute(ATTR_ROUTER["policy_name"], rd.policy_name)
+                    self._set_attr(span, ATTR_ROUTER["policy_name"], rd.policy_name)
                 if rd.channel_id:
                     self._final_channel_id = rd.channel_id
                     span.set_attribute(
@@ -248,42 +346,82 @@ class RouterSpan:
                 self._router_registry.register(trace_id, span_id, self)
             self._token, _ = GatewayContext.enter_router(self)
             self._ctx_token = self._token
+
+            # Route lifecycle events (gateway.route.started → route.selected).
+            if rd is not None:
+                self.recorder.record("gateway.route.started", {})
+                self.recorder.route_selected(
+                    channel_id=rd.channel_id,
+                    provider=rd.provider,
+                    resolved_model=rd.resolved_model,
+                    reason=rd.route_reason,
+                )
         except Exception as e:
             logger.error("Router span start failed: %s", e)
         return self
 
-    def _resolve_parents(self):
-        """Return (trace_id, parent_span_id, root_parent_object).
+    def _resolve_parent(self) -> ResolvedGatewayParent:
+        """Resolve the Router's parent into an explicit, frozen result.
 
-        Parent = active SDK LLM span when present; else the upstream trace
-        (inherited traceparent) with the Router as a child of the upstream
-        parent span; else the Router is the Root (no fabricated LLM/AGENT).
-        root_parent_object is None when no SDK context is active.
+        Order: in-process SDK context → upstream ``traceparent`` → local root.
+        A local root always gets a freshly generated, valid (non-zero, 32-hex)
+        TraceID — a Router NEVER reports a null or all-zero TraceID.
         """
         try:
             from ..context import get_current_context
             ctx = get_current_context()
             if ctx is not None:
-                return ctx.trace_id, ctx.span_id, ctx
+                trace_id = getattr(ctx, "trace_id", None)
+                if _is_valid_trace_id(trace_id):
+                    return ResolvedGatewayParent(
+                        trace_id=trace_id.lower(),
+                        parent_span_id=getattr(ctx, "span_id", None),
+                        origin=ORIGIN_SDK_CONTEXT,
+                        upstream_trace_present=True,
+                    )
         except Exception:
             pass
-        if self._upstream_trace_id:
-            return self._upstream_trace_id, self._upstream_parent_span_id, None
-        return None, None, None
+        if _is_valid_trace_id(self._upstream_trace_id):
+            return ResolvedGatewayParent(
+                trace_id=self._upstream_trace_id.lower(),
+                parent_span_id=self._upstream_parent_span_id,
+                origin=ORIGIN_REMOTE_TRACEPARENT,
+                upstream_trace_present=True,
+            )
+        return ResolvedGatewayParent(
+            trace_id=_new_valid_trace_id(),
+            parent_span_id=None,
+            origin=ORIGIN_GATEWAY_ROOT,
+            upstream_trace_present=False,
+        )
 
     def close(self):
         """End the Router span at a terminal state (fail-open).
 
-        Final status reflects the last attempt or a route-level decision
-        (cache hit / rate-limit rejection). Usage/Cost aggregate and all
-        counters are recorded before end. Registry + ContextVar always cleaned.
+        Any still-open Attempt is force-closed first (never just dropped from
+        the registry). Final status reflects the last attempt or a route-level
+        decision (cache hit / rate-limit rejection). Usage/Cost aggregate and
+        all counters are recorded before end. Registry + ContextVar always
+        cleaned.
         """
         if self._closed:
             return
-        self._closed = True
+        # Enter the terminal state atomically with the open-attempt snapshot
+        # so a concurrent register either is captured in the snapshot or
+        # observes _closed and is rejected (Blocker 2: no post-finalize
+        # registration / orphan span leak).
         try:
+            with self._open_attempts_lock:
+                if self._closed:
+                    return
+                self._closed = True
+        except Exception:
+            self._closed = True
+        try:
+            self._force_close_open_attempts()
             try:
                 if self._span is not None:
+                    self._record_terminal_event()
                     self._span.end()
                     self._ended_at = self._span.end_time
                     self._apply_aggregates()
@@ -298,23 +436,113 @@ class RouterSpan:
         finally:
             self._cleanup()
 
+    def _force_close_open_attempts(self):
+        """Force-close every Attempt still open when the Router finalizes.
+
+        A business exception between Attempt start and close must not leak an
+        open span / registry entry / active-attempt ContextVar. The snapshot
+        + clear happen under the registry lock so a concurrent Attempt close
+        cannot mutate the dict mid-iteration or re-register after clear.
+        """
+        try:
+            with self._open_attempts_lock:
+                open_attempts = list(self._open_attempts.values())
+                self._open_attempts.clear()
+        except Exception:
+            open_attempts = []
+        for attempt in open_attempts:
+            try:
+                attempt.force_close(
+                    category=ErrorCategory.GATEWAY_INTERNAL,
+                    reason="router_finalized_with_open_attempt",
+                )
+            except Exception as e:
+                logger.error("Router force-close of open attempt failed: %s", e)
+
+    # ── open-attempt registry ──
+
+    def register_open_attempt(self, attempt: AttemptSpan) -> bool:
+        """Track an Attempt as open (called on Attempt start).
+
+        Returns True if registered, False if the Router is already closed
+        (terminal) — in which case registration is a no-op and the caller
+        (Attempt.start) must take the fail-open no-op telemetry path so no
+        orphan span / registry entry / active-attempt ContextVar is created.
+        """
+        try:
+            key = attempt.span.span_id if attempt.span is not None else str(id(attempt))
+            with self._open_attempts_lock:
+                if self._closed:
+                    return False
+                self._open_attempts[key] = attempt
+                return True
+        except Exception as e:
+            logger.error("Router open-attempt register failed: %s", e)
+            return False
+
+    def unregister_open_attempt(self, attempt: AttemptSpan):
+        """Stop tracking an Attempt (called on Attempt close/force_close)."""
+        try:
+            key = attempt.span.span_id if attempt.span is not None else str(id(attempt))
+            with self._open_attempts_lock:
+                self._open_attempts.pop(key, None)
+        except Exception as e:
+            logger.error("Router open-attempt unregister failed: %s", e)
+
+    @property
+    def open_attempt_count(self) -> int:
+        try:
+            with self._open_attempts_lock:
+                return len(self._open_attempts)
+        except Exception:
+            return 0
+
+    def _record_terminal_event(self):
+        """Record ``gateway.response.completed``/``gateway.response.failed``
+        exactly once, before the span ends (P1-3 lifecycle wiring)."""
+        try:
+            if self._span is None:
+                return
+            if self._final_error is not None:
+                self.recorder.response_failed(
+                    error_category=self._final_error.category,
+                    http_status_code=self._final_http_status,
+                )
+            else:
+                self.recorder.response_completed(http_status_code=self._final_http_status)
+        except Exception as e:
+            logger.error("Router terminal event failed: %s", e)
+
     def _apply_aggregates(self):
         try:
             if self._span is None:
                 return
             span = self._span
-            span.set_attribute(ATTR_ROUTER["attempt_count"], self._attempt_count)
-            span.set_attribute(ATTR_ROUTER["retry_count"], self._retry_count)
-            span.set_attribute(ATTR_ROUTER["fallback_count"], self._fallback_count)
-            if self._cache_status:
-                span.set_attribute(ATTR_ROUTER["cache_status"], self._cache_status)
-            if self._final_channel_id:
+            # Snapshot the aggregate state under _aggregate_lock so a racing
+            # register_attempt_result cannot produce a torn read at finalize.
+            with self._aggregate_lock:
+                attempt_count = self._attempt_count
+                retry_count = self._retry_count
+                fallback_count = self._fallback_count
+                cache_status = self._cache_status
+                final_channel_id = self._final_channel_id
+                ttft_ms = self._ttft_ms
+                final_http_status = self._final_http_status
+                final_error = self._final_error
+                usage_attrs = usage_to_attributes(self._usage_aggregate)
+                cost_attrs = cost_to_attributes(self._cost_aggregate)
+            span.set_attribute(ATTR_ROUTER["attempt_count"], attempt_count)
+            span.set_attribute(ATTR_ROUTER["retry_count"], retry_count)
+            span.set_attribute(ATTR_ROUTER["fallback_count"], fallback_count)
+            if cache_status:
+                span.set_attribute(ATTR_ROUTER["cache_status"], cache_status)
+            if final_channel_id:
                 span.set_attribute(
                     ATTR_ROUTER["channel_id"],
-                    self._privacy.hash_channel_id(self._final_channel_id),
+                    self._privacy.hash_channel_id(final_channel_id),
                 )
-            if self._ttft_ms is not None:
-                span.set_attribute(ATTR_ROUTER["ttft_ms"], self._ttft_ms)
+            if ttft_ms is not None:
+                span.set_attribute(ATTR_ROUTER["ttft_ms"], ttft_ms)
             if self._queue_duration_ms is not None:
                 span.set_attribute(ATTR_ROUTER["queue_duration_ms"], self._queue_duration_ms)
             if self._auth_duration_ms is not None:
@@ -326,15 +554,15 @@ class RouterSpan:
                     ATTR_ROUTER["total_duration_ms"],
                     round((self._ended_at - self._started_at) * 1000, 2),
                 )
-            if self._final_http_status is not None:
-                span.set_attribute(ATTR_ROUTER["final_http_status_code"], self._final_http_status)
-            if self._final_error is not None:
-                span.set_attribute(ATTR_ROUTER["final_error_category"], self._final_error.category)
-                if self._final_error.type:
-                    span.set_attribute(ATTR_ROUTER["final_error_type"], self._final_error.type)
-            for key, value in usage_to_attributes(self._usage_aggregate).items():
+            if final_http_status is not None:
+                span.set_attribute(ATTR_ROUTER["final_http_status_code"], final_http_status)
+            if final_error is not None:
+                span.set_attribute(ATTR_ROUTER["final_error_category"], final_error.category)
+                if final_error.type:
+                    self._set_attr(span, ATTR_ROUTER["final_error_type"], final_error.type)
+            for key, value in usage_attrs.items():
                 span.set_attribute(key, value)
-            for key, value in cost_to_attributes(self._cost_aggregate).items():
+            for key, value in cost_attrs.items():
                 span.set_attribute(key, value)
         except Exception as e:
             logger.error("Router aggregate apply failed: %s", e)
@@ -350,9 +578,14 @@ class RouterSpan:
                 self._span.set_status("ERROR")
                 return
             if self._final_error is not None:
+                # Router and Attempt terminal states must agree: a final
+                # classified error (incl. client_cancelled / timeout /
+                # stream_interrupted) makes the Router ERROR.
                 self._span.set_status("ERROR")
-            elif self._fail_count == 0 and self._success_count > 0:
-                self._span.set_status("OK")
+            elif self._fail_count > 0 and self._success_count == 0:
+                # Every attempt failed but no classified error survived —
+                # still an error, never OK.
+                self._span.set_status("ERROR")
             else:
                 self._span.set_status("OK")
         except Exception as e:
@@ -371,8 +604,9 @@ class RouterSpan:
                 self._token = None
         except Exception as e:
             logger.error("Router context cleanup failed: %s", e)
-        # Force-clear so no stale Router ContextVar survives even when the
-        # reset token belonged to another asyncio Context (streaming task).
+        # Clear the whole gateway context (both slots) only when this Router
+        # is the active one — Router terminal state is the ONLY place allowed
+        # to clear the Router slot.
         try:
             from .context import clear_gateway_context
             current = GatewayContext.get()
@@ -393,6 +627,43 @@ class RouterSpan:
 
     # ── Attempt lifecycle ──
 
+    def allocate_attempt_index(self, explicit_index: Optional[int] = None) -> int:
+        """Allocate the attempt index for a new Attempt (thread-safe).
+
+        Rules (frozen):
+        - No explicit value → next auto-allocated index.
+        - Explicit valid positive integer, unused → use it.
+        - Explicit duplicate → remap to the next available value + warning.
+        - Zero / negative / non-integer → fall back to auto-allocation.
+        """
+        with self._index_lock:
+            candidate: Optional[int] = None
+            if explicit_index is not None:
+                try:
+                    if isinstance(explicit_index, bool):
+                        raise ValueError("bool is not a valid attempt index")
+                    parsed = int(explicit_index)
+                    if parsed >= 1 and parsed == explicit_index:
+                        candidate = parsed
+                except (TypeError, ValueError):
+                    candidate = None
+            if candidate is not None:
+                if candidate not in self._used_attempt_indices:
+                    self._used_attempt_indices.add(candidate)
+                    self._attempt_count = len(self._used_attempt_indices)
+                    return candidate
+                logger.warning(
+                    "Duplicate explicit attempt_index %s — remapping to next available",
+                    candidate,
+                )
+            # Auto-allocate the smallest unused positive index.
+            next_index = 1
+            while next_index in self._used_attempt_indices:
+                next_index += 1
+            self._used_attempt_indices.add(next_index)
+            self._attempt_count = len(self._used_attempt_indices)
+            return next_index
+
     def attempt(
         self,
         attempt_index: Optional[int] = None,
@@ -404,12 +675,24 @@ class RouterSpan:
     ) -> AttemptSpan:
         """Create a fresh AttemptSpan under this Router (spec §13.2).
 
-        Each call produces a new, unique Attempt span — never reused.
+        Each call produces a new, unique Attempt span — never reused. The
+        index is NOT allocated here; it is allocated atomically with
+        registration in ``activate_attempt`` (called from ``Attempt.start``),
+        so a Router that finalizes before activation cannot bump
+        ``attempt_count`` / ``_used_attempt_indices`` without a real,
+        activatable Attempt. When the Router is already closed, returns a
+        no-op AttemptSpan; ``Attempt.start()`` independently re-checks.
         """
-        index = attempt_index if attempt_index is not None else self._attempt_count + 1
+        if self._closed:
+            return AttemptSpan(
+                router=self, attempt_index=0, provider=provider,
+                channel_id=channel_id, channel_type=channel_type,
+                resolved_model=resolved_model, timeout_ms=timeout_ms,
+                privacy=self._privacy, registry=None, tracer=None, sampled=False,
+            )
         attempt = AttemptSpan(
             router=self,
-            attempt_index=index,
+            attempt_index=0,
             provider=provider,
             channel_id=channel_id,
             channel_type=channel_type,
@@ -420,50 +703,79 @@ class RouterSpan:
             tracer=self._tracer,
             sampled=self._sampled,
         )
-        self._attempt_count = max(self._attempt_count, index)
-        self._attempts.append(attempt)
+        attempt._explicit_index = attempt_index
         return attempt
+
+    def activate_attempt(self, attempt: AttemptSpan) -> bool:
+        """Atomically activate an Attempt: closed-check + index allocation +
+        open-registry registration + append to the attempts list.
+
+        Returns True if activated (``attempt._attempt_index`` set, registered),
+        False if the Router is closed. All under ``_open_attempts_lock`` so a
+        Router finalize cannot interleave between the closed-check, the index
+        allocation, and the registration — ``attempt_count`` only moves when a
+        real, activatable Attempt exists. ``allocate_attempt_index`` nests
+        ``_index_lock`` inside this lock (ordering: open_attempts → index,
+        never reversed).
+        """
+        try:
+            with self._open_attempts_lock:
+                if self._closed:
+                    return False
+                index = self.allocate_attempt_index(getattr(attempt, "_explicit_index", None))
+                attempt._attempt_index = index
+                self._attempts.append(attempt)
+                key = attempt.span.span_id if attempt.span is not None else str(id(attempt))
+                self._open_attempts[key] = attempt
+                return True
+        except Exception as e:
+            logger.error("Router activate_attempt failed: %s", e)
+            return False
 
     def register_attempt_result(self, result: AttemptResult):
         """Aggregate one attempt's outcome into the Router (fail-open).
 
         Failed attempts with Provider-returned usage still contribute to the
-        aggregate (spec §12.2).
+        aggregate (spec §12.2). The whole mutation runs under _aggregate_lock
+        so concurrent (hedged / parallel provider) results aggregate without
+        lost count updates or overwritten usage/cost aggregates.
         """
         try:
-            self._attempt_count = max(self._attempt_count, result.attempt_index or self._attempt_count)
-            if result.success:
-                self._success_count += 1
-                if result.channel_id:
-                    self._final_channel_id = result.channel_id
-                if result.http_status_code is not None:
-                    self._final_http_status = result.http_status_code
-            else:
-                self._fail_count += 1
-                if result.http_status_code is not None:
-                    self._final_http_status = result.http_status_code
-                if result.channel_id:
-                    self._final_channel_id = result.channel_id
-            # Final error reflects the LAST attempt's outcome: a later success
-            # clears the error left by an earlier failed attempt (spec §13.2).
-            self._final_error = result.error
-            if result.ttft_ms is not None and self._ttft_ms is None:
-                self._ttft_ms = result.ttft_ms
-            # Always aggregate usage/cost (including failed attempts).
-            if result.usage is not None:
-                self._usage_aggregate = add_usage(self._usage_aggregate, result.usage)
-            if result.cost is not None:
-                self._cost_aggregate = add_cost(self._cost_aggregate, result.cost)
+            with self._aggregate_lock:
+                if result.success:
+                    self._success_count += 1
+                    if result.channel_id:
+                        self._final_channel_id = result.channel_id
+                    if result.http_status_code is not None:
+                        self._final_http_status = result.http_status_code
+                else:
+                    self._fail_count += 1
+                    if result.http_status_code is not None:
+                        self._final_http_status = result.http_status_code
+                    if result.channel_id:
+                        self._final_channel_id = result.channel_id
+                # Final error reflects the LAST attempt's outcome: a later success
+                # clears the error left by an earlier failed attempt (spec §13.2).
+                self._final_error = result.error
+                if result.ttft_ms is not None and self._ttft_ms is None:
+                    self._ttft_ms = result.ttft_ms
+                # Always aggregate usage/cost (including failed attempts).
+                if result.usage is not None:
+                    self._usage_aggregate = add_usage(self._usage_aggregate, result.usage)
+                if result.cost is not None:
+                    self._cost_aggregate = add_cost(self._cost_aggregate, result.cost)
         except Exception as e:
             logger.error("Router attempt aggregation failed: %s", e)
 
     def set_usage_aggregate(self, usage: NormalizedUsage):
         """Directly set the Router usage aggregate (e.g. cache hit with usage)."""
-        self._usage_aggregate = usage
+        with self._aggregate_lock:
+            self._usage_aggregate = usage
 
     def set_cost_aggregate(self, cost: NormalizedCost):
         """Directly set the Router cost aggregate."""
-        self._cost_aggregate = cost
+        with self._aggregate_lock:
+            self._cost_aggregate = cost
 
     # ── route decision helpers (spec §13-14) ──
 
@@ -488,7 +800,9 @@ class RouterSpan:
         self._fallback_count += 1
         if to_channel_id is not None:
             self._final_channel_id = to_channel_id
-        return self.recorder.fallback_selected(channel_id=to_channel_id, reason=reason)
+        return self.recorder.fallback_selected(
+            from_channel_id=from_channel_id, to_channel_id=to_channel_id, reason=reason
+        )
 
     def set_cache_status(self, status: str):
         """Record a cache decision: hit → no attempt, cache_status=hit."""
@@ -536,6 +850,20 @@ class RouterSpan:
         self._route_duration_ms = route_duration_ms
 
     # ── properties ──
+
+    @property
+    def resolved_parent(self) -> Optional[ResolvedGatewayParent]:
+        """The explicit parent resolution (available after ``start()``)."""
+        return self._resolved_parent
+
+    @property
+    def open_attempts(self) -> list:
+        """Snapshot of currently open Attempts."""
+        try:
+            with self._open_attempts_lock:
+                return list(self._open_attempts.values())
+        except Exception:
+            return []
 
     @property
     def span(self) -> Optional[Span]:

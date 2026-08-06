@@ -82,18 +82,11 @@ jobs:
       - run: pip install -r requirements/base.txt
       - run: pip install -e sdk/python
       - run: |
-          python -m pytest sdk/tests/gateway_observability/test_router_span.py \
-            sdk/tests/gateway_observability/test_attempt_span.py \
-            sdk/tests/gateway_observability/test_retry.py \
-            sdk/tests/gateway_observability/test_fallback.py \
-            sdk/tests/gateway_observability/test_cache_rate_limit.py \
-            sdk/tests/gateway_observability/test_usage.py \
-            sdk/tests/gateway_observability/test_cost.py \
-            sdk/tests/gateway_observability/test_privacy.py \
-            sdk/tests/gateway_observability/test_sampling.py \
-            sdk/tests/gateway_observability/test_fail_open.py \
-            sdk/tests/gateway_observability/test_registry_cleanup.py \
-            -q --tb=short
+          python -m pytest sdk/tests/gateway_observability/ -q --tb=short \
+            --ignore=sdk/tests/gateway_observability/test_real_gateway_e2e.py \
+            --ignore=sdk/tests/gateway_observability/test_oneapi_adapter.py \
+            --ignore=sdk/tests/gateway_observability/test_e2e_scenarios.py \
+            --ignore=sdk/tests/gateway_observability/test_streaming.py
 
   oneapi-adapter-tests:
     name: One-API Adapter Tests
@@ -121,7 +114,8 @@ jobs:
       - run: pip install -r requirements/base.txt
       - run: pip install -e sdk/python
       - run: |
-          python -m pytest sdk/tests/gateway_observability/test_streaming.py -q --tb=short
+          python -m pytest sdk/tests/gateway_observability/test_streaming.py \
+            sdk/tests/gateway_observability/test_stream_terminal_state.py -q --tb=short
 
   real-e2e:
     name: Real E2E (Live Endpoint)
@@ -146,9 +140,52 @@ jobs:
           test -n "$E2E_MODEL" || { echo "E2E_MODEL secret is required"; exit 1; }
           python -m pytest sdk/tests/test_phase2_5_real_e2e.py -q --tb=short
 
-  # ── NOTE: gateway-real-e2e (task 9.2) is deferred to Phase 3.1. ──
-  # Round one ships the Gateway contract + runtime validated by the OFFLINE mock
-  # harness E2E (Scenario A–J) in oneapi-adapter-tests — no real gateway key is
-  # needed. A real One-API gateway E2E (One-API instance + a One-API token, NOT
-  # a single-vendor model key) is added when the One-API adapter is wired into
-  # the gateway server (Phase 3.1). See design.md D12 + spec §23/§30.
+  gateway-real-e2e:
+    name: Gateway Real E2E
+    runs-on: ubuntu-latest
+    # Trusted branches only; the whole job is skipped on fork PRs (secrets
+    # are unavailable there). On trusted branches missing secrets FAIL.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements/base.txt
+      - run: pip install -e sdk/python
+      - env:
+          # Unified gateway E2E env-var names (read by the test under these
+          # exact names). Values are sourced from the existing E2E_* secrets —
+          # both point at the same OpenAI-compatible endpoint, so no new
+          # GATEWAY_E2E_* secrets need to be provisioned. Missing secrets still
+          # FAIL the job on trusted branches via the test -n guards below.
+          GATEWAY_E2E_API_KEY: ${{ secrets.E2E_API_KEY }}
+          GATEWAY_E2E_BASE_URL: ${{ secrets.E2E_BASE_URL }}
+          GATEWAY_E2E_MODEL: ${{ secrets.E2E_MODEL }}
+        run: |
+          # Rework P0-6: fail (not skip) when secrets are missing on trusted branches.
+          test -n "$GATEWAY_E2E_API_KEY" || { echo "GATEWAY_E2E_API_KEY secret is required"; exit 1; }
+          test -n "$GATEWAY_E2E_BASE_URL" || { echo "GATEWAY_E2E_BASE_URL secret is required"; exit 1; }
+          test -n "$GATEWAY_E2E_MODEL" || { echo "GATEWAY_E2E_MODEL secret is required"; exit 1; }
+          # Secrets are redacted via the Python filter (never a single-quoted
+          # sed expression embedding the raw secret).
+          set -o pipefail
+          python -m pytest sdk/tests/gateway_observability/test_real_gateway_e2e.py \
+            -q --tb=short -rs 2>&1 | tee /tmp/gateway_e2e.log | python scripts/redact_ci_secrets.py
+          # Gate: the suite must actually RUN tests and SKIP none of them.
+          python - <<'EOF'
+          import re, sys
+          log = open("/tmp/gateway_e2e.log", encoding="utf-8", errors="replace").read()
+          summary = log.strip().splitlines()[-1] if log.strip() else ""
+          passed = sum(int(n) for n in re.findall(r"(\d+) passed", summary))
+          skipped = sum(int(n) for n in re.findall(r"(\d+) skipped", summary))
+          failed = sum(int(n) for n in re.findall(r"(\d+) failed", summary))
+          errors = sum(int(n) for n in re.findall(r"(\d+) error", summary))
+          print(f"gateway-real-e2e gate: passed={passed} skipped={skipped} failed={failed} errors={errors}")
+          if failed or errors:
+              sys.exit("gateway real E2E had failures/errors")
+          if passed <= 0:
+              sys.exit("gateway real E2E ran ZERO tests — refusing a green no-op")
+          if skipped != 0:
+              sys.exit(f"gateway real E2E skipped {skipped} required tests — refusing silent skip")
+          EOF
