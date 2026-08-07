@@ -1,88 +1,11 @@
-# gateway-observability-contract Specification
+# Delta: gateway-observability-contract
 
-## Purpose
-TBD - created by archiving change add-gateway-native-observability-contract. Update Purpose after archive.
-## Requirements
-### Requirement: Router and Attempt GATEWAY span hierarchy over existing SpanKinds
+本 delta 收紧 Streaming 终态一致性（恰好一个 Terminal State，first terminal
+claim wins）、新增 `gateway.attempt.selected` 事件、冻结 Hedged/Parallel Winner 语
+义（Router 终态由显式 Winner 决定，Usage/Cost 仍聚合全部 Attempt，无 Winner 有
+确定性 Fail-safe）。不修改已归档历史。
 
-The system SHALL represent gateway-native observability using only the existing SpanKind set (`AGENT`, `TASK`, `TOOL`, `LLM`, `GATEWAY`) — never new kinds such as `ROUTER` or `PROVIDER`. The GATEWAY role SHALL be distinguished via the `gateway.span_role` attribute with value `router` or `provider_attempt`. When an SDK LLM span exists, the Router GATEWAY SHALL have `parent_span_id = SDK LLM span_id`; each Attempt GATEWAY SHALL have `parent_span_id = Router span_id`. All spans SHALL share the same TraceID. Every real upstream Provider request SHALL correspond to exactly one unique Attempt span.
-
-#### Scenario: SDK-originated gateway trace
-
-- **WHEN** an SDK LLM call routes through a gateway with two upstream attempts
-- **THEN** the trace contains exactly one Router GATEWAY span whose parent is the SDK LLM span
-- **AND** exactly two Attempt GATEWAY spans whose parent is the Router span
-- **AND** all spans share the same TraceID
-- **AND** no span uses a SpanKind other than the existing five
-
-#### Scenario: No shared Attempt span across retries
-
-- **WHEN** an upstream request fails and is retried
-- **THEN** each real upstream request produces its own new Attempt span
-- **AND** no Attempt span is reused or overwritten by a subsequent attempt
-
-#### Scenario: Attempt never bypasses Router
-
-- **WHEN** a gateway handles a request that has a Router span
-- **THEN** no Attempt GATEWAY span is a direct child of the SDK LLM span, bypassing the Router
-
-### Requirement: GATEWAY span attribute namespaces
-
-All GATEWAY spans SHALL carry the generic attributes `gateway.name`, `gateway.version`, `gateway.request_id`, `gateway.protocol`, `gateway.route`, `gateway.trace_origin`, `gateway.upstream_trace_present`, and `gateway.span_role`. Router spans SHALL additionally carry `gateway.requested_model`, `gateway.resolved_model`, `gateway.provider`, `gateway.channel_id`, `gateway.channel_type`, `gateway.route_reason`, `gateway.policy_name`, `gateway.retry_count`, `gateway.fallback_count`, `gateway.attempt_count`, `gateway.cache_status`, `gateway.queue_duration_ms`, `gateway.auth_duration_ms`, `gateway.route_duration_ms`, `gateway.total_duration_ms`, `gateway.ttft_ms`, `gateway.final_http_status_code`, `gateway.final_error_type`, and `gateway.final_error_category`. Attempt spans SHALL additionally carry `gateway.attempt_index`, `gateway.provider`, `gateway.channel_id`, `gateway.channel_type`, `gateway.resolved_model`, `gateway.upstream_request_id`, `gateway.upstream_http_status_code`, `gateway.upstream_duration_ms`, `gateway.upstream_connect_duration_ms`, `gateway.upstream_ttft_ms`, `gateway.timeout_ms`, `gateway.retryable`, `gateway.error_type`, `gateway.error_category`, `gateway.error_message`, and `gateway.finish_reason`. Usage attributes SHALL use `usage.input_tokens`, `usage.output_tokens`, `usage.total_tokens`, `usage.cached_input_tokens`, `usage.reasoning_tokens`, `usage.cache_creation_tokens`, `usage.cache_read_tokens`, and `usage.source`. Cost attributes SHALL use `cost.input`, `cost.output`, `cost.total`, `cost.currency`, and `cost.source`.
-
-`gateway.trace_origin` SHALL be frozen to exactly three values, derived from the explicit parent-resolution origin (never inferred indirectly from "whether a parent object exists"):
-
-- `sdk` — the parent came from the in-process SDK context; `gateway.upstream_trace_present` SHALL be `true`.
-- `remote` — the parent came from an upstream W3C `traceparent` header; `gateway.upstream_trace_present` SHALL be `true`.
-- `gateway` — no SDK context and no upstream traceparent; the Router is a local root; `gateway.upstream_trace_present` SHALL be `false`.
-
-`gateway.trace_origin` and `gateway.upstream_trace_present` SHALL always be consistent with the actual parent IDs on the span: `sdk`/`remote` implies a non-null parent reference, `gateway` implies the Router is the trace root.
-
-Router spans SHALL also carry the complete association field set — `user_id`, `session_id`, `message_id`, `app_name`, and the business-scenario value — written to the Span top-level fields using the EXISTING Span Record naming (`business_scene`; the incompatible spelling `business_scenario` SHALL NOT appear as a second field). Association precedence SHALL be: explicit gateway request value > remote association header/baggage > none. Association values SHALL be sanitized before recording. Attempt spans SHALL NOT duplicate sensitive association fields.
-
-#### Scenario: Router attributes present
-
-- **WHEN** a Router GATEWAY span ends after a successful routed request
-- **THEN** the span has `gateway.span_role = "router"` and populated `gateway.resolved_model`, `gateway.channel_id`, `gateway.attempt_count`, and `gateway.total_duration_ms`
-- **AND** usage attributes are populated from the Router aggregate
-
-#### Scenario: Attempt attributes present
-
-- **WHEN** an Attempt GATEWAY span ends after an upstream response
-- **THEN** the span has `gateway.span_role = "provider_attempt"` and populated `gateway.attempt_index`, `gateway.upstream_http_status_code`, and `gateway.upstream_duration_ms`
-- **AND** usage and cost attributes are populated for that single attempt
-
-#### Scenario: SDK context sets trace origin sdk
-
-- **WHEN** the Router's parent is resolved from the in-process SDK context
-- **THEN** the Router records `gateway.trace_origin = sdk` and `gateway.upstream_trace_present = true`
-- **AND** the Router's parent span ID equals the SDK LLM span ID
-
-#### Scenario: Remote traceparent sets trace origin remote
-
-- **WHEN** the Router's parent is resolved from an upstream `traceparent` header
-- **THEN** the Router records `gateway.trace_origin = remote` and `gateway.upstream_trace_present = true`
-- **AND** the Router's trace ID and parent span ID match the traceparent values
-
-#### Scenario: Local root sets trace origin gateway
-
-- **WHEN** neither SDK context nor an upstream traceparent exists
-- **THEN** the Router records `gateway.trace_origin = gateway` and `gateway.upstream_trace_present = false`
-- **AND** the Router has no parent span ID
-
-#### Scenario: Trace metadata consistent with parent IDs
-
-- **WHEN** any Router span is emitted
-- **THEN** `gateway.trace_origin = sdk` or `remote` implies a non-null parent reference
-- **AND** `gateway.trace_origin = gateway` implies the Router is the trace root
-
-#### Scenario: Router records all association fields
-
-- **WHEN** a gateway request carries `user_id`, `session_id`, `message_id`, `app_name`, and a business-scenario value
-- **THEN** the Router span records all five fields under names matching the existing Span Record convention
-- **AND** only one business-scenario field name appears
-- **AND** explicit gateway values override remote header/baggage values
-- **AND** association values are sanitized
+## MODIFIED Requirements
 
 ### Requirement: Gateway events
 
@@ -139,52 +62,6 @@ Terminal lifecycle events SHALL be mutually exclusive within a group: the `attem
 - **WHEN** the Router selects a Winner attempt
 - **THEN** a `gateway.attempt.selected` event is recorded with `attempt_index`, hashed `channel_id`, `provider`, and `reason`
 - **AND** the raw channel ID appears in no event attribute
-
-### Requirement: Retry, fallback, cache, and rate-limit semantics
-
-Each retry SHALL produce a new Attempt span and never mutate a prior attempt's data. A fallback SHALL record `gateway.fallback.selected` with explicit from/to channels and reason; recording only `retry_count += 1` without a channel switch is forbidden. On a cache hit the Router SHALL exist with `gateway.cache_status = hit` and `gateway.attempt_count = 0`, and no Provider Attempt SHALL be created. On a rate-limit rejection the Router SHALL end with status ERROR, `gateway.error_category = rate_limit`, and `gateway.attempt_count = 0`; no fake Attempt SHALL be created when no upstream request was made.
-
-The Router SHALL distinguish the business Winner from the set of all attempts. For a serial retry, the Winner is the last attempt the business layer accepted. For a hedged request, the Winner is the first attempt the business layer adopted and returned to the caller. For a fallback, the Winner is the post-fallback attempt that succeeded. When all attempts fail, the Winner is the attempt whose failure the business layer chose to surface. The Router SHALL provide an explicit `select_winner(attempt_index, reason)` API; the Winner SHALL only be selectable among already-activated attempts that already have an `AttemptResult`. When no Winner is explicitly selected: if exactly one Attempt exists, the Router SHALL auto-select it as the Winner (reason `auto_single_attempt`); if multiple Attempts exist with no explicit Winner, the Router SHALL end with status ERROR, `gateway.final_error_category = gateway_internal`, `gateway.final_error_type = MissingWinnerSelection`, and a `gateway.response.failed` event — the Router SHALL NOT silently treat the last-completing attempt as the Winner.
-
-#### Scenario: Cache hit creates no attempt
-
-- **WHEN** a cached request is served
-- **THEN** the Router span has `gateway.cache_status = hit` and `gateway.attempt_count = 0`
-- **AND** no Attempt span exists under the Router
-
-#### Scenario: Rate-limit rejection
-
-- **WHEN** the gateway rejects a request due to rate limiting before any upstream call
-- **THEN** the Router span ends with status ERROR and `gateway.error_category = rate_limit`
-- **AND** `gateway.attempt_count = 0`
-- **AND** no Attempt span exists
-
-#### Scenario: Serial retry winner is the accepted attempt
-
-- **WHEN** attempt 1 fails and attempt 2 succeeds and the business layer returns attempt 2
-- **THEN** the Router selects attempt 2 as the Winner
-- **AND** the Router final status is OK with attempt 2's channel and HTTP status
-- **AND** the Router Usage and Cost aggregates include both attempts
-
-#### Scenario: Hedged loser timeout does not override the winner
-
-- **WHEN** a hedged request's Winner has already succeeded and a losing attempt later times out
-- **THEN** the Router final status remains OK
-- **AND** the Router final channel and final error are the Winner's, not the loser's
-- **AND** the losing attempt's Usage and Cost are still included in the Router aggregate
-
-#### Scenario: Multiple attempts without explicit winner is deterministic
-
-- **WHEN** a Router finalizes with multiple Attempts and no explicit Winner selection
-- **THEN** the Router ends with status ERROR and `gateway.final_error_category = gateway_internal`
-- **AND** `gateway.final_error_type = MissingWinnerSelection`
-- **AND** a `gateway.response.failed` event is recorded
-
-#### Scenario: Single attempt auto-selected as winner
-
-- **WHEN** a Router has exactly one Attempt with an `AttemptResult` and no explicit Winner selection
-- **THEN** the Router auto-selects that Attempt as the Winner with reason `auto_single_attempt`
-- **AND** the Router final status, channel, and HTTP status are that Attempt's
 
 ### Requirement: Streaming lifecycle
 
@@ -336,90 +213,48 @@ Both streaming and non-streaming Attempts SHALL compute Cost from their own capt
 - **THEN** the second selection is idempotent (no duplicate `gateway.attempt.selected` event for the same index)
 - **AND** attempting to select an unknown or not-yet-activated attempt is rejected
 
-### Requirement: No-SDK gateway trace
+### Requirement: Retry, fallback, cache, and rate-limit semantics
 
-When a gateway request arrives with no upstream SDK trace, the gateway SHALL produce a trace with the Router GATEWAY as the Root Span and its Attempt spans as children. The system SHALL NOT fabricate an LLM or AGENT span. The Router SHALL carry `gateway.upstream_trace_present = false` and `gateway.trace_origin = gateway`.
+Each retry SHALL produce a new Attempt span and never mutate a prior attempt's data. A fallback SHALL record `gateway.fallback.selected` with explicit from/to channels and reason; recording only `retry_count += 1` without a channel switch is forbidden. On a cache hit the Router SHALL exist with `gateway.cache_status = hit` and `gateway.attempt_count = 0`, and no Provider Attempt SHALL be created. On a rate-limit rejection the Router SHALL end with status ERROR, `gateway.error_category = rate_limit`, and `gateway.attempt_count = 0`; no fake Attempt SHALL be created when no upstream request was made.
 
-#### Scenario: Direct gateway request
+The Router SHALL distinguish the business Winner from the set of all attempts. For a serial retry, the Winner is the last attempt the business layer accepted. For a hedged request, the Winner is the first attempt the business layer adopted and returned to the caller. For a fallback, the Winner is the post-fallback attempt that succeeded. When all attempts fail, the Winner is the attempt whose failure the business layer chose to surface. The Router SHALL provide an explicit `select_winner(attempt_index, reason)` API; the Winner SHALL only be selectable among already-activated attempts that already have an `AttemptResult`. When no Winner is explicitly selected: if exactly one Attempt exists, the Router SHALL auto-select it as the Winner (reason `auto_single_attempt`); if multiple Attempts exist with no explicit Winner, the Router SHALL end with status ERROR, `gateway.final_error_category = gateway_internal`, `gateway.final_error_type = MissingWinnerSelection`, and a `gateway.response.failed` event — the Router SHALL NOT silently treat the last-completing attempt as the Winner.
 
-- **WHEN** a client requests the gateway directly with no `traceparent` from an SDK
-- **THEN** a Router GATEWAY span is created as the Root Span with `gateway.upstream_trace_present = false` and `gateway.trace_origin = gateway`
-- **AND** the Attempt span's parent is the Router span
-- **AND** no LLM or AGENT span exists in the trace
+#### Scenario: Cache hit creates no attempt
 
-### Requirement: Error classification and safe error messages
+- **WHEN** a cached request is served
+- **THEN** the Router span has `gateway.cache_status = hit` and `gateway.attempt_count = 0`
+- **AND** no Attempt span exists under the Router
 
-The system SHALL classify gateway/upstream failures into a fixed taxonomy: `authentication`, `authorization`, `rate_limit`, `quota`, `timeout`, `connect_error`, `dns_error`, `tls_error`, `provider_4xx`, `provider_5xx`, `invalid_request`, `invalid_response`, `stream_interrupted`, `client_cancelled`, `gateway_internal`, `unknown`. Each failure SHALL be recorded as `gateway.error_type`, `gateway.error_category`, `gateway.error_message`, and `gateway.retryable`. Error messages SHALL be safe strings, length-limited, sanitized, and fail-closed. Telemetry SHALL NOT record Authorization headers, API Keys, Cookies, Provider secrets, full URL query strings, full response bodies, or full stack traces.
+#### Scenario: Rate-limit rejection
 
-#### Scenario: HTTP 500 classified as retryable provider_5xx
+- **WHEN** the gateway rejects a request due to rate limiting before any upstream call
+- **THEN** the Router span ends with status ERROR and `gateway.error_category = rate_limit`
+- **AND** `gateway.attempt_count = 0`
+- **AND** no Attempt span exists
 
-- **WHEN** an upstream returns HTTP 500
-- **THEN** the Attempt span records `gateway.error_category = provider_5xx` and `gateway.retryable = true`
+#### Scenario: Serial retry winner is the accepted attempt
 
-#### Scenario: Client cancel is distinct from provider error
+- **WHEN** attempt 1 fails and attempt 2 succeeds and the business layer returns attempt 2
+- **THEN** the Router selects attempt 2 as the Winner
+- **AND** the Router final status is OK with attempt 2's channel and HTTP status
+- **AND** the Router Usage and Cost aggregates include both attempts
 
-- **WHEN** a client disconnects mid-stream
-- **THEN** the Attempt and Router record `gateway.error_category = client_cancelled`
-- **AND** the status is not a normal provider error status
+#### Scenario: Hedged loser timeout does not override the winner
 
-#### Scenario: Secrets absent from error data
+- **WHEN** a hedged request's Winner has already succeeded and a losing attempt later times out
+- **THEN** the Router final status remains OK
+- **AND** the Router final channel and final error are the Winner's, not the loser's
+- **AND** the losing attempt's Usage and Cost are still included in the Router aggregate
 
-- **WHEN** any gateway span, event, or log is emitted during an error
-- **THEN** it contains no Authorization header, API Key, Cookie, or full stack trace value
+#### Scenario: Multiple attempts without explicit winner is deterministic
 
-### Requirement: Sampling inheritance and local root creation
+- **WHEN** a Router finalizes with multiple Attempts and no explicit Winner selection
+- **THEN** the Router ends with status ERROR and `gateway.final_error_category = gateway_internal`
+- **AND** `gateway.final_error_type = MissingWinnerSelection`
+- **AND** a `gateway.response.failed` event is recorded
 
-When a legitimate upstream `traceparent` exists, its sampling decision SHALL be honored: `trace_flags=01` SHALL sample and `trace_flags=00` SHALL NOT report. The gateway SHALL NOT re-randomize to override the upstream decision. With no upstream trace, the gateway SHALL create a Root Router according to a local `sample_rate`. When sampled out, the system SHALL still run business normally, still propagate `traceparent`, SHALL NOT perform large payload serialization, and SHALL NOT generate Reporter Records.
+#### Scenario: Single attempt auto-selected as winner
 
-#### Scenario: Upstream sampled-out is honored
-
-- **WHEN** an incoming `traceparent` has `trace_flags=00`
-- **THEN** the gateway performs the business request normally
-- **AND** no Reporter Record is generated
-- **AND** the upstream sampling decision is not overridden
-
-#### Scenario: No upstream trace creates sampled root
-
-- **WHEN** a request has no upstream trace and the local sample rate samples it in
-- **THEN** a Root Router span is created and reported
-
-#### Scenario: Sampled-out still propagates
-
-- **WHEN** the decision is not to sample
-- **THEN** the outgoing `traceparent` is still propagated to downstream
-
-### Requirement: Gateway telemetry is fully fail-open
-
-Any observability failure SHALL NOT change gateway business behavior. This covers Router span creation, Attempt span creation, event addition, Usage parsing, Cost calculation, span end, reporter failure, context reset, and streaming finalization. The system SHALL return business success when telemetry fails during a successful request, and SHALL preserve the original business exception when telemetry fails during a failing request.
-
-#### Scenario: Telemetry failure preserves business success
-
-- **WHEN** a request succeeds but an event add or span end raises
-- **THEN** the business result is returned unchanged
-
-#### Scenario: Telemetry failure preserves business error
-
-- **WHEN** a request fails with a business exception and span finalization also raises
-- **THEN** the original business exception is propagated
-
-#### Scenario: Fail-open on streaming finalization
-
-- **WHEN** stream finalization (wrapper close, registry cleanup, context reset) raises during a client cancel
-- **THEN** the client-visible behavior is unchanged and no secondary exception replaces the cancellation outcome
-
-### Requirement: Valid trace identity for gateway roots
-
-When neither an SDK context nor an upstream `traceparent` exists, the Router parent resolver SHALL generate a valid W3C TraceID: exactly 32 lowercase hexadecimal characters, never all zeros, and distinct across consecutive requests. The resolver SHALL return an explicit `ResolvedGatewayParent` (`trace_id`, `parent_span_id`, `origin`, `upstream_trace_present`) with `origin` in (`sdk_context`, `remote_traceparent`, `gateway_root`); a null or all-zero TraceID SHALL never be reported. Every Attempt SHALL inherit its Router's TraceID.
-
-#### Scenario: No-SDK router generates a valid trace ID
-
-- **WHEN** a gateway request arrives with no SDK context and no traceparent
-- **THEN** the Router's TraceID is 32 hexadecimal characters, not all zeros
-- **AND** consecutive such requests produce distinct TraceIDs
-- **AND** each Attempt inherits its Router's TraceID
-
-#### Scenario: Router never reports a null or all-zero trace ID
-
-- **WHEN** any Router span is created under any origin
-- **THEN** its TraceID is neither null nor all zeros
-
+- **WHEN** a Router has exactly one Attempt with an `AttemptResult` and no explicit Winner selection
+- **THEN** the Router auto-selects that Attempt as the Winner with reason `auto_single_attempt`
+- **AND** the Router final status, channel, and HTTP status are that Attempt's

@@ -42,9 +42,12 @@
 - db.get_trace_summaries() returns {"traces": [...], "total": int} dict
 
 ## Current Status
-- Active development: **Phase 3 — Gateway Native Observability** rework is complete; the gateway-observability contract + runtime are frozen in `openspec/specs/gateway-observability-{contract,runtime}/`. Source under `sdk/python/llm_observability/gateway_observability/` (17 modules: runtime, router_span, attempt_span, streaming, recorder, privacy, cost, usage, events, context, registry, propagation, adapter, attributes, errors, aggregation, `__init__`).
+- **Phase 3.0 — Gateway Contract & Runtime** is COMPLETE / FROZEN; the gateway-observability contract + runtime are frozen in `openspec/specs/gateway-observability-{contract,runtime}/`. Source under `sdk/python/llm_observability/gateway_observability/` (17 modules: runtime, router_span, attempt_span, streaming, recorder, privacy, cost, usage, events, context, registry, propagation, adapter, attributes, errors, aggregation, `__init__`). Phase 3.0 added: Streaming Terminal atomic state machine (first terminal claim wins), Hedged/Parallel Winner semantics (`RouterSpan.select_winner` + deterministic fail-safe incl. `MissingWinnerSelection`), Terminal Event mutual-exclusion groups, `gateway.attempt.selected` event, and unified Streaming Duration semantics.
+- **Phase 3.1 — One-API Production Integration** (real One-API lifecycle glue + containerized E2E) is **PENDING** (future change). The `OneApiAdapter` field-mapping adapter is part of 3.0 and frozen.
+- **Phase 3.2 — Gateway UI & Metrics** (Router Detail / Attempt Timeline / Route Decision / Cost Breakdown / Gateway filters / Gateway metrics / retry-hedge waste cost) is **PENDING** (future change). The generic Trace Tree can render GATEWAY spans, but no Gateway-dedicated views/metrics exist yet.
+- Only when 3.1 and 3.2 also complete may `Phase 3 — Gateway Native Observability` be marked COMPLETE/FROZEN.
 - Phases 2.1–2.5 (SDK & Agent Trace / Tool Span / LangChain Auto-Instr / Runnable Callback / SDK parity) are **COMPLETE / FROZEN**.
-- Test suite: ~950+ tests pass (SDK + proxy/core + gateway observability). Run: `.venv/bin/python -m pytest sdk/tests/ tests/ -q`.
+- Test suite: ~1000+ tests pass (SDK + proxy/core + gateway observability). Run: `.venv/bin/python -m pytest sdk/tests/ tests/ -q`.
 - OpenSpec changes live under `openspec/changes/` (active) and `openspec/changes/archive/` (frozen history — never edit).
 - Repo: https://github.com/xjy486/llm-observability
 
@@ -57,5 +60,7 @@
 | 2.3 LangChain Auto-Instr | docs/llm-observability-phase2.3-*.md | done |
 | 2.4 Runnable Callback | docs/llm-observability-phase2.4-generic-runnable-callback-development-spec.md | done |
 | 2.5 SDK Parity | docs/llm-observability-phase2.5-agentlens-sdk-parity-development-spec.md, docs/llm-observability-phase2.5-*.md | done |
-| 3 Gateway Native Obs | docs/llm-observability-phase3-*.md; frozen specs in openspec/specs/gateway-observability-{contract,runtime}/ | rework complete |
+| 3.0 Gateway Contract & Runtime | docs/llm-observability-phase3-*.md; frozen specs in openspec/specs/gateway-observability-{contract,runtime}/ | COMPLETE / FROZEN |
+| 3.1 One-API Production Integration | (future change) | PENDING |
+| 3.2 Gateway UI & Metrics | (future change) | PENDING |
 - PRD: docs/LLM_Agent_Observability_PRD_v0.1.md

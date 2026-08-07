@@ -12,13 +12,25 @@ from .events import filter_event_attributes
 
 logger = logging.getLogger("llm_obs.gateway.recorder")
 
-# Terminal lifecycle events — recorded at most once per bound span.
-_TERMINAL_EVENTS = frozenset({
-    event_names.EVENT_ATTEMPT_COMPLETED,
-    event_names.EVENT_ATTEMPT_FAILED,
-    event_names.EVENT_RESPONSE_COMPLETED,
-    event_names.EVENT_RESPONSE_FAILED,
-})
+# Terminal lifecycle events — recorded at most once per bound span, and
+# mutually exclusive within a group: once one event in a group is recorded,
+# every other event in the same group is rejected. Groups:
+#   attempt   → gateway.attempt.completed / gateway.attempt.failed
+#   response  → gateway.response.completed / gateway.response.failed
+#   stream    → gateway.stream.completed  / gateway.stream.cancelled
+_TERMINAL_GROUPS: dict = {
+    "attempt": frozenset({event_names.EVENT_ATTEMPT_COMPLETED,
+                          event_names.EVENT_ATTEMPT_FAILED}),
+    "response": frozenset({event_names.EVENT_RESPONSE_COMPLETED,
+                           event_names.EVENT_RESPONSE_FAILED}),
+    "stream": frozenset({event_names.EVENT_STREAM_COMPLETED,
+                         event_names.EVENT_STREAM_CANCELLED}),
+}
+# Reverse map: terminal event name → its mutual-exclusion group.
+_TERMINAL_EVENT_GROUP: dict = {
+    name: group for group, names in _TERMINAL_GROUPS.items() for name in names
+}
+_TERMINAL_EVENTS = frozenset(_TERMINAL_EVENT_GROUP.keys())
 
 
 class GatewayEventRecorder:
@@ -33,6 +45,9 @@ class GatewayEventRecorder:
         self._span = span
         self._privacy = privacy
         self._terminal_recorded: set = set()
+        # Mutual-exclusion groups already occupied on this span. Once a group
+        # is occupied, every other terminal event in the same group is rejected.
+        self._terminal_groups_recorded: set = set()
 
     def bind(self, span):
         """Bind the recorder to a span (used before events fire)."""
@@ -52,10 +67,16 @@ class GatewayEventRecorder:
         """
         if self._span is None:
             return False
-        if name in _TERMINAL_EVENTS:
+        group = _TERMINAL_EVENT_GROUP.get(name)
+        if group is not None:
+            # Terminal event: at most once by name AND at most one per group.
+            # Once any event in the group is recorded, the rest are rejected.
             if name in self._terminal_recorded:
                 return False
+            if group in self._terminal_groups_recorded:
+                return False
             self._terminal_recorded.add(name)
+            self._terminal_groups_recorded.add(group)
         try:
             allowed = filter_event_attributes(attributes or {})
             if self._privacy is not None:
@@ -146,6 +167,24 @@ class GatewayEventRecorder:
         if http_status_code is not None:
             attrs["http_status_code"] = http_status_code
         return self.record(event_names.EVENT_ATTEMPT_FAILED, attrs)
+
+    def attempt_selected(self, attempt_index=None, channel_id=None, provider=None, reason=None) -> bool:
+        """Record a ``gateway.attempt.selected`` (Winner selection) event.
+
+        Not a terminal event — MAY be recorded again when the Winner is
+        explicitly re-selected. The channel ID is always hashed.
+        """
+        attrs = {}
+        if attempt_index is not None:
+            attrs["attempt_index"] = attempt_index
+        hashed = self._hashed_channel(channel_id)
+        if hashed is not None:
+            attrs["channel_id"] = hashed
+        if provider is not None:
+            attrs["provider"] = provider
+        if reason is not None:
+            attrs["reason"] = reason
+        return self.record(event_names.EVENT_ATTEMPT_SELECTED, attrs)
 
     def stream_started(self) -> bool:
         return self.record(event_names.EVENT_STREAM_STARTED, {})

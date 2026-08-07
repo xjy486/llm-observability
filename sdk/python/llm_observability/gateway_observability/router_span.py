@@ -243,6 +243,15 @@ class RouterSpan:
         self._final_channel_id: Optional[str] = None
         self._final_http_status: Optional[int] = None
         self._final_error: Optional[GatewayError] = None
+        # Hedged/Parallel Winner semantics (spec §13.4). ``register_attempt_result``
+        # stores every AttemptResult here; the Router's final status/channel/http
+        # status/error are derived from an explicit Winner (``select_winner``) or a
+        # deterministic fail-safe at finalize — NEVER from the last-completing
+        # attempt. Usage/Cost still aggregate every attempt.
+        self._results_by_index: dict = {}
+        self._selected_attempt_index: Optional[int] = None
+        self._selected_result: Optional[AttemptResult] = None
+        self._selection_reason: Optional[str] = None
         self._cache_status: Optional[str] = None
         self._ttft_ms: Optional[float] = None
         self._queue_duration_ms: Optional[float] = None
@@ -419,6 +428,11 @@ class RouterSpan:
             self._closed = True
         try:
             self._force_close_open_attempts()
+            # Resolve the Winner (explicit or fail-safe) BEFORE recording the
+            # terminal event / applying aggregates, so the Router's final
+            # status/channel/http_status/error reflect the Winner — not the
+            # last-completing attempt (spec §13.4).
+            self._resolve_winner()
             try:
                 if self._span is not None:
                     self._record_terminal_event()
@@ -739,33 +753,148 @@ class RouterSpan:
         aggregate (spec §12.2). The whole mutation runs under _aggregate_lock
         so concurrent (hedged / parallel provider) results aggregate without
         lost count updates or overwritten usage/cost aggregates.
+
+        Per the Winner contract (spec §13.4), this method SHALL NOT overwrite
+        ``_final_channel_id`` / ``_final_http_status`` / ``_final_error`` per
+        call — those are derived from an explicit Winner (``select_winner``) or
+        the deterministic fail-safe at finalize, never from the last-completing
+        attempt. The result is stored in ``_results_by_index`` for Winner
+        resolution; Usage/Cost/counts still aggregate every attempt.
         """
         try:
             with self._aggregate_lock:
                 if result.success:
                     self._success_count += 1
-                    if result.channel_id:
-                        self._final_channel_id = result.channel_id
-                    if result.http_status_code is not None:
-                        self._final_http_status = result.http_status_code
                 else:
                     self._fail_count += 1
-                    if result.http_status_code is not None:
-                        self._final_http_status = result.http_status_code
-                    if result.channel_id:
-                        self._final_channel_id = result.channel_id
-                # Final error reflects the LAST attempt's outcome: a later success
-                # clears the error left by an earlier failed attempt (spec §13.2).
-                self._final_error = result.error
+                self._results_by_index[result.attempt_index] = result
                 if result.ttft_ms is not None and self._ttft_ms is None:
                     self._ttft_ms = result.ttft_ms
-                # Always aggregate usage/cost (including failed attempts).
+                # Always aggregate usage/cost (including failed attempts and
+                # losing hedged attempts).
                 if result.usage is not None:
                     self._usage_aggregate = add_usage(self._usage_aggregate, result.usage)
                 if result.cost is not None:
                     self._cost_aggregate = add_cost(self._cost_aggregate, result.cost)
         except Exception as e:
             logger.error("Router attempt aggregation failed: %s", e)
+
+    def select_winner(self, attempt_index: int, reason: Optional[str] = None) -> bool:
+        """Explicitly select the business Winner attempt (spec §13.4).
+
+        The Winner defines the Router's final status / channel / HTTP status /
+        error. Usage/Cost aggregation is unaffected (still sums every attempt).
+
+        Rules:
+        - Only an already-activated attempt with an ``AttemptResult`` may be
+          selected (returns False for an unknown / result-less index).
+        - Selecting the same index twice is idempotent (returns True, no
+          duplicate ``gateway.attempt.selected`` event).
+        - Switching to a different index is allowed and records a new
+          ``gateway.attempt.selected`` event.
+        """
+        try:
+            with self._aggregate_lock:
+                result = self._results_by_index.get(attempt_index)
+                if result is None:
+                    return False
+                if self._selected_attempt_index == attempt_index:
+                    return True  # idempotent re-selection of the current Winner
+                self._selected_attempt_index = attempt_index
+                self._selected_result = result
+                self._selection_reason = reason
+                self._derive_final_from_result(result)
+            # Record the selection event outside the lock (fail-open).
+            try:
+                self.recorder.attempt_selected(
+                    attempt_index=attempt_index,
+                    channel_id=result.channel_id,
+                    provider=self._attempt_provider(attempt_index),
+                    reason=reason,
+                )
+            except Exception as e:
+                logger.error("Router select_winner event failed: %s", e)
+            return True
+        except Exception as e:
+            logger.error("Router select_winner failed: %s", e)
+            return False
+
+    def _attempt_provider(self, attempt_index: int) -> Optional[str]:
+        """Best-effort provider lookup for an attempt index (for events)."""
+        try:
+            for attempt in self._attempts:
+                if getattr(attempt, "attempt_index", None) == attempt_index:
+                    return getattr(attempt, "provider", None)
+        except Exception:
+            return None
+        return None
+
+    def _derive_final_from_result(self, result: AttemptResult):
+        """Set the Router's final_* fields from a Winner AttemptResult.
+
+        Runs under ``_aggregate_lock`` (caller holds it). A successful Winner
+        clears any prior final_error; a failed Winner surfaces its error.
+        """
+        self._final_channel_id = result.channel_id
+        self._final_http_status = result.http_status_code
+        self._final_error = result.error
+
+    def _resolve_winner(self):
+        """Resolve the Router's final state at finalize (spec §13.4 fail-safe).
+
+        - Explicit Winner already selected → final_* derived from it (done).
+        - No attempt results → leave the route-level final_error (rate-limit /
+          cache-hit / route exception) untouched.
+        - Exactly one successful attempt → auto-select it (``auto_single_success``).
+        - Exactly one attempt total → auto-select it (``auto_single_attempt``).
+        - Multiple attempts with no single success → ``MissingWinnerSelection``
+          (``gateway_internal``), Router ERROR — never an implicit last-completing
+          winner.
+
+        Runs under ``_aggregate_lock``. Auto-selection records a
+        ``gateway.attempt.selected`` event (fail-open).
+        """
+        try:
+            with self._aggregate_lock:
+                if self._selected_result is not None:
+                    return  # explicit Winner already derived final_*
+                results = list(self._results_by_index.values())
+                if not results:
+                    return  # route-level outcome (rate-limit / cache / exception)
+                successes = [r for r in results if r.success]
+                if len(successes) == 1:
+                    self._auto_select(successes[0], "auto_single_success")
+                    return
+                if len(results) == 1:
+                    self._auto_select(results[0], "auto_single_attempt")
+                    return
+                # Multiple attempts, no single winner — deterministic fail-safe.
+                self._final_error = GatewayError(
+                    category=ErrorCategory.GATEWAY_INTERNAL,
+                    type="MissingWinnerSelection",
+                    message="multiple attempts finalized without an explicit winner",
+                    retryable=False,
+                )
+                self._selection_reason = "missing_winner"
+        except Exception as e:
+            logger.error("Router winner resolution failed: %s", e)
+
+    def _auto_select(self, result: AttemptResult, reason: str):
+        """Auto-select a single result as Winner under _aggregate_lock."""
+        self._selected_attempt_index = result.attempt_index
+        self._selected_result = result
+        self._selection_reason = reason
+        self._derive_final_from_result(result)
+        # Record the auto-selection event (fail-open) outside the lock below.
+        try:
+            self.recorder.attempt_selected(
+                attempt_index=result.attempt_index,
+                channel_id=result.channel_id,
+                provider=self._attempt_provider(result.attempt_index),
+                reason=reason,
+            )
+        except Exception as e:
+            logger.error("Router auto-select event failed: %s", e)
 
     def set_usage_aggregate(self, usage: NormalizedUsage):
         """Directly set the Router usage aggregate (e.g. cache hit with usage)."""
@@ -896,6 +1025,16 @@ class RouterSpan:
     @property
     def final_channel_id(self) -> Optional[str]:
         return self._final_channel_id
+
+    @property
+    def final_http_status(self) -> Optional[int]:
+        return self._final_http_status
+
+    @property
+    def selected_attempt_index(self) -> Optional[int]:
+        """The explicit/auto Winner attempt index, or None if the fail-safe
+        ``MissingWinnerSelection`` path was taken."""
+        return self._selected_attempt_index
 
     @property
     def final_error(self) -> Optional[GatewayError]:
