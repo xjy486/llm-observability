@@ -74,7 +74,7 @@
 ## Checkpoint F — 全量回归 + CI + 归档
 
 - [x] F.1 全量回归：`.venv/bin/python -m pytest sdk/tests/ tests/ -q` 全绿（1006 passed, 1 skipped=live-upstream；含 Phase 2.1–2.5 regression 与全部已归档 closeout 测试）
-- [ ] F.2 GitHub CI 全部成功；Real E2E `skipped == 0`、`passed > 0`；Secret 缺失受信任分支失败、Fork PR 跳过 Secret Job；日志脱敏（`scripts/redact_ci_secrets.py`）—— 需 push 后在 GitHub 验证
+- [x] F.2 GitHub CI 全部成功（PR #3，run 31141569077，10/10 jobs success）；Real E2E gate `passed=9 skipped=0 failed=0 errors=0`；Secret 缺失受信任分支失败、Fork PR 跳过 Secret Job；日志脱敏（`scripts/redact_ci_secrets.py`）
 - [x] F.3 CI 新增/强化 `gateway-terminal-race-tests`、`gateway-hedged-attempt-tests` 挂在常驻 gateway test job（非 secret-gated）—— 新增 4 个测试文件已被 `gateway-runtime-tests`（整目录）覆盖，并补入 `gateway-streaming-tests` job
-- [ ] F.4 **终审**：对照 design Risks 逐项核验；三层证据（代码审查 / CI 绿 / E2E 0 skipped）齐备；对照 §13 验收矩阵逐项确认 —— 待 F.2 CI 绿
-- [ ] F.5 归档本 change（`openspec archive fix-phase3-final-acceptance-gaps`），归档后同步主 spec Purpose；不修改已归档历史 —— 待 F.2/F.4
+- [x] F.4 **终审**：对照 design Risks 逐项核验；三层证据（代码审查 / CI 绿 / E2E 0 skipped）齐备；对照 §13 验收矩阵逐项确认（One-API/UI/Metrics 项按拆分延后至 3.1/3.2，文档一致）
+- [ ] F.5 归档本 change（`openspec archive fix-phase3-final-acceptance-gaps`），归档后同步主 spec Purpose；不修改已归档历史
